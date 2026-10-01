@@ -202,6 +202,20 @@ class HttpClient:
             values = dict(self._metrics)
         for key in ("logical_requests", "request_starts", "wire_request_starts", "request_completions", "request_failures", "network_bytes", "retry_waits", "rate_limit_events"):
             values[key] = int(values.get(key, 0))
+        # Normalize accumulated duration counters at the public snapshot boundary.
+        # time.monotonic() deltas can land a few binary-float ulps below an
+        # exact boundary on Windows (for example 0.015 becoming
+        # 0.014999999999986358), which makes otherwise-correct metrics behave
+        # inconsistently across supported Python/OS combinations. Nanosecond
+        # precision is already finer than these operational counters require.
+        for key in (
+            "pacing_wait_seconds",
+            "host_gate_wait_seconds",
+            "retry_wait_seconds",
+            "rate_limit_wait_seconds",
+            "network_seconds",
+        ):
+            values[key] = round(float(values.get(key, 0.0)), 9)
         return values
 
     def _acquire_host_permit(self):
