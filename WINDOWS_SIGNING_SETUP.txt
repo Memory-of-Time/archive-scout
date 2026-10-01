@@ -1,0 +1,16 @@
+Archive Scout Windows signing setup
+
+Official tagged Windows releases are designed to use Azure Artifact Signing through the Build All Platforms workflow.
+
+Repository variables:
+- ENABLE_WINDOWS_ARTIFACT_SIGNING=true
+- WINDOWS_SIGNING_ENDPOINT
+- WINDOWS_SIGNING_ACCOUNT_NAME
+- WINDOWS_SIGNING_PROFILE_NAME
+
+Repository secrets:
+- AZURE_CLIENT_ID
+- AZURE_TENANT_ID
+- AZURE_SUBSCRIPTION_ID
+
+The workflow builds ArchiveScout.exe first, signs that exact executable, verifies the Authenticode signature, and packages the release only after verification succeeds. Manual workflow runs may produce an unsigned test package when signing is disabled; tagged official releases intentionally fail if signing is not enabled.

@@ -1,0 +1,15 @@
+ARCHIVE SCOUT 1.0.0 REPOSITORY CHECKLIST
+
+1. Confirm archive_scout/constants.py and pyproject.toml report version 1.0.0.
+2. Confirm schema version remains 11.
+3. Run: python -m unittest discover -s tests -p "test_*.py"
+4. Confirm the dedicated v1.0.0 rate/Windows GUI audit regression tests pass.
+5. Confirm default index pacing is 2.5 seconds and replay pacing is 0.125 seconds.
+6. Confirm a missing Retry-After produces at least a 60-second first cooldown.
+7. Confirm .github/workflows/tests.yml expects package version 1.0.0.
+8. Confirm packaging/windows/version_info.txt uses 1.0.0 / filevers=(1, 0, 0, 0).
+9. Confirm packaging/windows/ArchiveScout.manifest is included by scripts/build_windows.ps1.
+10. Build Windows, Linux, and macOS packages on their native runners.
+11. Smoke-test startup, project creation/opening, navigation, scrolling, DPI/theme changes, indexing preview, resume, and local search on native packages.
+12. Verify release archives contain no __pycache__, .pyc, local project databases, API keys, or temporary files.
+13. Tag the initial public release as v1.0.0 only after the release workflow is green.

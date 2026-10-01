@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+build/
+dist/
+release/
+*.spec
+.DS_Store
+.vscode/
+.idea/
+.venv/
+venv/
+
+*.egg-info/
+.coverage
+htmlcov/
+
+# Local credentials and developer environment
+.env
+.env.*
+!.env.example
