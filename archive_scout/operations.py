@@ -196,6 +196,7 @@ def run_project(
 
     requested_mode = mode
     resumed_progress_stage = ""
+    saved_rate_pause_detail: dict[str, object] = {}
     if mode == "resume":
         previous = database.execute(
             """SELECT mode,retention_policy,config_json,progress_json FROM operation_runs
@@ -222,9 +223,30 @@ def run_project(
             if str(previous["retention_policy"] or "") in {"keep", "discard_after_scan"}:
                 config = replace(config, text_retention=str(previous["retention_policy"])).normalized()
             try:
-                resumed_progress_stage = str(json.loads(str(previous["progress_json"] or "{}" )).get("stage") or "")
+                previous_progress = json.loads(str(previous["progress_json"] or "{}"))
+                resumed_progress_stage = str(previous_progress.get("stage") or "")
+                detail = previous_progress.get("detail")
+                if isinstance(detail, dict) and detail.get("reason_code") == "service_rate_limit":
+                    saved_rate_pause_detail = dict(detail)
             except (TypeError, ValueError, json.JSONDecodeError):
                 resumed_progress_stage = ""
+
+    # Protect server-supplied Retry-After across a process restart.  Resume (or
+    # another network operation in the same project) must not erase an
+    # unexpired service deadline simply because the in-memory host gate is new.
+    if not saved_rate_pause_detail:
+        paused_row = database.execute(
+            """SELECT progress_json FROM operation_runs
+               WHERE status='paused' ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        if paused_row is not None:
+            try:
+                paused_progress = json.loads(str(paused_row["progress_json"] or "{}"))
+                detail = paused_progress.get("detail")
+                if isinstance(detail, dict) and detail.get("reason_code") == "service_rate_limit":
+                    saved_rate_pause_detail = dict(detail)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
 
     # Resume restores the original operation contract before validating it. A
     # download-only resume must not suddenly require keyword sets, while a full
@@ -271,6 +293,7 @@ def run_project(
                     completed=event.current,
                     total=event.total,
                     stage=event.stage,
+                    detail=event.detail,
                 )
                 database.commit()
                 last_progress_write = now
@@ -281,6 +304,24 @@ def run_project(
     callback = operation_callback
     try:
         save_project_config(config)
+        network_modes = {
+            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_errors",
+            "media_all", "media_index", "media_download", "media_retry", "analysis",
+        }
+        eligible_at = float(saved_rate_pause_detail.get("eligible_at_epoch") or 0.0)
+        if mode in network_modes and eligible_at > time.time():
+            remaining = max(0.0, eligible_at - time.time())
+            raise RateLimitDeferred(
+                f"Wayback service cooldown is still active for about {remaining:.0f}s. "
+                "The saved queue was left untouched; Resume after the eligibility time.",
+                status=int(saved_rate_pause_detail.get("http_status") or 429),
+                waited=float(saved_rate_pause_detail.get("waited_seconds") or 0.0),
+                eligible_at_epoch=eligible_at,
+                incident_id=(
+                    int(saved_rate_pause_detail["incident_id"])
+                    if saved_rate_pause_detail.get("incident_id") is not None else None
+                ),
+            )
         if mode == "backup":
             path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep, max_mb=config.backup_max_mb)
             emit(callback, ProgressEvent("backup", f"Backup written to {path}"))
@@ -604,13 +645,22 @@ def run_project(
             database.execute("UPDATE captures SET state='downloaded_unscanned' WHERE state='scanning'")
             database.execute("UPDATE media_captures SET state='pending' WHERE state='downloading'")
             finish_jobs(database, jobs, "interrupted")
-        finish_operation_run(database, operation_run_id, "interrupted", str(exc))
+        detail = exc.to_detail()
+        update_operation_run(
+            database,
+            operation_run_id,
+            message=str(exc),
+            stage="rate_limit_paused",
+            detail=detail,
+        )
+        finish_operation_run(database, operation_run_id, "paused", str(exc))
         database.commit()
         emit(
             callback,
             ProgressEvent(
-                "rate_limit",
+                "rate_limit_paused",
                 f"Wayback stayed rate limited beyond the wait budget. Progress was saved; use Resume later. {exc}",
+                detail=detail,
             ),
         )
         raise

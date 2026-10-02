@@ -1,19 +1,21 @@
-# Archive Scout 1.0.0 release notes
+# Archive Scout 1.0.1 release notes
 
-Archive Scout 1.0.0 is the initial public release. It combines the validated acquisition, classification, scanning, media, report, recovery, research, and automation systems into one release identity.
+Archive Scout 1.0.1 is a focused corrective release for rate-limit recovery and GUI scrolling. The project schema remains **11**.
 
-## Wayback request control
+## Wayback recovery
 
-Index/CDX/Timemap traffic starts at one actual request attempt every 2.5 seconds (24/minute), while replay traffic starts at one attempt every 0.125 seconds (8/second). The clocks are shared per process and do not accumulate burst credit while idle. Redirect hops and fallback transport attempts pass through the same admission path.
+An exhausted live 429/503 recovery budget is now a typed, resumable service pause. Text and media indexers preserve the exact pending request and propagate that pause to the operation boundary without reducing row caps, subdividing date windows, rotating endpoints, switching formats, or granting a fresh automatic recovery budget.
 
-Live 429/503 responses close the shared Wayback gate. Retry-After seconds and HTTP-date values are minimum deadlines; without a usable header, the first pause is at least 60 seconds with positive-only jitter. Recovery requires a probe and pacing relaxes gradually after sustained healthy traffic. Historical origin statuses returned through replay captures do not close the live gate.
+Paged schedulers treat the first service deferral as a pool-wide control signal: new page admission stops, queued sibling work is cancelled, already-validated pages are committed with their checkpoints, and unfinished pages remain pending without being counted as ordinary page failures.
 
-## Windows and GUI
+The shared host gate now carries an absolute recovery deadline across workers. Time already spent behind a shared cooldown counts toward that deadline. Retry-After remains a minimum server deadline and its wall-clock eligibility is persisted so restarting Archive Scout cannot cause an early retry. Adaptive pacing changes at most once per coalesced incident, and healthy automatic indexing continues resume-key traversal rather than switching a dense first response to paged mode.
 
-Windows builds declare Per-Monitor V2 DPI awareness. Archive Scout leaves Tk's system DPI baseline intact and applies the user font preference through named fonts. System theme detection recognizes Windows dark mode and high contrast. Main pages use reusable scroll containers, sidebar navigation scrolls independently, wide tables expose both axes, and nested wheel routing hands control from Text/Tree widgets to outer pages only at their boundaries.
+## Scrolling and Windows interaction
 
-Potentially heavy Results/FTS, History, Errors, and site-issue database reads run outside the Tk event loop and use generation tokens so stale queries cannot overwrite newer UI state.
+Focusing a control that is already visible no longer changes the page position. Keyboard traversal reveals an off-screen control only as far as necessary, using the actual canvas viewport and coalesced idle work without calling `update_idletasks()` from the focus handler.
+
+Wheel input is routed once through a single interpreter-wide router. Routing prefers the surface under the pointer, retains high-resolution residuals per stable surface/axis, and prevents a native Text/Listbox/Treeview that reaches its boundary from also moving its parent on the same event.
 
 ## Compatibility
 
-The public application version is 1.0.0 and the internal project schema remains 11. The loader accepts identifiers emitted by pre-release development builds so existing Archive Scout project directories can be opened and migrated rather than abandoned.
+The public application version is **1.0.1** and the internal project schema remains **11**. Existing v1.0.0 projects remain compatible.

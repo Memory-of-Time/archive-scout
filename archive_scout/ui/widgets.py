@@ -30,17 +30,20 @@ class ToolTip:
 
 
 class WheelRouter:
-    """Install one root-level wheel router and dispatch to the nearest scroll surface.
+    """Install one interpreter-wide wheel router and dispatch each event once.
 
-    Native Text/Listbox/Treeview widgets keep their normal wheel behavior while
-    they can still move.  At a boundary the event is handed to the nearest outer
-    Archive Scout scroll owner, so nested panes never scroll twice.
+    Tk native Text/Listbox/Treeview class bindings run before ``bind_all``.  The
+    router therefore remembers the native view observed after the previous event:
+    if the view changed on this event, the native widget consumed it; only a later
+    event that arrives while the same native surface is already stationary at its
+    boundary may bubble to an outer Archive Scout scroll owner.
     """
     _attr = "_archive_scout_wheel_router"
 
     def __init__(self, root: tk.Misc) -> None:
         self.root = root
-        self._wheel_residual: dict[int, float] = {}
+        self._wheel_residual: dict[tuple[int, str], float] = {}
+        self._native_views: dict[tuple[int, str], tuple[float, float]] = {}
         root.bind_all("<MouseWheel>", self._wheel, add=True)
         root.bind_all("<Shift-MouseWheel>", self._shift_wheel, add=True)
         root.bind_all("<Button-4>", self._wheel, add=True)
@@ -49,7 +52,13 @@ class WheelRouter:
 
     @classmethod
     def ensure(cls, widget: tk.Misc) -> "WheelRouter":
-        root = widget.winfo_toplevel()
+        # ``bind_all`` is interpreter-wide, not toplevel-local.  Store exactly
+        # one router on the Tk interpreter root so repeatedly opening dialogs
+        # cannot stack duplicate global handlers.
+        try:
+            root = widget._root()  # type: ignore[attr-defined]
+        except Exception:
+            root = widget.winfo_toplevel()
         router = getattr(root, cls._attr, None)
         if router is None:
             router = cls(root)
@@ -75,28 +84,43 @@ class WheelRouter:
         return isinstance(widget, (tk.Text, tk.Listbox, ttk.Treeview))
 
     @staticmethod
-    def _view_can_move(widget: tk.Misc, units: int, *, horizontal: bool = False) -> bool:
-        if not units:
-            return False
+    def _view(widget: tk.Misc, *, horizontal: bool = False) -> tuple[float, float] | None:
         try:
             first, last = (widget.xview() if horizontal else widget.yview())
-            eps = 1e-6
-            return first > eps if units < 0 else last < 1.0 - eps
-        except (tk.TclError, AttributeError, ValueError):
-            return False
+            return float(first), float(last)
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            return None
 
-    def _units(self, event) -> int:
+    @staticmethod
+    def _view_can_move_from(view: tuple[float, float] | None, units: int) -> bool:
+        if not units or view is None:
+            return False
+        first, last = view
+        eps = 1e-6
+        return first > eps if units < 0 else last < 1.0 - eps
+
+    def _pointer_widget(self, event):
+        try:
+            x_root = int(getattr(event, "x_root"))
+            y_root = int(getattr(event, "y_root"))
+            containing = self.root.winfo_containing(x_root, y_root)
+            if containing is not None:
+                return containing
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            pass
+        return getattr(event, "widget", None)
+
+    def _units(self, event, surface: object, *, horizontal: bool = False) -> int:
         if getattr(event, "num", None) == 4:
-            return -3
+            return -1
         if getattr(event, "num", None) == 5:
-            return 3
+            return 1
         delta = float(getattr(event, "delta", 0) or 0)
         if not delta:
             return 0
-        if sys.platform == "darwin":
-            return -1 if delta > 0 else 1
-        key = id(getattr(event, "widget", self.root))
-        accumulated = self._wheel_residual.get(key, 0.0) + (-delta / 120.0)
+        divisor = 1.0 if sys.platform == "darwin" else 120.0
+        key = (id(surface), "x" if horizontal else "y")
+        accumulated = self._wheel_residual.get(key, 0.0) + (-delta / divisor)
         if abs(accumulated) < 1.0:
             self._wheel_residual[key] = accumulated
             return 0
@@ -104,39 +128,58 @@ class WheelRouter:
         self._wheel_residual[key] = accumulated - units
         return units
 
-    def _wheel(self, event):
-        widget = getattr(event, "widget", None)
-        units = self._units(event)
+    def _native_consumed(self, widget: tk.Misc, units: int, *, horizontal: bool = False) -> bool:
+        """Return whether the native class binding consumed this wheel event."""
+        axis = "x" if horizontal else "y"
+        key = (id(widget), axis)
+        current = self._view(widget, horizontal=horizontal)
+        previous = self._native_views.get(key)
+        if current is not None:
+            self._native_views[key] = current
+        if current is None:
+            return True
+        # If movement remains possible after the class binding, keep the event
+        # on the native surface.  If it just arrived at a boundary, the changed
+        # view proves this same event was already consumed there too.
+        if self._view_can_move_from(current, units):
+            return True
+        if previous is None:
+            return True
+        moved = abs(current[0] - previous[0]) > 1e-9 or abs(current[1] - previous[1]) > 1e-9
+        return moved
+
+    def _route(self, event, *, horizontal: bool = False):
+        widget = self._pointer_widget(event)
+        owners = list(self._owners(widget))
+        surface = widget if self._native_scrollable(widget) else (owners[0] if owners else widget or self.root)
+        units = self._units(event, surface, horizontal=horizontal)
         if not units:
             return "break" if self._native_scrollable(widget) else None
-        # Native class bindings run before the all-binding.  If the widget can
-        # move, simply consume the event here to prevent an outer-page double scroll.
-        if self._native_scrollable(widget) and self._view_can_move(widget, units):
+
+        if self._native_scrollable(widget) and self._native_consumed(widget, units, horizontal=horizontal):
             return "break"
-        for owner in self._owners(widget):
-            if hasattr(owner, "can_scroll_y") and owner.can_scroll_y(units):
-                owner.scroll_y(units)
+
+        method_can = "can_scroll_x" if horizontal else "can_scroll_y"
+        method_scroll = "scroll_x" if horizontal else "scroll_y"
+        for owner in owners:
+            can_scroll = getattr(owner, method_can, None)
+            scroll = getattr(owner, method_scroll, None)
+            if callable(can_scroll) and callable(scroll) and can_scroll(units):
+                scroll(units)
                 return "break"
         return "break" if self._native_scrollable(widget) else None
 
+    def _wheel(self, event):
+        return self._route(event, horizontal=False)
+
     def _shift_wheel(self, event):
-        widget = getattr(event, "widget", None)
-        units = self._units(event)
-        if not units:
-            return "break" if self._native_scrollable(widget) else None
-        if self._native_scrollable(widget) and self._view_can_move(widget, units, horizontal=True):
-            return "break"
-        for owner in self._owners(widget):
-            if hasattr(owner, "can_scroll_x") and owner.can_scroll_x(units):
-                owner.scroll_x(units)
-                return "break"
-        return "break" if self._native_scrollable(widget) else None
+        return self._route(event, horizontal=True)
 
     def _focus_in(self, event):
         widget = getattr(event, "widget", None)
         for owner in self._owners(widget):
             if isinstance(owner, ScrollablePage):
-                owner.after_idle(lambda o=owner, w=widget: o.reveal(w))
+                owner.request_reveal(widget)
                 break
         return None
 
@@ -162,30 +205,109 @@ class ScrollablePage(ttk.Frame):
         self.canvas.bind("<Configure>", self._viewport, add=True)
         WheelRouter.ensure(self)
         self._region_job = None
+        self._reveal_job = None
+        self._reveal_target: tk.Misc | None = None
+
     def _viewport(self, event=None) -> None:
         width = max(1, int(getattr(event, "width", self.canvas.winfo_width())))
         self.canvas.itemconfigure(self._window, width=width); self._queue_region()
+
     def _queue_region(self, _event=None) -> None:
         if self._region_job is not None:
             try: self.after_cancel(self._region_job)
             except tk.TclError: pass
         self._region_job = self.after_idle(self._update_region)
+
     def _update_region(self) -> None:
         self._region_job = None; self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
     def can_scroll_y(self, units: int) -> bool:
         try:
             first, last = self.canvas.yview()
             return first > 1e-6 if units < 0 else last < 1.0 - 1e-6
         except tk.TclError:
             return False
+
     def can_scroll_x(self, units: int) -> bool: return False
     def scroll_y(self, units: int) -> None: self.canvas.yview_scroll(int(units), "units")
     def scroll_x(self, units: int) -> None: return None
-    def reveal(self, widget: tk.Misc) -> None:
+
+    def request_reveal(self, widget: tk.Misc | None) -> None:
+        if widget is None:
+            return
+        self._reveal_target = widget
+        if self._reveal_job is not None:
+            return
+        self._reveal_job = self.after_idle(self._run_reveal)
+
+    def _run_reveal(self) -> None:
+        self._reveal_job = None
+        widget = self._reveal_target
+        self._reveal_target = None
+        if widget is None:
+            return
         try:
-            self.update_idletasks(); y = widget.winfo_rooty()-self.body.winfo_rooty(); total=max(1,self.body.winfo_reqheight())
-            self.canvas.yview_moveto(max(0.0,min(1.0,y/total)))
-        except tk.TclError: pass
+            if hasattr(widget, "winfo_exists") and not widget.winfo_exists():
+                return
+            if hasattr(widget, "winfo_ismapped") and not widget.winfo_ismapped():
+                return
+            focus_get = getattr(self, "focus_get", None)
+            if callable(focus_get):
+                focused = focus_get()
+                if focused is not None and focused is not widget:
+                    return
+            if not any(owner is self for owner in WheelRouter._owners(widget)):
+                return
+            self.reveal(widget)
+        except (tk.TclError, AttributeError):
+            return
+
+    def _reveal_margin(self) -> int:
+        try:
+            pixels_per_point = float(self.canvas.winfo_fpixels("1p"))
+            return max(6, min(24, int(round(6.0 * pixels_per_point))))
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            return 8
+
+    def reveal(self, widget: tk.Misc) -> None:
+        """Reveal only an off-screen focused widget, using minimum movement."""
+        try:
+            viewport_top = int(self.canvas.winfo_rooty())
+            viewport_height = max(1, int(self.canvas.winfo_height()))
+            viewport_bottom = viewport_top + viewport_height
+            widget_top = int(widget.winfo_rooty())
+            widget_height = max(1, int(widget.winfo_height()))
+            widget_bottom = widget_top + widget_height
+            margin = min(self._reveal_margin(), max(0, viewport_height // 4))
+            visible_top = viewport_top + margin
+            visible_bottom = viewport_bottom - margin
+
+            if widget_height <= max(1, visible_bottom - visible_top):
+                if widget_top >= visible_top and widget_bottom <= visible_bottom:
+                    return
+                delta = widget_top - visible_top if widget_top < visible_top else widget_bottom - visible_bottom
+            else:
+                # For a control taller than the viewport, anchor its top once;
+                # alternating top/bottom corrections would oscillate forever.
+                if abs(widget_top - visible_top) <= 1:
+                    return
+                delta = widget_top - visible_top
+
+            try:
+                bbox = self.canvas.bbox("all")
+            except (tk.TclError, AttributeError):
+                bbox = None
+            if bbox:
+                content_height = max(viewport_height, int(bbox[3]) - int(bbox[1]))
+            else:
+                content_height = max(viewport_height, int(self.body.winfo_reqheight()))
+            first, _last = self.canvas.yview()
+            max_first = max(0.0, 1.0 - (viewport_height / max(1.0, float(content_height))))
+            target = max(0.0, min(max_first, float(first) + (float(delta) / max(1.0, float(content_height)))))
+            if abs(target - float(first)) > 1e-9:
+                self.canvas.yview_moveto(target)
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            pass
 
 
 class ScrollableTree(ttk.Frame):

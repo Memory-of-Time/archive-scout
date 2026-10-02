@@ -26,6 +26,8 @@ class _SharedRateState:
         self.requested_delay = max(0.0, float(requested_delay))
         self.adaptive_delay = self.requested_delay
         self.last_rate_limit = 0.0
+        self.last_rate_signal = 0.0
+        self.last_incident_id: int | None = None
         self.healthy_starts = 0
 
 
@@ -61,8 +63,9 @@ class FixedRateLimiter:
         with self.slot(stop_event):
             return
 
-    def note_rate_limit(self) -> None:
-        return
+    def note_rate_limit(self, incident_id: int | None = None) -> bool:
+        del incident_id
+        return False
 
     def note_healthy_response(self) -> None:
         return
@@ -117,9 +120,26 @@ class SharedFixedRateLimiter(FixedRateLimiter):
     def requested_delay(self) -> float:
         return self.delay
 
-    def note_rate_limit(self) -> None:
+    def note_rate_limit(self, incident_id: int | None = None) -> bool:
+        """Apply at most one pacing reduction for a coalesced service incident.
+
+        ``SharedHostGate`` owns the canonical incident identifier.  The optional
+        time-based coalescing path is retained for callers/tests that do not yet
+        provide that identifier, but production HTTP clients always do.
+        """
         with self.condition:
             now = time.monotonic()
+            if incident_id is not None:
+                if self._state.last_incident_id == int(incident_id):
+                    self._state.last_rate_signal = now
+                    return False
+                self._state.last_incident_id = int(incident_id)
+            else:
+                if self._state.last_rate_signal > 0.0 and now - self._state.last_rate_signal <= 2.0:
+                    self._state.last_rate_signal = now
+                    return False
+                self._state.last_incident_id = None
+            self._state.last_rate_signal = now
             baseline = max(self._state.requested_delay, 0.001)
             current = max(self._state.adaptive_delay, baseline)
             # Reopen conservatively after a throttle, without changing project
@@ -128,6 +148,7 @@ class SharedFixedRateLimiter(FixedRateLimiter):
             self._state.last_rate_limit = now
             self._state.healthy_starts = 0
             self.condition.notify_all()
+            return True
 
     def note_healthy_response(self) -> None:
         with self.condition:
@@ -152,6 +173,7 @@ class SharedFixedRateLimiter(FixedRateLimiter):
                 "pool_floor_delay": self._state.requested_delay,
                 "effective_delay": self.effective_delay,
                 "healthy_starts": self._state.healthy_starts,
+                "last_incident_id": self._state.last_incident_id or 0,
             }
 
 
@@ -159,6 +181,24 @@ class SharedFixedRateLimiter(FixedRateLimiter):
 class HostPermit:
     generation: int
     probe: bool = False
+
+
+class RecoveryDeadlineExceeded(RuntimeError):
+    """Raised when a shared service-recovery incident outlives its budget."""
+
+    def __init__(
+        self,
+        *,
+        incident_id: int,
+        waited: float,
+        eligible_at_epoch: float,
+        reason: str,
+    ) -> None:
+        super().__init__(reason or "Wayback service recovery deadline reached")
+        self.incident_id = int(incident_id)
+        self.waited = max(0.0, float(waited))
+        self.eligible_at_epoch = max(0.0, float(eligible_at_epoch))
+        self.reason = str(reason or "")
 
 
 class SharedHostGate:
@@ -182,30 +222,69 @@ class SharedHostGate:
         self.decay_seconds = max(self.coalesce_seconds, float(decay_seconds))
         self.condition = threading.Condition()
         self.blocked_until = 0.0
+        self.blocked_until_wall = 0.0
         self.last_signal = 0.0
         self.incidents = 0
+        self.incident_id = 0
+        self.incident_started = 0.0
+        self.incident_started_wall = 0.0
         self.reason = ""
         self.generation = 0
         self.probe_required = False
         self.probe_inflight = False
 
-    def acquire_request(self, stop_event: threading.Event) -> HostPermit:
+    def acquire_request(
+        self,
+        stop_event: threading.Event,
+        *,
+        deadline: float | None = None,
+    ) -> HostPermit:
         while True:
             with self.condition:
                 if stop_event.is_set():
                     raise Stopped
                 now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    waited = max(0.0, now - self.incident_started) if self.incident_started else 0.0
+                    raise RecoveryDeadlineExceeded(
+                        incident_id=self.incident_id,
+                        waited=waited,
+                        eligible_at_epoch=self.blocked_until_wall,
+                        reason=self.reason,
+                    )
                 remaining = self.blocked_until - now
                 if remaining > 0:
-                    self.condition.wait(timeout=min(max(remaining, 0.05), 0.5))
+                    timeout = min(max(remaining, 0.05), 0.5)
+                    if deadline is not None:
+                        timeout = min(timeout, max(0.0, deadline - now))
+                    if timeout <= 0:
+                        continue
+                    self.condition.wait(timeout=timeout)
                     continue
                 if self.probe_required:
                     if not self.probe_inflight:
                         self.probe_inflight = True
                         return HostPermit(self.generation, True)
-                    self.condition.wait(timeout=0.5)
+                    timeout = 0.5
+                    if deadline is not None:
+                        timeout = min(timeout, max(0.0, deadline - now))
+                    if timeout <= 0:
+                        continue
+                    self.condition.wait(timeout=timeout)
                     continue
                 return HostPermit(self.generation, False)
+
+    def recovery_deadline(self, max_wait: float) -> float | None:
+        """Return the absolute monotonic deadline for the active incident."""
+        budget = max(0.0, float(max_wait))
+        if budget <= 0:
+            return None
+        with self.condition:
+            now = time.monotonic()
+            active = self.probe_required or self.probe_inflight or self.blocked_until > now
+            if not active or self.incident_started <= 0:
+                return None
+            return self.incident_started + budget
 
     def permit_is_current(self, permit: HostPermit) -> bool:
         with self.condition:
@@ -227,15 +306,19 @@ class SharedHostGate:
             if recovered:
                 self.probe_required = False
                 self.blocked_until = 0.0
+                self.blocked_until_wall = 0.0
                 # Retain incident memory; gradual rate recovery belongs to the
                 # corresponding rate pool rather than resetting after one probe.
                 self.incidents = max(0, self.incidents - 1)
                 self.reason = ""
+                self.incident_started = 0.0
+                self.incident_started_wall = 0.0
                 self.generation += 1
             else:
                 # A fresh 5xx/network failure did not prove recovery.  Avoid a
                 # thundering sequence of simultaneous recovery probes.
                 self.blocked_until = max(self.blocked_until, time.monotonic() + 5.0)
+                self.blocked_until_wall = max(self.blocked_until_wall, time.time() + 5.0)
             self.condition.notify_all()
 
     def wait(self, stop_event: threading.Event) -> None:
@@ -248,18 +331,30 @@ class SharedHostGate:
                     return
                 self.condition.wait(timeout=min(max(remaining, 0.05), 0.5))
 
-    def pause_for_rate_limit(
+    def signal_rate_limit(
         self,
         retry_after: float | None = None,
         reason: str = "HTTP 429",
-    ) -> float:
+    ) -> tuple[float, int, float, bool]:
         now = time.monotonic()
+        wall_now = time.time()
         with self.condition:
-            new_incident = now - self.last_signal > self.coalesce_seconds
-            if now - self.last_signal > self.decay_seconds:
+            # A throttle remains one incident until its recovery probe proves the
+            # service healthy.  Late responses from requests that were already in
+            # flight must not manufacture a fresh incident merely because they
+            # arrive outside the short signal-coalescing window.
+            active_incident = bool(
+                self.incident_id
+                and (self.probe_required or self.probe_inflight or self.blocked_until > now or self.incident_started > 0.0)
+            )
+            new_incident = not active_incident
+            if not active_incident and now - self.last_signal > self.decay_seconds:
                 self.incidents = 0
             if new_incident:
                 self.incidents += 1
+                self.incident_id += 1
+                self.incident_started = now
+                self.incident_started_wall = wall_now
             self.last_signal = now
 
             if retry_after is not None and retry_after > 0:
@@ -271,12 +366,26 @@ class SharedHostGate:
                 pause *= random.uniform(1.0, 1.1)
 
             self.blocked_until = max(self.blocked_until, now + pause)
+            self.blocked_until_wall = max(self.blocked_until_wall, wall_now + pause)
             self.reason = reason
             self.probe_required = True
             self.probe_inflight = False
             self.generation += 1
             self.condition.notify_all()
-            return max(0.0, self.blocked_until - now)
+            return (
+                max(0.0, self.blocked_until - now),
+                self.incident_id,
+                self.blocked_until_wall,
+                new_incident,
+            )
+
+    def pause_for_rate_limit(
+        self,
+        retry_after: float | None = None,
+        reason: str = "HTTP 429",
+    ) -> float:
+        """Compatibility wrapper returning only the effective shared wait."""
+        return self.signal_rate_limit(retry_after, reason)[0]
 
     def remaining(self) -> float:
         with self.condition:
@@ -284,12 +393,16 @@ class SharedHostGate:
 
     def snapshot(self) -> dict[str, float | int | str | bool]:
         with self.condition:
+            now = time.monotonic()
             return {
-                "remaining": max(0.0, self.blocked_until - time.monotonic()),
+                "remaining": max(0.0, self.blocked_until - now),
                 "incidents": self.incidents,
+                "incident_id": self.incident_id,
+                "incident_elapsed": max(0.0, now - self.incident_started) if self.incident_started else 0.0,
                 "reason": self.reason,
                 "probe_required": self.probe_required,
                 "probe_inflight": self.probe_inflight,
+                "eligible_at_epoch": self.blocked_until_wall,
             }
 
     def configure(self, base_pause: float, max_pause: float) -> None:

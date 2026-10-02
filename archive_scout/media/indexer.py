@@ -890,6 +890,9 @@ def _request_media_resume(
 def _media_failure_error(failures: list[PageFetchResult]) -> BaseException:
     if not failures:
         return TransientRequestError("unknown paged media CDX failure", splittable=False)
+    for item in failures:
+        if isinstance(item.error, RateLimitDeferred):
+            return item.error
     return failures[0].error or TransientRequestError("unknown paged media CDX failure", splittable=False)
 
 
@@ -1076,7 +1079,7 @@ def index_direct_media(
                     }
 
                     def store_completed_media_page(result: PageFetchResult) -> None:
-                        nonlocal received, accepted_count, changed, write_seconds, batch_pages_done, last_page_progress
+                        nonlocal received, accepted_count, changed, write_seconds, batch_pages_done, last_page_progress, seen
                         page_received = len(result.rows)
                         accepted = _accept_media_rows(result.rows, media)
                         write_started = time.monotonic()
@@ -1093,6 +1096,7 @@ def index_direct_media(
                         completed_pages.add(int(result.page))
                         write_seconds += time.monotonic() - write_started
                         received += page_received
+                        seen += page_received
                         accepted_count += len(accepted)
                         batch_pages_done += 1
                         now = time.monotonic()
@@ -1121,7 +1125,6 @@ def index_direct_media(
                     successes = batch.successful
                     failures = batch.failed
                     with database:
-                        seen += received
                         if successes:
                             current.failures = 0
                             connection_failure_streak = 0
@@ -1266,8 +1269,29 @@ def index_direct_media(
                 with database:
                     persist_state(encode_plan(plan), False, seen, error_id)
                 raise
-            except (RateLimitDeferred, TransientRequestError) as exc:
-                if isinstance(exc, TransientRequestError) and exc.connection_failed:
+            except RateLimitDeferred as exc:
+                with database:
+                    record_recovery_event(
+                        database,
+                        "media_index",
+                        "service_rate_limit_paused",
+                        f"{target} {label}: {exc}",
+                        details=exc.to_detail(),
+                    )
+                    persist_state(encode_plan(plan), False, seen, error_id)
+                if callback:
+                    callback(
+                        ProgressEvent(
+                            "rate_limit_paused",
+                            f"{target} {label}: Wayback service pause saved exactly; Resume will continue without changing the media request plan.",
+                            completed,
+                            total,
+                            exc.to_detail(),
+                        )
+                    )
+                raise
+            except TransientRequestError as exc:
+                if exc.connection_failed:
                     connection_failure_streak += 1
                     current.failures += 1
                     network = target_config.network.normalized()
@@ -1994,12 +2018,25 @@ def index_external_embedded_media(
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if callback:
-            stage = "rate_limit" if "quota/overload cooldown" in reason or "all Wayback requests paused" in reason else "media_embed"
             if wait_seconds > 0:
                 message = f"{reason}. Retry {attempt}/{total} in {wait_seconds:.1f}s…"
             else:
                 message = reason
-            callback(ProgressEvent(stage, message))
+            callback(ProgressEvent("media_embed", message))
+
+    def on_rate_event(detail: dict[str, object]) -> None:
+        if not callback:
+            return
+        phase = str(detail.get("phase") or "cooldown")
+        status = int(detail.get("http_status") or 429)
+        wait_seconds = max(0.0, float(detail.get("wait_seconds") or 0.0))
+        if phase == "paused":
+            message = f"Wayback HTTP {status} recovery budget is exhausted; embedded-media progress was saved for Resume."
+            stage = "rate_limit_paused"
+        else:
+            message = f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; one recovery probe will run next."
+            stage = "rate_limit_waiting"
+        callback(ProgressEvent(stage, message, detail=dict(detail)))
 
     client = HttpClient(
         limiter,
@@ -2017,6 +2054,7 @@ def index_external_embedded_media(
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
+        rate_event_callback=on_rate_event,
     )
     try:
         index_embedded_media(
@@ -2047,17 +2085,29 @@ def index_media(
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if callback:
-            if "quota/overload cooldown" in reason or "all Wayback requests paused" in reason:
-                limit = f"/{total}" if total else ""
-                message = f"{reason}. Shared pause {attempt}{limit} for {wait_seconds:.1f}s; one recovery probe will run next…"
-                stage = "rate_limit"
-            elif wait_seconds <= 0:
+            if wait_seconds <= 0:
                 message = reason
                 stage = "network"
             else:
                 message = f"CDX media request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}s…"
                 stage = "media_index"
             callback(ProgressEvent(stage, message))
+
+    def on_rate_event(detail: dict[str, object]) -> None:
+        if not callback:
+            return
+        phase = str(detail.get("phase") or "cooldown")
+        status = int(detail.get("http_status") or 429)
+        wait_seconds = max(0.0, float(detail.get("wait_seconds") or 0.0))
+        spacing = detail.get("effective_spacing_seconds")
+        if phase == "paused":
+            message = f"Wayback HTTP {status} recovery budget is exhausted; the exact media queue was saved for Resume."
+            stage = "rate_limit_paused"
+        else:
+            spacing_text = f" Effective index spacing: {float(spacing):.3f}s." if spacing is not None else ""
+            message = f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; one recovery probe will run next.{spacing_text}"
+            stage = "rate_limit_waiting"
+        callback(ProgressEvent(stage, message, detail=dict(detail)))
 
     client = HttpClient(
         limiter,
@@ -2075,6 +2125,7 @@ def index_media(
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
+        rate_event_callback=on_rate_event,
     )
     try:
         index_direct_media(config, database, client, stop_event, callback, signature, state_signature)

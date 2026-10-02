@@ -63,7 +63,7 @@ class PrefixClient:
 
 class Audit5ReleaseTests(unittest.TestCase):
     def test_release_identity_and_historical_healthy_cdx_default(self):
-        self.assertEqual(VERSION, "1.0.0")
+        self.assertEqual(VERSION, "1.0.1")
         cfg = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(cfg.cdx_delay, 2.5)
         self.assertEqual(cfg.network.cdx_workers, 10)
@@ -164,7 +164,7 @@ class Audit5ReleaseTests(unittest.TestCase):
             result = fetch_media(row, cfg, PrefixClient(HTML, "text/html"))
             self.assertEqual(result["kind"], "recovered_text")
 
-    def test_auto_dense_first_resume_switches_once_to_paged(self):
+    def test_auto_healthy_resume_keeps_resume_key_without_switching_to_paged(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cfg = ProjectConfig(
@@ -178,18 +178,17 @@ class Audit5ReleaseTests(unittest.TestCase):
             ]
             calls = []
             def fake_resume(_client, _cfg, _target, current):
-                calls.append("resume")
-                current.resume_key = "next"
-                return list(rows), False
-            def fake_paged(*_args, **_kwargs):
-                calls.append("paged")
-                return PagedBatch([], [], True)
+                calls.append(("resume", current.resume_key))
+                if current.resume_key is None:
+                    current.resume_key = "next"
+                    return list(rows), False
+                return [], True
             with mock.patch("archive_scout.cdx.indexer._request_resume", side_effect=fake_resume), \
-                 mock.patch("archive_scout.cdx.indexer._request_paged_batch", side_effect=fake_paged):
+                 mock.patch("archive_scout.cdx.indexer._request_paged_batch", side_effect=AssertionError("healthy resume must not switch to paged")):
                 index_archive(cfg, db, threading.Event())
-            self.assertEqual(calls, ["resume", "paged"])
+            self.assertEqual(calls, [("resume", None), ("resume", "next")])
             event = db.execute("SELECT COUNT(*) FROM recovery_events WHERE category='auto_dense_paged'").fetchone()[0]
-            self.assertEqual(event, 1)
+            self.assertEqual(event, 0)
             db.close()
 
     def test_combined_operation_calls_standard_media_only_after_text_pipeline(self):

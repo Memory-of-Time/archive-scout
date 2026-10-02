@@ -39,7 +39,6 @@ from .parameters import (
     adopt_compatible_index_state,
     parse_num_pages,
     preferred_index_strategy,
-    is_broad_cdx_query,
 )
 
 
@@ -496,17 +495,33 @@ def _client_for_config(
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
-        if "all Wayback requests paused" in reason:
-            limit = f"/{total}" if total else ""
-            message = f"{reason}. Shared pause {attempt}{limit} for {wait_seconds:.1f}s; one recovery probe will run next…"
-            stage = "rate_limit"
-        elif wait_seconds <= 0:
+        if wait_seconds <= 0:
             message = reason
             stage = "network"
         else:
             message = f"CDX request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}s…"
             stage = "index"
         emit(callback, ProgressEvent(stage, message))
+
+    def on_rate_event(detail: dict[str, object]) -> None:
+        phase = str(detail.get("phase") or "cooldown")
+        status = int(detail.get("http_status") or 429)
+        wait_seconds = max(0.0, float(detail.get("wait_seconds") or 0.0))
+        spacing = detail.get("effective_spacing_seconds")
+        if phase == "paused":
+            message = (
+                f"Wayback HTTP {status} recovery budget is exhausted. The exact index queue is saved; "
+                "Resume will continue after the service cooldown is eligible."
+            )
+            stage = "rate_limit_paused"
+        else:
+            spacing_text = f" Effective index spacing: {float(spacing):.3f}s." if spacing is not None else ""
+            message = (
+                f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; "
+                f"one recovery probe will run next.{spacing_text}"
+            )
+            stage = "rate_limit_waiting"
+        emit(callback, ProgressEvent(stage, message, detail=dict(detail)))
 
     def on_network(message: str) -> None:
         emit(callback, ProgressEvent("network", message))
@@ -527,6 +542,7 @@ def _client_for_config(
         network_backend=network.backend,
         trust_environment=network.trust_environment,
         network_callback=on_network,
+        rate_event_callback=on_rate_event,
     )
 
 
@@ -718,6 +734,9 @@ def _request_resume(
 def _paged_failure_error(failures: list[PageFetchResult]) -> BaseException:
     if not failures:
         return TransientRequestError("unknown paged CDX failure", splittable=False)
+    for item in failures:
+        if isinstance(item.error, RateLimitDeferred):
+            return item.error
     return failures[0].error or TransientRequestError("unknown paged CDX failure", splittable=False)
 
 
@@ -877,7 +896,7 @@ def index_archive(
                         }
 
                         def store_completed_page(result: PageFetchResult) -> None:
-                            nonlocal received, changed, write_seconds, batch_pages_done, last_page_progress
+                            nonlocal received, changed, write_seconds, batch_pages_done, last_page_progress, seen
                             page_received = len(result.rows)
                             write_started = time.monotonic()
                             # Capture rows and their page checkpoint are one
@@ -896,6 +915,7 @@ def index_archive(
                             completed_pages.add(int(result.page))
                             write_seconds += time.monotonic() - write_started
                             received += page_received
+                            seen += page_received
                             batch_pages_done += 1
                             now = time.monotonic()
                             if (
@@ -925,7 +945,6 @@ def index_archive(
                         successes = batch.successful
                         failures = batch.failed
                         with database:
-                            seen += received
                             if successes:
                                 current.failures = 0
                                 connection_failure_streak = 0
@@ -1041,44 +1060,16 @@ def index_archive(
                         )
                         continue
 
-                    starting_resume_key = current.resume_key
                     rows, finished = _request_resume(client, target_config, target, current)
                     connection_failure_streak = 0
                     transient_failure_streak = 0
                     request_seconds = time.monotonic() - request_started
                     received = len(rows)
-                    # Automatic mode starts unknown broad ranges with one useful
-                    # data-bearing resume request. If that first response is
-                    # demonstrably dense and has continuation, preserve its rows
-                    # and switch the saved window once to the proven ten-worker
-                    # Timemap page pipeline. Never reinterpret an existing resume
-                    # checkpoint or oscillate strategies during a healthy run.
-                    auto_dense_switch = (
-                        not finished
-                        and starting_resume_key is None
-                        and target_config.network.normalized().index_strategy == "auto"
-                        and is_broad_cdx_query(target_config, target)
-                        and received >= max(1000, int((current.page_size or target_config.page_size) * 0.80))
-                    )
-                    if auto_dense_switch:
-                        current.strategy = "paged"
-                        current.resume_key = None
-                        current.page = 0
-                        current.page_count = -1
-                        current.page_blocks = 9
-                        current.retry_pages.clear()
-                        current.page_failures.clear()
                     write_started = time.monotonic()
                     with database:
                         changed = upsert_captures(database, rows, target_id, signature)
                         seen += received
                         current.failures = 0
-                        if auto_dense_switch:
-                            record_recovery_event(
-                                database, "index", "auto_dense_paged",
-                                f"{target} {label}: first combined-range batch was dense; switching once to bounded parallel Timemap pages",
-                                details={"received": received, "page_blocks": 9},
-                            )
                         if finished:
                             plan.pending.pop(0)
                             plan.completed += 1
@@ -1108,10 +1099,30 @@ def index_archive(
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     raise
                 except RateLimitDeferred as exc:
-                    error_id = _defer_transient_window(
-                        target_config, database, plan, current, persist_task_state, seen, error_id,
-                        exc, callback, completed_windows, total_windows, stop_event,
+                    # The HTTP layer has already exhausted the one shared
+                    # service-recovery budget. Preserve the exact pending work
+                    # unchanged and let the typed pause reach the operation
+                    # boundary; shrinking/splitting/rotating cannot repair quota.
+                    with database:
+                        record_recovery_event(
+                            database,
+                            "index",
+                            "service_rate_limit_paused",
+                            f"{target} {label}: {exc}",
+                            details=exc.to_detail(),
+                        )
+                        persist_task_state(encode_plan(plan), False, seen, error_id)
+                    emit(
+                        callback,
+                        ProgressEvent(
+                            "rate_limit_paused",
+                            f"{target} {label}: Wayback service pause saved exactly; Resume will continue without changing the request plan.",
+                            completed_windows,
+                            total_windows,
+                            exc.to_detail(),
+                        ),
                     )
+                    raise
                 except TransientRequestError as exc:
                     if exc.connection_failed:
                         connection_failure_streak += 1

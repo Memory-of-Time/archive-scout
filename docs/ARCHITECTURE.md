@@ -4,7 +4,7 @@ Archive Scout is a project-oriented desktop application. The UI is deliberately 
 
 ## Project storage
 
-Each project contains `archive_scout.sqlite3`, downloaded captures, downloaded media, reports, backups, and derived exports. SQLite is the authoritative work-state store. The current public v1.0.0 project schema is 11. SQLite is the authoritative manifest, queue, coverage, classification, scan/review and recovery store; retained capture/media files hold the replay payload bytes.
+Each project contains `archive_scout.sqlite3`, downloaded captures, downloaded media, reports, backups, and derived exports. SQLite is the authoritative work-state store. The current public v1.0.1 project schema is 11. SQLite is the authoritative manifest, queue, coverage, classification, scan/review and recovery store; retained capture/media files hold the replay payload bytes.
 
 Project connections use WAL mode, normal synchronous behavior, memory temporary storage, a bounded cache, memory mapping, busy timeouts, and foreign keys. Large queues are read with keyset pagination rather than large OFFSET scans.
 

@@ -23,15 +23,15 @@ from archive_scout.utils import normalize_search
 
 class V106ReleaseTests(unittest.TestCase):
     def test_release_identity(self):
-        self.assertEqual(VERSION, '1.0.0')
+        self.assertEqual(VERSION, '1.0.1')
         self.assertEqual(SCHEMA_VERSION, 11)
 
     def test_windows_file_version_metadata_matches_release(self):
         metadata = Path('packaging/windows/version_info.txt').read_text(encoding='utf-8')
-        self.assertIn('filevers=(1, 0, 0, 0)', metadata)
-        self.assertIn('prodvers=(1, 0, 0, 0)', metadata)
-        self.assertIn("StringStruct('FileVersion', '1.0.0')", metadata)
-        self.assertIn("StringStruct('ProductVersion', '1.0.0')", metadata)
+        self.assertIn('filevers=(1, 0, 1, 0)', metadata)
+        self.assertIn('prodvers=(1, 0, 1, 0)', metadata)
+        self.assertIn("StringStruct('FileVersion', '1.0.1')", metadata)
+        self.assertIn("StringStruct('ProductVersion', '1.0.1')", metadata)
 
     def test_url_filename_preserves_query_and_is_portable(self):
         a = url_filename('http://example.com/show.php?id=1&x=a')

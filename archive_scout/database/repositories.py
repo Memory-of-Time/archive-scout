@@ -904,8 +904,11 @@ def update_operation_run(
     completed: int | None = None,
     total: int | None = None,
     stage: str = "",
+    detail: dict | None = None,
 ) -> None:
     payload = {"completed": completed, "total": total, "stage": stage}
+    if detail:
+        payload["detail"] = dict(detail)
     database.execute(
         "UPDATE operation_runs SET updated_at=?,message=?,progress_json=? WHERE id=?",
         (utc_now(), message, json.dumps(payload, ensure_ascii=False), operation_run_id),
