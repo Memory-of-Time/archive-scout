@@ -118,7 +118,17 @@ class WheelRouter:
         delta = float(getattr(event, "delta", 0) or 0)
         if not delta:
             return 0
-        divisor = 1.0 if sys.platform == "darwin" else 120.0
+        # Tk normally reports Windows/X11 wheel notches in multiples of 120,
+        # while native macOS trackpads typically provide small/high-resolution
+        # deltas.  Some macOS Tk builds and synthetic/test events can still
+        # deliver the classic +/-120 form, so normalize that shape as one
+        # logical notch instead of treating it as 120 scroll units.
+        if sys.platform == "darwin":
+            quotient = delta / 120.0
+            classic_notch = abs(delta) >= 120.0 and abs(quotient - round(quotient)) < 1e-9
+            divisor = 120.0 if classic_notch else 1.0
+        else:
+            divisor = 120.0
         key = (id(surface), "x" if horizontal else "y")
         accumulated = self._wheel_residual.get(key, 0.0) + (-delta / divisor)
         if abs(accumulated) < 1.0:
