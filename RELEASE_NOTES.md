@@ -1,21 +1,16 @@
-# Archive Scout 1.0.1 release notes
+# Archive Scout 1.0.2 release notes
 
-Archive Scout 1.0.1 is a focused corrective release for rate-limit recovery and GUI scrolling. The project schema remains **11**.
+Archive Scout 1.0.2 is a focused interface and per-target correctness release. The project schema remains **11** and existing v1.0.0/v1.0.1 projects remain compatible.
 
-## Wayback recovery
+## What changed
 
-An exhausted live 429/503 recovery budget is now a typed, resumable service pause. Text and media indexers preserve the exact pending request and propagate that pause to the operation boundary without reducing row caps, subdividing date windows, rotating endpoints, switching formats, or granting a fresh automatic recovery budget.
-
-Paged schedulers treat the first service deferral as a pool-wide control signal: new page admission stops, queued sibling work is cancelled, already-validated pages are committed with their checkpoints, and unfinished pages remain pending without being counted as ordinary page failures.
-
-The shared host gate now carries an absolute recovery deadline across workers. Time already spent behind a shared cooldown counts toward that deadline. Retry-After remains a minimum server deadline and its wall-clock eligibility is persisted so restarting Archive Scout cannot cause an early retry. Adaptive pacing changes at most once per coalesced incident, and healthy automatic indexing continues resume-key traversal rather than switching a dense first response to paged mode.
-
-## Scrolling and Windows interaction
-
-Focusing a control that is already visible no longer changes the page position. Keyboard traversal reveals an off-screen control only as far as necessary, using the actual canvas viewport and coalesced idle work without calling `update_idletasks()` from the focus handler.
-
-Wheel input is routed once through a single interpreter-wide router. Routing prefers the surface under the pointer, retains high-resolution residuals per stable surface/axis, and prevents a native Text/Listbox/Treeview that reaches its boundary from also moving its parent on the same event.
+- **Clearly outlined text-entry areas on every OS.** Multiline Tk text editors now receive an explicit theme-aware border/focus outline instead of depending on platform-native defaults that could make editable regions blend into the page.
+- **Media editors are visibly grouped.** Media sites/paths, Include extensions, and Exclude extensions now use labeled outlined groups so it is immediately clear where each one-per-line list is entered.
+- **Per-target overrides remain attached to the target through the full text pipeline.** A target-specific date range, match type, collapse/filter identity, or other query-defining setting no longer indexes under one CDX signature and then disappears when replay/scanning uses the global signature.
+- **Per-target replay settings now actually apply.** Target-specific Download workers and Replay delay settings run in bounded target phases while still respecting Archive Scout's process-wide Wayback pacing floor and shared cooldown behavior.
+- **Simple mode explicitly honors target overrides.** Configure current target stores overrides under the same normalized target identity used by the backend, and Sites and paths shows a live summary of the active override on the current line.
+- **No schema migration.** Project schema remains 11.
 
 ## Compatibility
 
-The public application version is **1.0.1** and the internal project schema remains **11**. Existing v1.0.0 projects remain compatible.
+The release keeps the v1.0.1 rate-limit, scrolling, recovery, scanner, report, media, and project-safety behavior. Existing project configuration and SQLite data remain compatible.

@@ -1,6 +1,6 @@
 # Scanning performance
 
-Archive Scout 1.0.1 keeps deterministic evidence semantics while reducing avoidable local CPU and I/O work. The scanner reuses normalized/count data, bounds proximity-segment work, avoids repeated literal-count allocation, reuses already-saved files for local rescans, and handles malformed-markup tails without reintroducing a source-length truncation.
+Archive Scout 1.0.2 keeps deterministic evidence semantics while reducing avoidable local CPU and I/O work. The scanner reuses normalized/count data, bounds proximity-segment work, avoids repeated literal-count allocation, reuses already-saved files for local rescans, and handles malformed-markup tails without reintroducing a source-length truncation.
 
 Scanning is local after acquisition. Increasing scanner workers can improve CPU-bound throughput on suitable hardware without increasing Wayback request volume. Network pacing is controlled independently by the index and replay request-attempt pools described in `NETWORK_PERFORMANCE.md`.
 

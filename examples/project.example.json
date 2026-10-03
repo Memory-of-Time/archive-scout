@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "output_dir": "./archive-scout-project",
   "targets": ["example.com/*"],
   "keywords": ["video", "archive"],

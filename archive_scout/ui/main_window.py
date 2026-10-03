@@ -19,7 +19,7 @@ from ..ai.relevance import AIReviewError, run_ai_review
 from ..ai.reports import generate_ai_reports
 from ..cdx.client import RateLimitDeferred
 from ..cdx.parameters import build_cdx_params, build_num_pages_params, cdx_year_window, cdx_endpoints, cdx_paged_endpoints, preferred_index_strategy
-from ..utils import cdx_request_url
+from ..utils import cdx_request_url, normalize_target
 from ..config import (
     AIConfig,
     AnalysisConfig,
@@ -178,6 +178,7 @@ class ArchiveScoutApp(tk.Tk):
         self.result_sort_column = "score"
         self.result_sort_reverse = True
         self.target_settings: dict[str, dict] = {}
+        self.target_override_status_var = tk.StringVar(value="No per-target override on the current line.")
         self.nav_buttons: dict[str, ttk.Button] = {}
         self.page_names: list[str] = []
         self.result_page = 0
@@ -833,20 +834,53 @@ class ArchiveScoutApp(tk.Tk):
         hscroll.grid(row=2, column=0, sticky="ew")
         self.targets_text.configure(yscrollcommand=scroll.set, xscrollcommand=hscroll.set)
         controls = ttk.Frame(tab)
-        controls.grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(controls, text="Configure current target…", command=self.configure_target_settings).grid(row=0, column=0)
-        ttk.Label(controls, text="Per-target settings may narrow dates or slow request pacing; they cannot exceed the shared Wayback request rate.", style="Muted.TLabel").grid(row=0, column=1, padx=(10, 0))
+        controls.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(1, weight=1)
+        ttk.Button(controls, text="Configure current target…", command=self.configure_target_settings).grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text="Per-target settings are honored in both Simple and Advanced modes; slower pacing can never exceed the shared Wayback request rate.", style="Muted.TLabel", wraplength=820).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(controls, textvariable=self.target_override_status_var, style="Muted.TLabel", wraplength=1000).grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        self.targets_text.bind("<KeyRelease>", lambda _e: self._refresh_target_override_status(), add=True)
+        self.targets_text.bind("<ButtonRelease-1>", lambda _e: self._refresh_target_override_status(), add=True)
 
-    def configure_target_settings(self) -> None:
+    def _current_target_line(self) -> str:
         try:
             index = self.targets_text.index("insert")
-            line = self.targets_text.get(f"{index.split('.')[0]}.0", f"{index.split('.')[0]}.end").strip()
+            return self.targets_text.get(f"{index.split('.')[0]}.0", f"{index.split('.')[0]}.end").strip()
         except Exception:
-            line = ""
+            return ""
+
+    @staticmethod
+    def _target_override_key(line: str) -> str:
+        try:
+            return normalize_target(line)
+        except (TypeError, ValueError):
+            return str(line or "").strip()
+
+    def _refresh_target_override_status(self) -> None:
+        line = self._current_target_line()
+        if not line:
+            self.target_override_status_var.set("No target selected. Place the cursor on a target line to inspect its override.")
+            return
+        key = self._target_override_key(line)
+        settings = dict(self.target_settings.get(key) or self.target_settings.get(line) or {})
+        if not settings:
+            self.target_override_status_var.set(f"No per-target override for {key or line}.")
+            return
+        labels = {
+            "from_date": "from", "to_date": "to", "cdx_match_type": "matchType",
+            "page_size": "CDX limit", "workers": "workers", "scan_workers": "scan workers",
+            "cdx_delay": "CDX delay", "download_delay": "replay delay",
+        }
+        summary = ", ".join(f"{labels.get(name, name)}={value}" for name, value in settings.items())
+        self.target_override_status_var.set(f"Active override for {key}: {summary}")
+
+    def configure_target_settings(self) -> None:
+        line = self._current_target_line()
         if not line:
             messagebox.showinfo(APP_NAME, "Place the cursor on a target line first.")
             return
-        existing = dict(self.target_settings.get(line) or {})
+        target_key = self._target_override_key(line)
+        existing = dict(self.target_settings.get(target_key) or self.target_settings.get(line) or {})
         dialog = tk.Toplevel(self)
         dialog.title(f"Target settings — {line}")
         dialog.transient(self)
@@ -867,22 +901,42 @@ class ArchiveScoutApp(tk.Tk):
             "page_size": "CDX result limit", "workers": "Download workers",
             "cdx_delay": "CDX delay (slower only)", "download_delay": "Replay delay (slower only)",
         }
-        for row, key in enumerate(fields):
-            ttk.Label(frame, text=labels[key] + ":").grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Entry(frame, textvariable=fields[key], width=28).grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
+        for row, field_name in enumerate(fields):
+            ttk.Label(frame, text=labels[field_name] + ":").grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=fields[field_name], width=28).grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
         def save() -> None:
-            values = {key: variable.get().strip() for key, variable in fields.items() if variable.get().strip()}
-            for key in ("page_size", "workers"):
-                if key in values:
-                    values[key] = int(values[key])
-            for key in ("cdx_delay", "download_delay"):
-                if key in values:
-                    values[key] = float(values[key])
-            self.target_settings[line] = values
+            values = {name: variable.get().strip() for name, variable in fields.items() if variable.get().strip()}
+            try:
+                for name in ("page_size", "workers"):
+                    if name in values:
+                        values[name] = int(values[name])
+                for name in ("cdx_delay", "download_delay"):
+                    if name in values:
+                        values[name] = float(values[name])
+            except ValueError as exc:
+                messagebox.showerror(APP_NAME, f"Check the numeric target settings: {exc}", parent=dialog)
+                return
+            # Store overrides by normalized target identity.  This guarantees
+            # that a Simple-mode line such as https://example.com resolves to
+            # the same key used by ProjectConfig.for_target().
+            if line != target_key:
+                self.target_settings.pop(line, None)
+            if values:
+                self.target_settings[target_key] = values
+            else:
+                self.target_settings.pop(target_key, None)
+            self._refresh_target_override_status()
             dialog.destroy()
+
+        def clear_override() -> None:
+            self.target_settings.pop(line, None)
+            self.target_settings.pop(target_key, None)
+            self._refresh_target_override_status()
+            dialog.destroy()
+
         buttons = ttk.Frame(frame)
         buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Clear override", command=lambda: (self.target_settings.pop(line, None), dialog.destroy())).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Clear override", command=clear_override).pack(side="left", padx=4)
         ttk.Button(buttons, text="Save", command=save, style="Accent.TButton").pack(side="left", padx=4)
 
     def create_keywords_tab(self) -> None:
@@ -969,29 +1023,30 @@ class ArchiveScoutApp(tk.Tk):
             wraplength=1080,
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        labels = ttk.Frame(tab)
-        labels.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 4))
-        labels.columnconfigure(0, weight=1)
-        labels.columnconfigure(1, weight=1)
-        ttk.Label(labels, text="Media sites/paths (blank uses Sites and paths)").grid(row=0, column=0, sticky="w")
-        ttk.Label(labels, text="Include extensions, one per line").grid(row=0, column=1, sticky="w", padx=(12, 0))
         editors = ttk.Frame(tab)
-        editors.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        editors.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
         editors.columnconfigure(0, weight=1)
         editors.columnconfigure(1, weight=1)
         editors.columnconfigure(2, weight=1)
         editors.rowconfigure(0, weight=1)
-        self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont")
+
+        target_box = ttk.LabelFrame(editors, text="Media sites/paths — blank uses Sites and paths", padding=6)
+        target_box.grid(row=0, column=0, sticky="nsew")
+        target_box.columnconfigure(0, weight=1); target_box.rowconfigure(0, weight=1)
+        self.media_targets_text = tk.Text(target_box, wrap="none", font="TkFixedFont")
         self.media_targets_text.grid(row=0, column=0, sticky="nsew")
-        self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont")
-        self.media_include_text.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
-        right = ttk.Frame(editors)
-        right.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-        ttk.Label(right, text="Exclude extensions, one per line").grid(row=0, column=0, sticky="w")
-        self.media_exclude_text = tk.Text(right, wrap="none", font="TkFixedFont")
-        self.media_exclude_text.grid(row=1, column=0, sticky="nsew")
+
+        include_box = ttk.LabelFrame(editors, text="Include extensions — one per line", padding=6)
+        include_box.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        include_box.columnconfigure(0, weight=1); include_box.rowconfigure(0, weight=1)
+        self.media_include_text = tk.Text(include_box, wrap="none", font="TkFixedFont")
+        self.media_include_text.grid(row=0, column=0, sticky="nsew")
+
+        exclude_box = ttk.LabelFrame(editors, text="Exclude extensions — one per line", padding=6)
+        exclude_box.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+        exclude_box.columnconfigure(0, weight=1); exclude_box.rowconfigure(0, weight=1)
+        self.media_exclude_text = tk.Text(exclude_box, wrap="none", font="TkFixedFont")
+        self.media_exclude_text.grid(row=0, column=0, sticky="nsew")
         policy = ttk.Frame(tab)
         policy.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         policy.columnconfigure(0, weight=1)
@@ -2976,6 +3031,8 @@ class ArchiveScoutApp(tk.Tk):
         self.network_retry_max_var.set(str(network.retry_max_seconds))
         self.network_failure_limit_var.set(str(network.failure_pause_threshold))
         self.target_settings = dict(config.target_settings)
+        if hasattr(self, "target_override_status_var"):
+            self._refresh_target_override_status()
         self.auto_backup_var.set(config.auto_backup)
         self.backup_keep_var.set(str(config.backup_keep))
         self.backup_max_var.set(str(config.backup_max_mb))

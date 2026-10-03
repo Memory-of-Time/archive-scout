@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2 — Interface outlines and per-target correctness
+
+- Added explicit cross-platform outlines for multiline text-entry areas and labeled Media input groups.
+- Fixed target-specific CDX signatures/date scopes being lost when the text replay and scan selectors used only the global project signature.
+- Made per-target replay worker and delay overrides effective during text acquisition.
+- Normalized Configure current target keys and surfaced the active override summary in Sites and paths, including Simple mode.
+- Project schema remains 11.
+
 ## 1.0.1 — Rate-limit and scrolling corrective release
 
 - Propagates an exhausted Wayback service pause unchanged to the operation boundary instead of shrinking, splitting, rotating, or retrying the pending request.

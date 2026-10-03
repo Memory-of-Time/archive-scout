@@ -1,9 +1,9 @@
-Archive Scout 1.0.1 source validation
+Archive Scout 1.0.2 source validation
 
-Release identity: 1.0.1
+Release identity: 1.0.2
 Project schema: 11
 Validation scope: source tree and offline tests in this repository
-Test suite: 367 passed; 3 expected environment/display skips; 0 failures/errors.
+Test suite: 373 passed; 3 expected environment/display skips; 0 failures/errors.
 Python compileall: passed.
 Windows manifest XML parse: passed.
 
@@ -18,8 +18,11 @@ Validated release invariants:
 - Shared recovery incidents enforce one absolute deadline and persist Retry-After eligibility across restart.
 - Adaptive pacing changes at most once per coalesced service incident.
 - Visible focus changes do not move scrollable pages; native wheel boundary events are not double-routed to parent pages.
+- Multiline text-entry areas use explicit theme-aware outlines, and Media target/include/exclude editors are clearly labeled across Windows, macOS, and Linux.
+- Per-target date/match/query overrides stay associated with the correct indexed inventory through replay acquisition and local scanning, including Simple mode.
+- Per-target replay worker and delay overrides are applied in bounded target acquisition phases without weakening the shared request floor.
 - Historical archived-origin 429 responses do not close the live host gate.
-- Windows build metadata declares 1.0.1 and includes the Per-Monitor V2 DPI manifest.
+- Windows build metadata declares 1.0.2 and includes the Per-Monitor V2 DPI manifest.
 - Theme code scales named fonts without writing the global Tk DPI scale.
 - Results/FTS, History, Errors, and site-issue reads use background query workers with generation guards.
 

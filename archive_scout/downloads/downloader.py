@@ -95,6 +95,98 @@ def capture_path(root: Path, capture_id: int, timestamp: str, original: str) -> 
     del capture_id
     return url_capture_path(root, timestamp, original)
 
+def _inventory_scope_predicate(
+    database: sqlite3.Connection,
+    config: ProjectConfig,
+    *,
+    alias: str = "c",
+) -> tuple[str, list[object]]:
+    """Return the active text-inventory predicate for every configured target.
+
+    Per-target CDX overrides can change the semantic query signature and date
+    bounds.  Indexing has always stored those target-specific identities, but
+    older replay/scan selectors compared every row with only the global project
+    signature.  That made correctly indexed override rows disappear from later
+    Simple-mode acquisition/scanning.  Keep target id, signature and date scope
+    together all the way through the text pipeline.
+
+    ``target_id IS NULL`` remains accepted for legacy/test rows created before
+    target provenance became mandatory.
+    """
+    normalized = config.normalized()
+    clauses: list[str] = []
+    params: list[object] = []
+    seen: set[tuple[object, ...]] = set()
+    for target in normalized.targets:
+        target_config = normalized.for_target(target)
+        signature = cdx_query_signature(target_config)
+        target_row = database.execute(
+            "SELECT id FROM targets WHERE pattern=?", (target,)
+        ).fetchone()
+        target_id = int(target_row[0]) if target_row is not None else None
+        date_bound = cdx_signature_is_date_bound(target_config)
+        identity = (
+            target_id, signature,
+            "" if date_bound else target_config.from_date,
+            "" if date_bound else target_config.to_date,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        parts: list[str] = []
+        if target_id is not None:
+            parts.append(f"({alias}.target_id=? OR {alias}.target_id IS NULL)")
+            params.append(target_id)
+        parts.append(f"{alias}.query_signature=?")
+        params.append(signature)
+        if not date_bound:
+            parts.append(f"{alias}.timestamp BETWEEN ? AND ?")
+            params.extend([target_config.from_date, target_config.to_date])
+        clauses.append("(" + " AND ".join(parts) + ")")
+
+    if not clauses:
+        # Keep helpers useful for compatibility callers that supply an otherwise
+        # valid config with no target provenance. Normal GUI acquisition already
+        # rejects an empty target list before reaching this point.
+        signature = cdx_query_signature(normalized)
+        parts = [f"{alias}.query_signature=?"]
+        params = [signature]
+        if not cdx_signature_is_date_bound(normalized):
+            parts.append(f"{alias}.timestamp BETWEEN ? AND ?")
+            params.extend([normalized.from_date, normalized.to_date])
+        return "(" + " AND ".join(parts) + ")", params
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def _active_query_signatures(config: ProjectConfig) -> tuple[str, ...]:
+    normalized = config.normalized()
+    if not normalized.targets:
+        return (cdx_query_signature(normalized),)
+    return tuple(dict.fromkeys(
+        cdx_query_signature(normalized.for_target(target)) for target in normalized.targets
+    ))
+
+
+def _text_runtime_target_configs(
+    config: ProjectConfig,
+    capture_ids: list[int] | None = None,
+) -> list[ProjectConfig]:
+    """Split acquisition only when a target has runtime replay overrides.
+
+    Query-defining overrides are handled by ``_inventory_scope_predicate`` and
+    can therefore remain in one high-throughput queue.  Worker/replay-delay (and
+    advanced scan-worker) overrides need their own executor/limiter instance, so
+    those targets run as bounded per-target phases.  Explicit capture-id retries
+    stay single-pass to avoid retrying the same row once per configured target.
+    """
+    normalized = config.normalized()
+    if capture_ids or len(normalized.targets) <= 1:
+        return [normalized]
+    runtime_keys = {"workers", "download_delay", "scan_workers"}
+    if not any(runtime_keys.intersection(normalized.settings_for_target(target)) for target in normalized.targets):
+        return [normalized]
+    return [normalized.for_target(target) for target in normalized.targets]
+
 
 def _allocate_capture_path(database: sqlite3.Connection, root: Path, row: sqlite3.Row, reserved: set[str] | None = None) -> Path:
     existing = str(row["local_path"] or "") if "local_path" in row.keys() else ""
@@ -132,15 +224,13 @@ def cumulative_download_progress(
 ) -> tuple[int, int]:
     if capture_ids:
         return 0, max(0, int(queued_total))
-    signature = cdx_query_signature(config)
-    date_sql = "" if cdx_signature_is_date_bound(config) else " AND timestamp BETWEEN ? AND ?"
-    params: tuple[object, ...] = (signature,) if not date_sql else (signature, config.from_date, config.to_date)
+    scope_sql, scope_params = _inventory_scope_predicate(database, config, alias="captures")
     total = int(database.execute(
-        "SELECT COUNT(*) FROM captures WHERE query_signature=?" + date_sql, params
+        "SELECT COUNT(*) FROM captures WHERE " + scope_sql, scope_params
     ).fetchone()[0])
     unfinished = int(database.execute(
-        "SELECT COUNT(*) FROM captures WHERE query_signature=?" + date_sql
-        + " AND state IN ('pending','downloading','downloaded_unscanned','scanning')", params,
+        "SELECT COUNT(*) FROM captures WHERE " + scope_sql
+        + " AND state IN ('pending','downloading','downloaded_unscanned','scanning')", scope_params,
     ).fetchone()[0])
     return max(0, total - unfinished), total
 
@@ -183,11 +273,9 @@ def prepare_download_rows(
         )
         source += " JOIN archive_scout_capture_selection s ON s.id=c.id"
     else:
-        clauses.append("c.query_signature=?")
-        params.append(cdx_query_signature(config))
-        if not cdx_signature_is_date_bound(config):
-            clauses.append("c.timestamp BETWEEN ? AND ?")
-            params.extend([config.from_date, config.to_date])
+        scope_sql, scope_params = _inventory_scope_predicate(database, config, alias="c")
+        clauses.append(scope_sql)
+        params.extend(scope_params)
         clauses.append("c.download_attempts<?")
         params.append(config.max_attempts)
     if states:
@@ -286,11 +374,17 @@ def prepare_acquisition_rows(
     with database:
         adopt_compatible_index_identity(database, config)
         requeue_reclassifiable_skips(database, config.download_scope, CLASSIFIER_REVISION)
-    classification_counts = classify_capture_inventory(
-        database, cdx_query_signature(config),
-        allow_media_descriptors_as_text=config.search_media_descriptors,
-        stop_event=stop_event, progress_callback=classification_callback,
-    )
+    classification_counts = {
+        name: 0 for name in ("text", "image", "video", "audio", "media_descriptor", "other_binary", "unknown")
+    }
+    for signature in _active_query_signatures(config):
+        updated = classify_capture_inventory(
+            database, signature,
+            allow_media_descriptors_as_text=config.search_media_descriptors,
+            stop_event=stop_event, progress_callback=classification_callback,
+        )
+        for name, value in updated.items():
+            classification_counts[name] = classification_counts.get(name, 0) + int(value)
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_capture_selection")
     source = "captures c"
     clauses: list[str] = []
@@ -305,11 +399,9 @@ def prepare_acquisition_rows(
         )
         source += " JOIN archive_scout_capture_selection s ON s.id=c.id"
     else:
-        clauses.append("c.query_signature=?")
-        params.append(cdx_query_signature(config))
-        if not cdx_signature_is_date_bound(config):
-            clauses.append("c.timestamp BETWEEN ? AND ?")
-            params.extend([config.from_date, config.to_date])
+        scope_sql, scope_params = _inventory_scope_predicate(database, config, alias="c")
+        clauses.append(scope_sql)
+        params.extend(scope_params)
         clauses.append("c.download_attempts<?")
         params.append(config.max_attempts)
     if states:
@@ -988,11 +1080,9 @@ def _pending_scan_rows(
         )
         source += " JOIN temp.archive_scout_scan_selection s ON s.id=c.id"
     else:
-        clauses.append("c.query_signature=?")
-        params.append(cdx_query_signature(config))
-        if not cdx_signature_is_date_bound(config):
-            clauses.append("c.timestamp BETWEEN ? AND ?")
-            params.extend([config.from_date, config.to_date])
+        scope_sql, scope_params = _inventory_scope_predicate(database, config, alias="c")
+        clauses.append(scope_sql)
+        params.extend(scope_params)
     last = 0
     while True:
         rows = database.execute(
@@ -1373,8 +1463,7 @@ def _acquire_archive(
         url_skipped = int(selection_stats["url_skipped"])
         settled = downloaded + skipped + failures + metadata_skipped + url_skipped
         metrics = network_metrics()
-        logical_requests = int(metrics.get("logical_requests", 0))
-        starts = int(metrics.get("wire_request_starts", metrics["request_starts"]))
+        starts = int(metrics["request_starts"])
         completions = int(metrics["request_completions"])
         request_failures = int(metrics.get("request_failures", 0))
         retries = int(metrics["retry_waits"]) + int(metrics["rate_limit_events"])
@@ -1394,7 +1483,7 @@ def _acquire_archive(
         )
         callback(ProgressEvent(
             progress_stage,
-            f"{label}: logical HTTP operations {logical_requests:,}; wire request starts {starts:,} ({starts/elapsed:.1f}/s); "
+            f"{label}: wire request starts {starts:,} ({starts/elapsed:.1f}/s); "
             f"responses {completions:,}; transport failures {request_failures:,}; "
             f"saved {downloaded:,} ({downloaded/elapsed:.1f}/s); retries {retries:,}; "
             f"worker waits {worker_wait_seconds:.1f}s; scheduled rate pauses {scheduled_rate_pause:.1f}s; "
@@ -1402,8 +1491,6 @@ def _acquire_archive(
             min(settled, total), total,
             {
                 "replay_submitted": submitted,
-                "logical_http_operations": logical_requests,
-                "wire_request_starts": starts,
                 "replay_started": starts,
                 "replay_start_rate": starts / elapsed,
                 "http_completions": completions,
@@ -1628,9 +1715,7 @@ def _acquire_archive(
             "skipped": skipped + int(selection_stats["metadata_skipped"]) + int(selection_stats["url_skipped"]),
             "errors": failures,
             "elapsed": time.monotonic() - started,
-            "logical_http_operations": int(metrics.get("logical_requests", 0)),
-            "wire_request_starts": int(metrics.get("wire_request_starts", metrics["request_starts"])),
-            "http_starts": int(metrics.get("wire_request_starts", metrics["request_starts"])),
+            "http_starts": int(metrics["request_starts"]),
             "http_completions": int(metrics["request_completions"]),
         }
     finally:
@@ -1666,14 +1751,11 @@ def _scan_pending_captures(
                WHERE c.state='downloaded_unscanned' AND c.local_path IS NOT NULL""" + availability_clause
         ).fetchone()[0])
     else:
-        date_sql = "" if cdx_signature_is_date_bound(config) else " AND c.timestamp BETWEEN ? AND ?"
-        params = [cdx_query_signature(config)]
-        if date_sql:
-            params.extend([config.from_date, config.to_date])
+        scope_sql, scope_params = _inventory_scope_predicate(database, config, alias="c")
         total = int(database.execute(
             """SELECT COUNT(*) FROM captures c WHERE c.state='downloaded_unscanned'
-               AND c.local_path IS NOT NULL AND c.query_signature=?""" + date_sql + availability_clause,
-            params,
+               AND c.local_path IS NOT NULL AND """ + scope_sql + availability_clause,
+            scope_params,
         ).fetchone()[0])
 
     if not total:
@@ -1837,7 +1919,14 @@ def download_archive(
     capture_ids: list[int] | None = None,
     scan_jobs: list[ScanJob] | None = None,
 ) -> None:
-    """Acquire first through the shared replay engine, then scan local files."""
+    """Acquire first through the shared replay engine, then scan local files.
+
+    When a target has replay-runtime overrides, run bounded target phases so its
+    worker count and replay delay are actually honored. Query-only overrides do
+    not force a split; the unified selector keeps their target-specific CDX
+    signatures/date bounds intact without sacrificing normal multi-target
+    throughput.
+    """
     if config.download_scope == "index_only":
         if callback:
             callback(ProgressEvent("download", "Index-only mode selected; downloads skipped."))
@@ -1846,27 +1935,41 @@ def download_archive(
     if not jobs or any(not job.patterns for job in jobs):
         raise ValueError("at least one keyword rule is required")
     combined_patterns = [item for job in jobs for item in job.patterns]
+    runtime_configs = _text_runtime_target_configs(config, capture_ids)
+    split_runtime = len(runtime_configs) > 1
+    if split_runtime and callback:
+        callback(ProgressEvent(
+            "download",
+            "Applying per-target replay worker/delay settings; targets will acquire in bounded phases.",
+        ))
+
     if config.text_retention == "discard_after_scan":
         # Retry only discard-spool files left by an earlier interrupted/failed
         # run. Pre-existing retained/imported captures are never swept into the
         # destructive policy merely because this operation selected discard.
-        _scan_pending_captures(
-            config, database, jobs, stop_event, callback, capture_ids=capture_ids
-        )
-        _acquire_archive(
-            config, database, stop_event, callback,
-            patterns=combined_patterns, states=states, capture_ids=capture_ids,
-            progress_stage="download", scan_jobs=jobs,
-        )
+        for runtime_config in runtime_configs:
+            _scan_pending_captures(
+                runtime_config, database, jobs, stop_event, callback, capture_ids=capture_ids
+            )
+            _acquire_archive(
+                runtime_config, database, stop_event, callback,
+                patterns=combined_patterns, states=states, capture_ids=capture_ids,
+                progress_stage="download", scan_jobs=jobs,
+            )
     else:
-        _acquire_archive(
-            config, database, stop_event, callback,
-            patterns=combined_patterns, states=states, capture_ids=capture_ids,
-            progress_stage="download",
-        )
-        _scan_pending_captures(
-            config, database, jobs, stop_event, callback, capture_ids=capture_ids
-        )
+        # Preserve the established acquisition-first contract even when runtime
+        # settings require per-target replay pools: acquire every target first,
+        # then drain the local scan backlog target by target.
+        for runtime_config in runtime_configs:
+            _acquire_archive(
+                runtime_config, database, stop_event, callback,
+                patterns=combined_patterns, states=states, capture_ids=capture_ids,
+                progress_stage="download",
+            )
+        for runtime_config in runtime_configs:
+            _scan_pending_captures(
+                runtime_config, database, jobs, stop_event, callback, capture_ids=capture_ids
+            )
 
 
 def download_archive_only(
@@ -1880,9 +1983,29 @@ def download_archive_only(
     """Acquire text captures without creating scan/document/match work."""
     if config.text_retention == "discard_after_scan":
         raise ValueError("Scan and discard is unavailable for download-only because no scan completion exists")
-    return _acquire_archive(
-        config, database, stop_event, callback,
-        patterns=None, states=states, capture_ids=capture_ids,
-        progress_stage="download_only",
-    )
+    runtime_configs = _text_runtime_target_configs(config, capture_ids)
+    if len(runtime_configs) == 1:
+        return _acquire_archive(
+            runtime_configs[0], database, stop_event, callback,
+            patterns=None, states=states, capture_ids=capture_ids,
+            progress_stage="download_only",
+        )
 
+    totals: dict[str, int | float] = {
+        "queued": 0, "downloaded": 0, "skipped": 0, "errors": 0, "elapsed": 0.0,
+    }
+    for index, runtime_config in enumerate(runtime_configs, start=1):
+        if callback:
+            target = runtime_config.targets[0] if runtime_config.targets else f"target {index}"
+            callback(ProgressEvent(
+                "download_only",
+                f"Applying per-target replay settings for {target} ({index}/{len(runtime_configs)}).",
+            ))
+        stats = _acquire_archive(
+            runtime_config, database, stop_event, callback,
+            patterns=None, states=states, capture_ids=capture_ids,
+            progress_stage="download_only",
+        )
+        for name in totals:
+            totals[name] += stats.get(name, 0)
+    return totals
