@@ -130,11 +130,11 @@ def capture_routing_decision(
         "retained", "retained_unscanned", "spooled_unscanned", "cleanup_pending",
     }:
         return "downloaded" if state_value == "downloaded" else "downloaded_awaiting_scan"
-    if reason in {"classified_media", "payload_validation_deferred"}:
+    if reason in {"deferred_to_media", "payload_validation_deferred"}:
         return "deferred_to_media"
     if reason == "classified_media_descriptor":
         return "media_descriptor_excluded"
-    if reason in {"known_non_text", "sniffed_non_text", "unsupported_binary"}:
+    if reason in {"known_non_text", "sniffed_non_text", "unsupported_binary", "classified_media"}:
         return "skipped_non_text"
     if reason == "url_keyword_filter":
         return "skipped_url_filter"
@@ -156,7 +156,7 @@ def capture_body_coverage(
     kind = str(resource_class or "unknown").strip().casefold() or "unknown"
     state_value = str(state or "pending").strip().casefold() or "pending"
     availability = str(payload_availability or "not_acquired").strip().casefold()
-    if kind in {"image", "video", "audio", "media_descriptor", "other_binary"}:
+    if kind in {"image", "video", "audio", "other_binary"}:
         return "non_text"
     if availability == "discarded":
         return "discarded"

@@ -42,6 +42,7 @@ from ..database.repositories import (
     upsert_document,
 )
 from ..events import ConnectivityPaused, ProgressEvent, Stopped
+from .recovery import wait_for_archive
 from ..parsing.embeds import extract_embed_candidates_fast
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..scanning.jobs import ScanJob
@@ -135,7 +136,7 @@ def make_replay_redirect_validator(config: ProjectConfig, source_original: str):
     The callback runs before the transport contacts each redirect destination.
     External is defined by the embedded original host, not by the common
     web.archive.org replay host. Live destinations are never silently attached
-    to historical evidence in v1.0.4.
+    to historical evidence in v1.0.5.
     """
     normalized = config.normalized()
     scopes = _target_host_scope(normalized)
@@ -1595,6 +1596,7 @@ def _acquire_archive(
             },
         ))
 
+    last_recovery_emit = 0.0
     deferred_error: RateLimitDeferred | ConnectivityPaused | None = None
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=config.workers, thread_name_prefix="archive-acquire"
@@ -1625,7 +1627,7 @@ def _acquire_archive(
                         f"(free disk {disk_free / (1024*1024):.1f} MiB); pausing new replay admissions while scanners catch up.",
                     ))
 
-            if not backpressure_active and len(ready_downloads) < max(config.workers, inflight_limit):
+            if deferred_error is None and not backpressure_active and len(ready_downloads) < max(config.workers, inflight_limit):
                 stage_candidates()
 
             slots = 0 if backpressure_active else inflight_limit - len(futures)
@@ -1656,7 +1658,12 @@ def _acquire_archive(
                     schedule_discard_scans()
                 if deferred_error is not None:
                     flush_results(force=True)
-                    break
+                    if not config.network.persistent_retries:
+                        raise deferred_error
+                    wait_for_archive(config, host_gate, stop_event, callback, stage=progress_stage)
+                    acquisition_cancel.clear()
+                    deferred_error = None
+                    continue
                 if rows_exhausted and not ready_downloads and not waiting_scan and not scan_futures:
                     flush_results(force=True)
                     break
@@ -1681,6 +1688,8 @@ def _acquire_archive(
                 item = futures.pop(future)
                 capture_id = int(item["id"])
                 try:
+                    if future.cancelled():
+                        raise Stopped
                     result = future.result()
                     if result["kind"] == "non_text":
                         skipped_buffer.append((capture_id, str(result.get("resource_class") or "")))
@@ -1742,6 +1751,7 @@ def _acquire_archive(
                     if deferred_error is None:
                         deferred_error = exc
                         acquisition_cancel.set()
+                    ready_downloads.appendleft((item, Path(str(item["assigned_path"]))))
                     with database:
                         database.execute(
                             "UPDATE captures SET state='pending',updated_at=? WHERE id=?",
@@ -1751,6 +1761,7 @@ def _acquire_archive(
                     if deferred_error is None:
                         deferred_error = exc
                         acquisition_cancel.set()
+                    ready_downloads.appendleft((item, Path(str(item["assigned_path"]))))
                     with database:
                         database.execute(
                             "UPDATE captures SET state='pending',updated_at=? WHERE id=?",
@@ -1759,6 +1770,7 @@ def _acquire_archive(
                 except Stopped:
                     if deferred_error is None:
                         raise
+                    ready_downloads.appendleft((item, Path(str(item["assigned_path"]))))
                 except Exception as exc:
                     if is_local_storage_error(exc):
                         acquisition_cancel.set()
@@ -1781,9 +1793,10 @@ def _acquire_archive(
                 acquisition_cancel.set()
                 for pending in futures:
                     pending.cancel()
-                ready_downloads.clear()
                 flush_results(force=True)
-                break
+                if callback and futures and time.monotonic() - last_recovery_emit >= 1.0:
+                    last_recovery_emit = time.monotonic()
+                    callback(ProgressEvent("network_waiting", f"Settling {len(futures):,} active/queued replay attempts before recovery…"))
 
         if deferred_error is not None:
             raise deferred_error
@@ -1791,12 +1804,17 @@ def _acquire_archive(
         acquisition_cancel.set()
         for future in futures:
             future.cancel()
-        flush_results(force=True)
-        pool.shutdown(wait=False, cancel_futures=True)
-        if scan_pool is not None:
-            for future in scan_futures:
-                future.cancel()
-            scan_pool.shutdown(wait=False, cancel_futures=True)
+        try:
+            flush_results(force=True)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            if scan_pool is not None:
+                for future in scan_futures:
+                    future.cancel()
+                scan_pool.shutdown(wait=True, cancel_futures=True)
+        # Atomic finals from workers that settled during cancellation are
+        # adopted by the existing file recovery path. No new worker generation
+        # can own their .part paths until this executor has fully stopped.
         raise
     else:
         pool.shutdown(wait=True)

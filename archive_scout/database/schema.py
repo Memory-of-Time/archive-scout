@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS captures(
     local_path TEXT,
     content_hash TEXT,
     detected_encoding TEXT,
+    body_revision INTEGER NOT NULL DEFAULT 0,
     download_attempts INTEGER NOT NULL DEFAULT 0,
     document_id INTEGER,
     http_status INTEGER,
@@ -242,7 +243,9 @@ CREATE TABLE IF NOT EXISTS quick_search_runs(
     match_count INTEGER NOT NULL DEFAULT 0,
     started_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    coverage_version INTEGER NOT NULL DEFAULT 0,
+    capture_limit INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS quick_search_runs_fingerprint_idx ON quick_search_runs(fingerprint,id DESC);
 CREATE TABLE IF NOT EXISTS quick_search_hits(
@@ -255,6 +258,16 @@ CREATE TABLE IF NOT EXISTS quick_search_hits(
     FOREIGN KEY(run_id) REFERENCES quick_search_runs(id) ON DELETE CASCADE,
     FOREIGN KEY(capture_id) REFERENCES captures(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS quick_search_coverage(
+    run_id INTEGER NOT NULL,
+    capture_id INTEGER NOT NULL,
+    body_revision INTEGER NOT NULL,
+    coverage_mask INTEGER NOT NULL,
+    PRIMARY KEY(run_id,capture_id),
+    FOREIGN KEY(run_id) REFERENCES quick_search_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(capture_id) REFERENCES captures(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS quick_search_hits_capture_idx ON quick_search_hits(run_id,capture_id);
 CREATE TABLE IF NOT EXISTS recovery_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -855,6 +868,14 @@ def migrate_v10_to_v11(database: sqlite3.Connection) -> None:
     database.execute("UPDATE schema_info SET version=11")
 
 
+def migrate_v11_to_v12(database: sqlite3.Connection) -> None:
+    add_column_if_missing(database, "captures", "body_revision INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(database, "quick_search_runs", "coverage_version INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(database, "quick_search_runs", "capture_limit INTEGER NOT NULL DEFAULT 0")
+    database.executescript(BASE_SCHEMA_SQL)
+    database.execute("UPDATE schema_info SET version=12")
+
+
 def initialize_schema(database: sqlite3.Connection) -> None:
     database.execute("PRAGMA foreign_keys=ON")
     has_schema = database.execute(
@@ -921,10 +942,25 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v10_to_v11(database)
         elif version == 10:
             migrate_v10_to_v11(database)
+        elif version == 11:
+            migrate_v11_to_v12(database)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
         else:
             database.executescript(BASE_SCHEMA_SQL)
+    if int(database.execute("SELECT version FROM schema_info LIMIT 1").fetchone()[0]) == 11:
+        migrate_v11_to_v12(database)
+    database.executescript("""
+CREATE TRIGGER IF NOT EXISTS captures_body_revision_update
+AFTER UPDATE OF local_path,content_hash,bytes_saved,payload_availability,detected_encoding,mimetype,resource_class ON captures
+WHEN OLD.local_path IS NOT NEW.local_path OR OLD.content_hash IS NOT NEW.content_hash
+ OR OLD.bytes_saved IS NOT NEW.bytes_saved OR OLD.payload_availability IS NOT NEW.payload_availability
+ OR OLD.detected_encoding IS NOT NEW.detected_encoding OR OLD.mimetype IS NOT NEW.mimetype
+ OR OLD.resource_class IS NOT NEW.resource_class
+BEGIN
+    UPDATE captures SET body_revision=body_revision+1 WHERE id=NEW.id;
+END;
+""")
     # URL-derived path collision checks are on the replay hot path.
     # Create this after older-schema migrations have added captures.local_path.
     database.execute("CREATE INDEX IF NOT EXISTS captures_local_path_idx ON captures(local_path)")

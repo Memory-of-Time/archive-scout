@@ -21,7 +21,7 @@ class V4ToV5MigrationTests(unittest.TestCase):
             database.close()
 
             modern = open_database(root)
-            self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 11)
+            self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 12)
             for table in ("operation_runs", "network_events", "project_backups", "repair_actions"):
                 row = modern.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
                 self.assertIsNotNone(row)

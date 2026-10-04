@@ -8,7 +8,7 @@ Archive Scout is a cross-platform research workspace for public Wayback Machine 
 - `python -m pip install -r requirements-runtime.txt`
 - Development/test: `python -m unittest discover -s tests -p "test_*.py" -v`
 - Compile check: `python -m compileall -q archive_scout tests scripts`
-- Offline benchmark: `python scripts/benchmark_offline.py --rows 100000 --output benchmark.json`
+- Offline benchmark: `python scripts/benchmark_offline.py --cdx-rows 100000 --output benchmark.json`
 
 ## Architecture
 - `archive_scout/cdx/`: CDX query construction, paging/resume, response parsing, recovery.
@@ -16,7 +16,7 @@ Archive Scout is a cross-platform research workspace for public Wayback Machine 
 - `archive_scout/scanning/`: deterministic keyword/rule search.
 - `archive_scout/research/`: local Research Intelligence vectors, entities, duplicate relationships, evidence graph, hybrid retrieval and grounded AI synthesis.
 - `archive_scout/ai/`: provider-neutral AI request models and OpenAI/OpenRouter adapters.
-- `archive_scout/database/`: SQLite schema/migrations/repositories. Current schema is 11.
+- `archive_scout/database/`: SQLite schema/migrations/repositories. Current schema is 12.
 - `archive_scout/operations.py`: shared operation orchestration used by GUI and CLI.
 - `archive_scout/cli.py`: stable bot/automation contract. Machine-readable stdout must stay clean.
 

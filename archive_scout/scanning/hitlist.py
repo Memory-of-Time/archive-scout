@@ -50,36 +50,29 @@ def _count_matches(automaton: LiteralAutomaton, text: str) -> dict[str, int]:
 def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> tuple[int, int, int]:
     fingerprint = hitlist_fingerprint(keywords)
     row = database.execute(
-        """SELECT id,last_capture_id,match_count,updated_at FROM quick_search_runs
+        """SELECT id,last_capture_id,match_count,updated_at,coverage_version,capture_limit FROM quick_search_runs
            WHERE fingerprint=? AND status IN ('running','interrupted') ORDER BY id DESC LIMIT 1""",
         (fingerprint,),
     ).fetchone()
     now = utc_now()
     if row:
         run_id = int(row["id"])
-        # A URL checkpoint is not body coverage. If capture availability/content
-        # changed after the last Hitlist checkpoint, revisit the inventory from
-        # the beginning so an earlier URL whose body just arrived is not skipped.
-        corpus_changed = database.execute(
-            "SELECT 1 FROM captures WHERE updated_at>? LIMIT 1",
-            (str(row["updated_at"] or ""),),
-        ).fetchone() is not None
-        if corpus_changed:
+        if int(row["coverage_version"] or 0) != 1:
+            # One safe recheck for pre-v1.0.5 checkpoints that had no revision
+            # coverage. Subsequent resumes preserve unchanged results/cursors.
             database.execute("DELETE FROM quick_search_hits WHERE run_id=?", (run_id,))
-            database.execute(
-                """UPDATE quick_search_runs SET status='running',last_capture_id=0,indexed_checked=0,
-                       local_checked=0,unavailable_count=0,discarded_count=0,missing_count=0,
-                       non_text_count=0,incomplete_count=0,match_count=0,updated_at=? WHERE id=?""",
-                (now, run_id),
-            )
-            return run_id, 0, 0
+            database.execute("DELETE FROM quick_search_coverage WHERE run_id=?", (run_id,))
+            database.execute("""UPDATE quick_search_runs SET status='running',last_capture_id=0,indexed_checked=0,
+                local_checked=0,unavailable_count=0,discarded_count=0,missing_count=0,non_text_count=0,
+                incomplete_count=0,match_count=0,coverage_version=1,capture_limit=(SELECT COALESCE(MAX(id),0) FROM captures),updated_at=? WHERE id=?""", (now,run_id))
+            return run_id,0,0
         database.execute(
             "UPDATE quick_search_runs SET status='running',updated_at=? WHERE id=?", (now, run_id)
         )
         return run_id, int(row["last_capture_id"] or 0), int(row["match_count"] or 0)
     cursor = database.execute(
-        """INSERT INTO quick_search_runs(fingerprint,keywords_json,status,started_at,updated_at)
-           VALUES(?,?,'running',?,?)""",
+        """INSERT INTO quick_search_runs(fingerprint,keywords_json,status,started_at,updated_at,coverage_version,capture_limit)
+           VALUES(?,?,'running',?,?,1,(SELECT COALESCE(MAX(id),0) FROM captures))""",
         (fingerprint, json.dumps(keywords, ensure_ascii=False), now, now),
     )
     return int(cursor.lastrowid), 0, 0
@@ -156,28 +149,67 @@ def search_with_hitlist(
     automaton = LiteralAutomaton(normalized_to_display)
     run_id, last_id, matched_total = _resume_or_create_run(database, keywords)
     database.commit()
-    total = int(database.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+    capture_limit = int(database.execute("SELECT capture_limit FROM quick_search_runs WHERE id=?", (run_id,)).fetchone()[0])
+    total = int(database.execute("SELECT COUNT(*) FROM captures WHERE id<=?",(capture_limit,)).fetchone()[0])
     indexed_checked = local_checked = unavailable = 0
     discarded = missing = non_text = incomplete = 0
 
     try:
         while True:
+            if stop_event.is_set():
+                raise Stopped
+            revisiting = False
             rows = database.execute(
                 """SELECT c.id,c.original_url,c.timestamp,c.local_path,c.document_id,c.mimetype,c.detected_encoding,
-                          c.resource_class,c.payload_availability,c.state,d.path AS document_path
+                          c.resource_class,c.payload_availability,c.state,c.body_revision,d.path AS document_path,
+                          0 AS old_mask
                    FROM captures c LEFT JOIN documents d ON d.id=c.document_id
-                   WHERE c.id>? ORDER BY c.id LIMIT ?""",
-                (last_id, max(1, int(batch_size))),
+                   WHERE c.id>? AND c.id<=? ORDER BY c.id LIMIT ?""",
+                (last_id,capture_limit,max(1,int(batch_size))),
             ).fetchall()
             if not rows:
-                break
+                # Hold the writer boundary while deciding that coverage is
+                # current. Changes after this commit belong to a later search.
+                with database:
+                    database.execute("BEGIN IMMEDIATE")
+                    rows = database.execute(
+                        """SELECT c.id,c.original_url,c.timestamp,c.local_path,c.document_id,c.mimetype,c.detected_encoding,
+                                  c.resource_class,c.payload_availability,c.state,c.body_revision,d.path AS document_path,
+                                  q.coverage_mask AS old_mask
+                           FROM quick_search_coverage q JOIN captures c ON c.id=q.capture_id
+                           LEFT JOIN documents d ON d.id=c.document_id
+                           WHERE q.run_id=? AND q.body_revision<>c.body_revision ORDER BY c.id LIMIT ?""",
+                        (run_id,max(1,int(batch_size))),
+                    ).fetchall()
+                    if not rows:
+                        database.execute("UPDATE quick_search_runs SET status='complete',completed_at=?,updated_at=?,match_count=? WHERE id=?", (utc_now(),utc_now(),matched_total,run_id))
+                if not rows:
+                    break
+                revisiting = True
+            coverage_rows = []
+            old_matched = 0
+            if revisiting:
+                ids = [int(row['id']) for row in rows]
+                marks = ','.join('?' for _ in ids)
+                old_matched = int(database.execute(f"SELECT COUNT(DISTINCT capture_id) FROM quick_search_hits WHERE run_id=? AND capture_id IN ({marks})",(run_id,*ids)).fetchone()[0])
             hit_rows: list[tuple[int, int, str, str, int]] = []
             for row in rows:
                 if stop_event.is_set():
                     raise Stopped
                 capture_id = int(row["id"])
-                last_id = capture_id
-                indexed_checked += 1
+                if not revisiting:
+                    last_id = capture_id
+                    indexed_checked += 1
+                old_mask = int(row['old_mask']) if revisiting else 0
+                for index,name in enumerate(('local','unavailable','discarded','missing','non_text','incomplete')):
+                    if old_mask & (1 << index):
+                        if name == 'local': local_checked -= 1
+                        elif name == 'unavailable': unavailable -= 1
+                        elif name == 'discarded': discarded -= 1
+                        elif name == 'missing': missing -= 1
+                        elif name == 'non_text': non_text -= 1
+                        else: incomplete -= 1
+                before_counts = (local_checked,unavailable,discarded,missing,non_text,incomplete)
                 fields_by_pattern: dict[str, set[str]] = defaultdict(set)
                 counts_by_pattern: Counter[str] = Counter()
 
@@ -238,6 +270,9 @@ def search_with_hitlist(
                     if data is not None:
                         non_text += 1
 
+                after_counts = (local_checked,unavailable,discarded,missing,non_text,incomplete)
+                mask = sum((1 << index) for index,(before,after) in enumerate(zip(before_counts,after_counts)) if after>before)
+                coverage_rows.append((run_id,capture_id,int(row['body_revision']),mask))
                 for pattern, count in counts_by_pattern.items():
                     display = normalized_to_display.get(pattern, pattern)
                     hit_rows.append(
@@ -245,8 +280,11 @@ def search_with_hitlist(
                     )
 
             batch_match_count = len({row[1] for row in hit_rows})
-            matched_total += batch_match_count
+            matched_total += batch_match_count - old_matched
             with database:
+                if revisiting:
+                    database.execute(f"DELETE FROM quick_search_hits WHERE run_id=? AND capture_id IN ({marks})",(run_id,*ids))
+                database.executemany("INSERT OR REPLACE INTO quick_search_coverage(run_id,capture_id,body_revision,coverage_mask) VALUES(?,?,?,?)",coverage_rows)
                 if hit_rows:
                     database.executemany(
                         """INSERT INTO quick_search_hits(run_id,capture_id,keyword,fields,count)
@@ -261,7 +299,7 @@ def search_with_hitlist(
                        discarded_count=discarded_count+?,missing_count=missing_count+?,
                        non_text_count=non_text_count+?,incomplete_count=incomplete_count+?,
                        match_count=?,updated_at=? WHERE id=?""",
-                    (last_id, len(rows), local_checked, unavailable, discarded, missing,
+                    (last_id, 0 if revisiting else len(rows), local_checked, unavailable, discarded, missing,
                      non_text, incomplete, matched_total, utc_now(), run_id),
                 )
             # These are per-loop counters in SQL; reset after checkpoint.
@@ -271,12 +309,6 @@ def search_with_hitlist(
                     "hitlist", f"Hitlist search {last_id:,}/{total:,}; matching captures {matched_total:,}",
                     last_id, total, {"run_id": run_id, "matches": matched_total},
                 ))
-        with database:
-            database.execute(
-                """UPDATE quick_search_runs SET status='complete',completed_at=?,updated_at=?,
-                   match_count=? WHERE id=?""",
-                (utc_now(), utc_now(), matched_total, run_id),
-            )
     except Stopped:
         with database:
             database.execute(
@@ -304,6 +336,7 @@ def search_with_hitlist(
     summary_path.write_text(
         "Search with Hitlist\n\n"
         f"Run: {run_id}\n"
+        f"Corpus capture ID boundary: {capture_limit} (newer captures require a new search)\n"
         f"Indexed URLs checked: {int(row['indexed_checked'] or 0):,}\n"
         f"Local capture contents checked: {int(row['local_checked'] or 0):,}\n"
         f"Captures without searchable local content: {int(row['unavailable_count'] or 0):,}\n"

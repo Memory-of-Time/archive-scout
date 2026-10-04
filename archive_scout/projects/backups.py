@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ..database.lease import guard_project
+from ..database.connection import live_project_writer_pids
+
 import gzip
 import shutil
 import sqlite3
@@ -93,8 +96,11 @@ def _materialize_backup(backup_path: Path, destination: Path) -> None:
         shutil.copy2(backup_path, destination)
 
 
+@guard_project
 def restore_project_backup(root: Path, backup_path: Path) -> Path:
     root = Path(root)
+    if live_project_writer_pids(root):
+        raise RuntimeError("Pause the active project writer before restoring a database backup")
     backup_path = Path(backup_path)
     if not backup_path.exists():
         raise FileNotFoundError(backup_path)

@@ -1,6 +1,6 @@
 # Network performance and Wayback pacing
 
-Archive Scout 1.0.4 uses two shared request-attempt clocks. CDX/Timemap/index traffic starts at a conservative 2.5-second interval (24 attempts/minute) and replay traffic at 0.125 seconds (8 attempts/second). These are attempt ceilings, not throughput promises: redirects, retry attempts, and transport-backend fallbacks each consume admission because they each create network load.
+Archive Scout 1.0.5 uses two shared request-attempt clocks. CDX/Timemap/index traffic starts at a conservative 2.5-second interval (24 attempts/minute) and replay traffic at 0.125 seconds (8 attempts/second). These are attempt ceilings, not throughput promises: redirects, retry attempts, and transport-backend fallbacks each consume admission because they each create network load.
 
 The scheduler uses monotonic time and does not accumulate burst credit after idle periods or cooldowns. Per-target settings can make a target slower, but cannot silently weaken the effective project pool. Multiple workers are therefore useful for hiding response latency, not for multiplying the allowed request-start rate.
 
@@ -16,4 +16,6 @@ The network client tracks logical operations separately from actual wire request
 
 ## Recovery
 
-Rate-limit exhaustion and connectivity failure are separate pause reasons. A rate-limit incident has one absolute recovery deadline shared across workers, so time already spent behind another worker's gate counts toward the same budget. If Retry-After extends beyond that automatic budget, Archive Scout persists the wall-clock eligibility time and pauses without an early probe, including after restart. Both pause classes preserve the exact queue/checkpoint state for Resume, but the UI tells the user whether to wait for a quota/overload cooldown or restore connectivity. Persistent HTTP pools, validated Range resumes, durable page checkpoints, and bulk SQLite commits reduce repeated work without bypassing the shared pacing policy.
+Rate-limit exhaustion and connectivity failure are separate pause reasons. Each recovery cycle shares a deadline across workers, including time spent behind another worker's cooldown. With persistent recovery enabled, exhausting that cycle temporarily stops admission, settles existing attempts and waits for actual service eligibility. The same replay client and worker pool then continue with a renewed recovery cycle and one real probe. Renewal never shortens Retry-After or clears an active cooldown. Connection outages use a shared bounded exponential pause without pretending they are quota incidents.
+
+The exact queue and any wall-clock eligibility are saved for Resume. **Pause & save** remains cancellable during recovery. Disabling persistent recovery instead ends automatic recovery at the saved pause boundary. Persistent HTTP pools, validated Range resumes, durable page checkpoints and bulk SQLite commits reduce repeated work without bypassing the shared pacing policy.

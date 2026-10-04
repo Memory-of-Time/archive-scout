@@ -1,28 +1,26 @@
 # Archive Scout
 
-**Archive Scout 1.0.4** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **11**.
+**Archive Scout 1.0.5** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **12**.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.4/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.4/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.4/ArchiveScout-macOS-Universal.zip)
+- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
-## 1.0.4 highlights
+## 1.0.5 highlights
 
-- Canonical project identity now follows GUI operations, asynchronous queries, row maps, and mutations so stale rows or progress from one project cannot write into another.
-- Resume now considers recoverable failed operation snapshots and preserves the original operation contract, including keyword-free download-only recovery and compatible scan lineage.
-- Live Wayback 429/503 status is handled from response headers before body reads or media validation, preventing service cooldown instructions from being hidden by later body failures.
-- Replay and media acquisition now coordinate common connection outages, honor transport-backend cooldown eligibility, preserve untouched captures as pending, and keep local storage failures typed instead of rotating HTTP backends.
-- Closed clients release their requested pacing floor while service-driven adaptive cooldown state remains shared, preventing a previous slower operation from permanently constraining a later faster one.
-- Added **Download external redirect destinations**. External archived redirect targets are blocked by default, live escapes remain blocked, and resumed partial files restart safely across representation-changing redirects.
-- Added an acquisition-only text error retry route that does not require keywords or create scan/document/match rows.
-- Results now keep editable Notes separate from read-only snippets. Errors, Results, AI relevance, Research Intelligence, and Scan history have bounded asynchronous reads with clearer detail/copy affordances and stale-project guards.
-- Dashboard refresh honors its selected interval during active work, coalesces reads, uses bounded read-only snapshots, and reports unavailable counts instead of silently turning read failures into zero.
-- Loading a moved `project.json` now treats the selected manifest folder as the active project root instead of silently reopening an older saved absolute output path.
-- Project schema remains **11**.
+- Temporary Wayback outages keep the existing replay worker pool, HTTP client and cumulative progress. Expired recovery cycles can resume while respecting Retry-After and admitting one real recovery probe.
+- Validated text downloads can use the existing curl fallback when eligible Python backends fail.
+- Dashboard **Other outcomes** shows non-text/media exclusions, URL-filter skips, media handoffs, other skips, failed captures and recovered incidents. The current-operation accounting panel and its additional aggregate query have been removed.
+- Reports groups share the focus/wheel router, reflow on narrow screens and reserve clearance above their horizontal scrollbars.
+- Media disposition labels distinguish excluded binaries from an actual media handoff. Retained text descriptors are reported as available for local search.
+- Hitlist resumes preserve unchanged results and revisit bodies that arrived or changed after a checkpoint. Schema **12** adds small coverage records and body revisions; it does not duplicate capture contents.
+- Whole project operations and database restores use a crash-released OS lock. GUI restore runs in the background after existing view reads finish.
+
+The CDX strategies, request-rate settings, text/media byte classifier and deterministic scanning algorithm remain those of the supplied 1.0.4 source. These are targeted recovery, visibility and correctness changes, not a new acquisition or scanner pipeline. See [release notes](docs/RELEASE_1_0_5.md).
 
 The source still recognizes serialized project identifiers from pre-release development builds so existing project folders can be migrated safely. Those compatibility identifiers are not separate public releases.
 

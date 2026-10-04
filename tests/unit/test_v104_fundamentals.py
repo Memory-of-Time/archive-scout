@@ -26,17 +26,17 @@ from archive_scout.utils import hash_text, normalize_search
 
 class V104FundamentalsTests(unittest.TestCase):
     def test_release_identity_workflow_and_schema(self):
-        self.assertEqual(VERSION, "1.0.4")
-        self.assertEqual(SCHEMA_VERSION, 11)
+        self.assertEqual(VERSION, "1.0.5")
+        self.assertEqual(SCHEMA_VERSION, 12)
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
-        self.assertIn("importlib.metadata.version('archive-scout') == '1.0.4'", workflow)
+        self.assertIn("importlib.metadata.version('archive-scout') == '1.0.5'", workflow)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("workflow_dispatch", workflow)
 
     def test_classification_visibility_helpers_keep_class_route_and_body_separate(self):
         self.assertEqual(
-            capture_routing_decision("image", "skipped", "classified_media", "not_acquired"),
+            capture_routing_decision("image", "skipped", "deferred_to_media", "not_acquired"),
             "deferred_to_media",
         )
         self.assertEqual(capture_body_coverage("image", "skipped", "not_acquired"), "non_text")
@@ -59,8 +59,8 @@ class V104FundamentalsTests(unittest.TestCase):
             signature = cdx_query_signatures(cfg)[0]
             fixtures = [
                 ("text", "downloaded_unscanned", None, "retained_unscanned", "metadata:text"),
-                ("image", "skipped", "classified_media", "not_acquired", "mime:image/jpeg"),
-                ("video", "skipped", "classified_media", "not_acquired", "mime:video/mp4"),
+                ("image", "skipped", "deferred_to_media", "not_acquired", "mime:image/jpeg"),
+                ("video", "skipped", "deferred_to_media", "not_acquired", "mime:video/mp4"),
                 ("audio", "skipped", "known_non_text", "not_acquired", "mime:audio/mpeg"),
                 ("media_descriptor", "skipped", "classified_media_descriptor", "not_acquired", "extension:m3u"),
                 ("other_binary", "skipped", "unsupported_binary", "not_acquired", "signature:zip"),
@@ -89,7 +89,7 @@ class V104FundamentalsTests(unittest.TestCase):
             db.commit()
             db.close()
 
-            counts = read_dashboard_counts(root / "archive_scout.sqlite3")
+            counts = read_dashboard_counts(root / "archive_scout.sqlite3", include_operation_scope=True)
             self.assertEqual(counts["operation_scope"], "frozen_config")
             self.assertEqual(counts["operation_total"], 7)
             self.assertEqual(counts["operation_saved_unscanned"], 1)
@@ -110,7 +110,7 @@ class V104FundamentalsTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["routing_decision"], "deferred_to_media")
             self.assertEqual(rows[0]["classification_reason"], "mime:image/jpeg")
-            self.assertEqual(rows[0]["skip_reason"], "classified_media")
+            self.assertEqual(rows[0]["skip_reason"], "deferred_to_media")
 
     def test_download_only_automatically_recovers_same_operation_after_service_pause(self):
         with tempfile.TemporaryDirectory() as temp:

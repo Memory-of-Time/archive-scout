@@ -40,7 +40,7 @@ class CLIAutomationTests(unittest.TestCase):
             self.assertEqual(code, EXIT_OK)
             status = json.loads(stdout.getvalue())
             self.assertTrue(status['database'])
-            self.assertEqual(status['version'], '1.0.4')
+            self.assertEqual(status['version'], '1.0.5')
             self.assertEqual(stderr.getvalue(), '')
 
     def test_readonly_commands_do_not_write_project_database(self):

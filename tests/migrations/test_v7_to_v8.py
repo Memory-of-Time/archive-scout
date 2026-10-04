@@ -45,7 +45,7 @@ class V7ToV8MigrationTests(unittest.TestCase):
             database.close()
 
             modern = open_database(root)
-            self.assertEqual(modern.execute('SELECT version FROM schema_info').fetchone()[0], 11)
+            self.assertEqual(modern.execute('SELECT version FROM schema_info').fetchone()[0], 12)
             capture_columns = {row['name'] for row in modern.execute('PRAGMA table_info(captures)')}
             for name in ('skip_reason', 'classifier_revision', 'local_path', 'content_hash', 'detected_encoding'):
                 self.assertIn(name, capture_columns)

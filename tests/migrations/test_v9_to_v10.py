@@ -18,6 +18,7 @@ class V9ToV10MigrationTests(unittest.TestCase):
             db = sqlite3.connect(path)
             db.row_factory = sqlite3.Row
             initialize_schema(db)
+            db.execute("DROP TRIGGER IF EXISTS captures_body_revision_update")
             # Turn a freshly-created schema into the physical v9 shape. Python
             # 3.11+'s bundled SQLite supports DROP COLUMN on every supported CI
             # platform; this keeps the fixture focused on the real forward
@@ -66,7 +67,7 @@ class V9ToV10MigrationTests(unittest.TestCase):
 
             modern = open_database(root)
             try:
-                self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 11)
+                self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 12)
                 row = modern.execute(
                     "SELECT resource_class,payload_availability,cleanup_pending,document_id FROM captures WHERE id=?",
                     (capture_id,),

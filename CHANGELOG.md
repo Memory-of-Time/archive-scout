@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.5
+
+- Keep replay workers and backend health through temporary outages; renew expired recovery cycles without bypassing server cooldowns. Drain attempts before reuse.
+- Restore validated curl fallback for text.
+- Remove the current-operation accounting panel and default aggregate; show compact project skip, media-handoff, failure and recovery counts.
+- Coordinate Reports scrolling, reserve bottom clearance and reflow fields.
+- Correct media disposition labels and retained descriptor availability.
+- Resume Hitlist by body revision, preserve unchanged hits and reconcile changed-body coverage. Schema 12 adds compact Hitlist coverage; existing payloads and review data are preserved.
+- Serialize project operations/restores with a crash-released OS lock; restore runs off the GUI thread.
+
+
 ## 1.0.3 — Recovery correctness, project identity, and network integrity
 
 - Tagged GUI operations, asynchronous views, row maps, and mutations with canonical project identity so stale data from one project cannot alter another.

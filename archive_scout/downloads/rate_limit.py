@@ -255,6 +255,9 @@ class SharedHostGate:
         self.incident_id = 0
         self.incident_started = 0.0
         self.incident_started_wall = 0.0
+        self.recovery_cycle_started = 0.0
+        self.connection_outage_cycles = 0
+        self.connection_outage_base = 3.0
         self.reason = ""
         self.generation = 0
         self.probe_required = False
@@ -313,7 +316,37 @@ class SharedHostGate:
             active = self.probe_required or self.probe_inflight or self.blocked_until > now
             if not active or self.incident_started <= 0:
                 return None
-            return self.incident_started + budget
+            return max(self.incident_started, self.recovery_cycle_started) + budget
+
+    def renew_recovery_cycle(self, incident_id: int | None = None) -> None:
+        """Renew a coordinator's wait budget without shortening host eligibility."""
+        with self.condition:
+            if incident_id is not None and incident_id != self.incident_id:
+                return
+            if self.probe_inflight:
+                return
+            self.recovery_cycle_started = time.monotonic()
+            self.condition.notify_all()
+
+    def pause_for_connection_outage(self, base_seconds: float) -> None:
+        """One shared, increasing connection pause, independent of quota pacing."""
+        with self.condition:
+            now = time.monotonic()
+            if self.probe_required or self.probe_inflight or self.blocked_until > now:
+                return  # Preserve any live service cooldown and existing probe.
+            self.connection_outage_cycles += 1
+            self.connection_outage_base = max(1.0, float(base_seconds))
+            pause = min(60.0, max(1.0, base_seconds) * 2 ** min(self.connection_outage_cycles - 1, 5))
+            pause *= random.uniform(1.0, 1.1)
+            self.incident_id += 1
+            self.incident_started = self.recovery_cycle_started = now
+            self.incident_started_wall = time.time()
+            self.blocked_until = now + pause
+            self.blocked_until_wall = time.time() + pause
+            self.reason = "connection outage"
+            self.probe_required = True
+            self.generation += 1
+            self.condition.notify_all()
 
     def permit_is_current(self, permit: HostPermit) -> bool:
         with self.condition:
@@ -342,12 +375,19 @@ class SharedHostGate:
                 self.reason = ""
                 self.incident_started = 0.0
                 self.incident_started_wall = 0.0
+                self.recovery_cycle_started = 0.0
+                self.connection_outage_cycles = 0
                 self.generation += 1
             else:
                 # A fresh 5xx/network failure did not prove recovery.  Avoid a
                 # thundering sequence of simultaneous recovery probes.
-                self.blocked_until = max(self.blocked_until, time.monotonic() + 5.0)
-                self.blocked_until_wall = max(self.blocked_until_wall, time.time() + 5.0)
+                pause = 5.0
+                if self.reason == "connection outage":
+                    self.connection_outage_cycles += 1
+                    pause = min(60.0, self.connection_outage_base * 2 ** min(self.connection_outage_cycles - 1, 5))
+                    pause *= random.uniform(1.0, 1.1)
+                self.blocked_until = max(self.blocked_until, time.monotonic() + pause)
+                self.blocked_until_wall = max(self.blocked_until_wall, time.time() + pause)
             self.condition.notify_all()
 
     def wait(self, stop_event: threading.Event) -> None:
@@ -384,6 +424,7 @@ class SharedHostGate:
                 self.incident_id += 1
                 self.incident_started = now
                 self.incident_started_wall = wall_now
+                self.recovery_cycle_started = now
             self.last_signal = now
 
             if retry_after is not None and retry_after > 0:

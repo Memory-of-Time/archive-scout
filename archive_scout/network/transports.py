@@ -1003,13 +1003,9 @@ class ResilientTransport:
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
         names = self._ordered_names()
-        if preview_validator is not None and len(names) > 1:
-            # Curl's file-oriented fallback cannot reject a response until its
-            # transfer has completed. Keep it available for ordinary media and
-            # replay downloads, but prefer streaming Python transports for the
-            # text-validation path so known binary payloads stop near the
-            # bounded prefix instead of downloading megabytes before rejection.
-            names = [name for name in names if name != "curl"] or names
+        # Python streaming remains preferred by the backend order. Curl still
+        # applies the same bounded validator after its file-oriented transfer;
+        # genuine connection failures must not remove that final fallback.
         for name in names:
             if stop_event.is_set():
                 raise Stopped

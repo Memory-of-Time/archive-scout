@@ -113,7 +113,7 @@ def database_version(path: Path) -> int | None:
 
 
 def is_modern_database(path: Path) -> bool:
-    return database_version(path) in {2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION}
+    return database_version(path) in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION}
 
 
 def open_database_readonly(root: Path, *, timeout: float = 0.5) -> sqlite3.Connection:
@@ -158,7 +158,7 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
     version = database_version(path) if path.exists() else None
     if version is not None and version > SCHEMA_VERSION:
         raise RuntimeError(f"Project schema {version} is newer than supported schema {SCHEMA_VERSION}; update Archive Scout before opening it")
-    if migrate and path.exists() and version not in {2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION}:
+    if migrate and path.exists() and version not in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION}:
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
         version = database_version(path)

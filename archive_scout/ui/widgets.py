@@ -200,13 +200,19 @@ class ScrollablePage(ttk.Frame):
     Footer/status bars live outside this widget.  The canvas window always
     follows viewport width, while content height expands naturally.
     """
-    def __init__(self, master, *, padding=10, frame_style: str | None = None, **kwargs) -> None:
+    def __init__(self, master, *, padding=10, frame_style: str | None = None, horizontal=False, **kwargs) -> None:
         super().__init__(master, **kwargs)
+        self._horizontal = bool(horizontal)
         self.columnconfigure(0, weight=1); self.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew"); self.vbar.grid(row=0, column=1, sticky="ns")
+        if self._horizontal:
+            self.hbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+            self.hbar.grid(row=1, column=0, sticky="ew")
+            ttk.Frame(self).grid(row=1, column=1, sticky="nsew")
+            self.canvas.configure(xscrollcommand=self.hbar.set)
         self.body = ttk.Frame(self.canvas, padding=padding, style=frame_style or "TFrame")
         self._window = self.canvas.create_window((0,0), window=self.body, anchor="nw")
         self.canvas._archive_scout_scroll_owner = self  # type: ignore[attr-defined]
@@ -220,6 +226,8 @@ class ScrollablePage(ttk.Frame):
 
     def _viewport(self, event=None) -> None:
         width = max(1, int(getattr(event, "width", self.canvas.winfo_width())))
+        if getattr(self, "_horizontal", False):
+            width = max(width, self.body.winfo_reqwidth())
         self.canvas.itemconfigure(self._window, width=width); self._queue_region()
 
     def _queue_region(self, _event=None) -> None:
@@ -229,7 +237,10 @@ class ScrollablePage(ttk.Frame):
         self._region_job = self.after_idle(self._update_region)
 
     def _update_region(self) -> None:
-        self._region_job = None; self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._region_job = None
+        if getattr(self, "_horizontal", False):
+            self.canvas.itemconfigure(self._window, width=max(1, self.canvas.winfo_width(), self.body.winfo_reqwidth()))
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def can_scroll_y(self, units: int) -> bool:
         try:
@@ -238,9 +249,18 @@ class ScrollablePage(ttk.Frame):
         except tk.TclError:
             return False
 
-    def can_scroll_x(self, units: int) -> bool: return False
+    def can_scroll_x(self, units: int) -> bool:
+        if not getattr(self, "_horizontal", False):
+            return False
+        try:
+            first, last = self.canvas.xview()
+            return first > 1e-6 if units < 0 else last < 1.0 - 1e-6
+        except tk.TclError:
+            return False
     def scroll_y(self, units: int) -> None: self.canvas.yview_scroll(int(units), "units")
-    def scroll_x(self, units: int) -> None: return None
+    def scroll_x(self, units: int) -> None:
+        if getattr(self, "_horizontal", False):
+            self.canvas.xview_scroll(int(units), "units")
 
     def request_reveal(self, widget: tk.Misc | None) -> None:
         if widget is None:
@@ -281,6 +301,19 @@ class ScrollablePage(ttk.Frame):
 
     def reveal(self, widget: tk.Misc) -> None:
         """Reveal only an off-screen focused widget, using minimum movement."""
+        if getattr(self, "_horizontal", False):
+            try:
+                left = self.canvas.winfo_rootx() + self._reveal_margin()
+                right = self.canvas.winfo_rootx() + self.canvas.winfo_width() - self._reveal_margin()
+                widget_left = widget.winfo_rootx()
+                widget_right = widget_left + widget.winfo_width()
+                delta = widget_left - left if widget_left < left else max(0, widget_right - right)
+                bounds = self.canvas.bbox("all")
+                if delta and bounds:
+                    span = max(1, bounds[2] - bounds[0])
+                    self.canvas.xview_moveto(max(0.0, min(1.0, self.canvas.xview()[0] + delta / span)))
+            except (tk.TclError, AttributeError, TypeError):
+                pass
         try:
             viewport_top = int(self.canvas.winfo_rooty())
             viewport_height = max(1, int(self.canvas.winfo_height()))

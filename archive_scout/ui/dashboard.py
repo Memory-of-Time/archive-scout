@@ -23,6 +23,7 @@ EMPTY_DASHBOARD = {
     "skipped_non_text": 0,
     "skipped_url_filter": 0,
     "skipped_other": 0,
+    "deferred_to_media": 0,
     "pending": 0,
     "downloading": 0,
     "downloaded_unscanned": 0,
@@ -238,10 +239,10 @@ def _capture_aggregate(database: sqlite3.Connection, predicate: str, params: tup
                SUM(CASE WHEN COALESCE(c.resource_class,'unknown')='other_binary' THEN 1 ELSE 0 END) AS class_other_binary,
                SUM(CASE WHEN COALESCE(c.resource_class,'unknown')='unknown' THEN 1 ELSE 0 END) AS class_unknown,
                SUM(CASE WHEN c.state IN ('downloaded','downloaded_unscanned','scanning') OR c.payload_availability IN ('retained','retained_unscanned','spooled_unscanned','cleanup_pending') THEN 1 ELSE 0 END) AS routed_downloaded,
-               SUM(CASE WHEN c.state='skipped' AND c.skip_reason IN ('classified_media','payload_validation_deferred') THEN 1 ELSE 0 END) AS deferred_media,
-               SUM(CASE WHEN c.state='skipped' AND c.skip_reason IN ('known_non_text','sniffed_non_text','unsupported_binary','classified_media_descriptor') THEN 1 ELSE 0 END) AS skipped_non_text,
+               SUM(CASE WHEN c.state='skipped' AND c.skip_reason IN ('deferred_to_media','payload_validation_deferred') THEN 1 ELSE 0 END) AS deferred_media,
+               SUM(CASE WHEN c.state='skipped' AND c.skip_reason IN ('known_non_text','sniffed_non_text','unsupported_binary','classified_media','classified_media_descriptor') THEN 1 ELSE 0 END) AS skipped_non_text,
                SUM(CASE WHEN c.state='skipped' AND c.skip_reason='url_keyword_filter' THEN 1 ELSE 0 END) AS skipped_url_filter,
-               SUM(CASE WHEN c.state='skipped' AND COALESCE(c.skip_reason,'') NOT IN ('classified_media','payload_validation_deferred','known_non_text','sniffed_non_text','unsupported_binary','classified_media_descriptor','url_keyword_filter') THEN 1 ELSE 0 END) AS skipped_other,
+               SUM(CASE WHEN c.state='skipped' AND COALESCE(c.skip_reason,'') NOT IN ('deferred_to_media','payload_validation_deferred','classified_media','known_non_text','sniffed_non_text','unsupported_binary','classified_media_descriptor','url_keyword_filter') THEN 1 ELSE 0 END) AS skipped_other,
                SUM(CASE WHEN COALESCE(c.resource_class,'unknown') NOT IN ('image','video','audio','media_descriptor','other_binary') AND c.payload_availability IN ('retained','retained_unscanned','spooled_unscanned','cleanup_pending') THEN 1 ELSE 0 END) AS body_available,
                SUM(CASE WHEN COALESCE(c.resource_class,'unknown') IN ('image','video','audio','media_descriptor','other_binary') THEN 1 ELSE 0 END) AS body_non_text,
                SUM(CASE WHEN c.payload_availability='discarded' THEN 1 ELSE 0 END) AS body_discarded,
@@ -252,8 +253,8 @@ def _capture_aggregate(database: sqlite3.Connection, predicate: str, params: tup
     ).fetchone()
 
 
-def read_dashboard_counts(database_path: Path, *, max_query_seconds: float = 2.0) -> dict[str, int | bool | str | None]:
-    """Read project totals plus one operation-scoped reconciliation snapshot."""
+def read_dashboard_counts(database_path: Path, *, max_query_seconds: float = 2.0, include_operation_scope: bool = False) -> dict[str, int | bool | str | None]:
+    """Read lightweight project outcomes; operation auditing is explicit opt-in."""
     if not database_path.exists():
         return {**EMPTY_DASHBOARD, "_exact": True, "_status": "missing_database"}
     database = sqlite3.connect(database_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
@@ -300,47 +301,42 @@ def read_dashboard_counts(database_path: Path, *, max_query_seconds: float = 2.0
             result["recovery_events"] = _count(database, "SELECT COUNT(*) FROM recovery_events")
 
             if _has_column(database, "captures", "skip_reason"):
-                result["skipped_non_text"] = _count(
-                    database,
-                    """SELECT COUNT(*) FROM captures WHERE state='skipped' AND skip_reason IN
-                       ('known_non_text','sniffed_non_text','unsupported_binary','classified_media','classified_media_descriptor','payload_validation_deferred')""",
-                )
-                result["skipped_url_filter"] = _count(
-                    database, "SELECT COUNT(*) FROM captures WHERE state='skipped' AND skip_reason='url_keyword_filter'"
-                )
-                result["skipped_other"] = _count(
-                    database,
-                    """SELECT COUNT(*) FROM captures WHERE state='skipped' AND COALESCE(skip_reason,'') NOT IN
-                       ('known_non_text','sniffed_non_text','unsupported_binary','classified_media','classified_media_descriptor','payload_validation_deferred','url_keyword_filter')""",
-                )
+                skipped = database.execute("""SELECT skip_reason,COUNT(*) FROM captures
+                    WHERE state='skipped' GROUP BY skip_reason""").fetchall()
+                reasons = {str(row[0] or ''): int(row[1]) for row in skipped}
+                non_text = {'known_non_text','sniffed_non_text','unsupported_binary','classified_media','classified_media_descriptor'}
+                deferred = {'deferred_to_media','payload_validation_deferred'}
+                result['skipped_non_text'] = sum(reasons.get(reason,0) for reason in non_text)
+                result['deferred_to_media'] = sum(reasons.get(reason,0) for reason in deferred)
+                result['skipped_url_filter'] = reasons.get('url_keyword_filter',0)
+                result['skipped_other'] = sum(value for reason,value in reasons.items() if reason not in non_text | deferred | {'url_keyword_filter'})
             else:
-                result["skipped_non_text"] = 0
-                result["skipped_url_filter"] = 0
-                result["skipped_other"] = _count(database, "SELECT COUNT(*) FROM captures WHERE state='skipped'")
+                result['skipped_other'] = _count(database, "SELECT COUNT(*) FROM captures WHERE state='skipped'")
 
-            predicate, scope_params, meta = _latest_operation_scope(database) if _has_table(database, "operation_runs") else ("1=1", (), {"operation_id": 0, "operation_mode": "", "operation_status": "", "operation_scope": "project"})
-            result.update(meta)
-            operation = None
-            required_capture_columns = {"state", "resource_class", "payload_availability", "skip_reason"}
-            capture_columns = {str(row[1]) for row in database.execute("PRAGMA table_info(captures)")}
-            if required_capture_columns.issubset(capture_columns):
-                operation = _capture_aggregate(database, predicate, scope_params)
-            mapping = {
-                "operation_total": "total", "operation_pending": "pending", "operation_downloading": "downloading",
-                "operation_saved_unscanned": "saved_unscanned", "operation_scanning": "scanning", "operation_scanned": "scanned",
-                "operation_skipped": "skipped", "operation_failed": "failed", "operation_unclassified_state": "unknown_state",
-                "operation_class_text": "class_text", "operation_class_image": "class_image", "operation_class_video": "class_video",
-                "operation_class_audio": "class_audio", "operation_class_media_descriptor": "class_media_descriptor",
-                "operation_class_other_binary": "class_other_binary", "operation_class_unknown": "class_unknown",
-                "operation_downloaded": "routed_downloaded", "operation_deferred_media": "deferred_media",
-                "operation_skipped_non_text": "skipped_non_text", "operation_skipped_url_filter": "skipped_url_filter",
-                "operation_skipped_other": "skipped_other", "operation_body_available": "body_available",
-                "operation_body_non_text": "body_non_text", "operation_body_discarded": "body_discarded",
-                "operation_body_partial": "body_partial", "operation_body_url_only": "body_url_only",
-            }
-            if operation is not None:
-                for key, column in mapping.items():
-                    result[key] = int(operation[column] or 0)
+            if include_operation_scope:
+                predicate, scope_params, meta = _latest_operation_scope(database) if _has_table(database, "operation_runs") else ("1=1", (), {"operation_id": 0, "operation_mode": "", "operation_status": "", "operation_scope": "project"})
+                result.update(meta)
+                operation = None
+                required_capture_columns = {"state", "resource_class", "payload_availability", "skip_reason"}
+                capture_columns = {str(row[1]) for row in database.execute("PRAGMA table_info(captures)")}
+                if required_capture_columns.issubset(capture_columns):
+                    operation = _capture_aggregate(database, predicate, scope_params)
+                mapping = {
+                    "operation_total": "total", "operation_pending": "pending", "operation_downloading": "downloading",
+                    "operation_saved_unscanned": "saved_unscanned", "operation_scanning": "scanning", "operation_scanned": "scanned",
+                    "operation_skipped": "skipped", "operation_failed": "failed", "operation_unclassified_state": "unknown_state",
+                    "operation_class_text": "class_text", "operation_class_image": "class_image", "operation_class_video": "class_video",
+                    "operation_class_audio": "class_audio", "operation_class_media_descriptor": "class_media_descriptor",
+                    "operation_class_other_binary": "class_other_binary", "operation_class_unknown": "class_unknown",
+                    "operation_downloaded": "routed_downloaded", "operation_deferred_media": "deferred_media",
+                    "operation_skipped_non_text": "skipped_non_text", "operation_skipped_url_filter": "skipped_url_filter",
+                    "operation_skipped_other": "skipped_other", "operation_body_available": "body_available",
+                    "operation_body_non_text": "body_non_text", "operation_body_discarded": "body_discarded",
+                    "operation_body_partial": "body_partial", "operation_body_url_only": "body_url_only",
+                }
+                if operation is not None:
+                    for key, column in mapping.items():
+                        result[key] = int(operation[column] or 0)
 
             latest_scan = None
             if _has_table(database, "scan_runs"):
@@ -424,7 +420,7 @@ def _disposition_sql(value: str) -> tuple[str, tuple[object, ...]]:
     if value == "downloaded":
         return "(c.state IN ('downloaded','downloaded_unscanned','scanning') OR c.payload_availability IN ('retained','retained_unscanned','spooled_unscanned','cleanup_pending'))", ()
     if value == "deferred_to_media":
-        return "(c.state='skipped' AND c.skip_reason IN ('classified_media','payload_validation_deferred'))", ()
+        return "(c.state='skipped' AND c.skip_reason IN ('deferred_to_media','payload_validation_deferred'))", ()
     if value == "skipped":
         return "c.state='skipped'", ()
     if value == "failed":

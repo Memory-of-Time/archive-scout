@@ -207,6 +207,7 @@ class HttpClient:
         self.user_agent = user_agent
         self.stop_event = stop_event
         self.retry_callback = retry_callback
+        self.network_callback = network_callback
         self.rate_event_callback = rate_event_callback
         self.connection_failure_pause_threshold = max(0, int(connection_failure_pause_threshold))
         self.connection_retry_seconds = max(0.1, float(connection_retry_seconds))
@@ -358,6 +359,9 @@ class HttpClient:
             return
         count, should_pause = note(self.connection_failure_pause_threshold)
         if should_pause:
+            pause = getattr(self.host_gate, "pause_for_connection_outage", None)
+            if callable(pause):
+                pause(self.connection_retry_seconds)
             raise ConnectivityPaused(
                 "Repeated connection failures indicate a common network/Wayback outage "
                 f"({count} consecutive connection failures). Untouched work remains pending; "
@@ -429,6 +433,8 @@ class HttpClient:
             elapsed = time.monotonic() - started
             self._metric_add("host_gate_wait_seconds", elapsed)
             self._metric_add("rate_limit_wait_seconds", elapsed)
+            if exc.reason == "connection outage":
+                raise ConnectivityPaused("Connection recovery wait budget exhausted; queue remains saved") from exc
             status_match = re.search(r"HTTP\s+(429|503)", exc.reason or "", re.I)
             status = int(status_match.group(1)) if status_match else 429
             deferred = RateLimitDeferred(
@@ -458,6 +464,9 @@ class HttpClient:
                 raise RequestAdmissionRejected("shared Wayback gate changed before this wire attempt")
             self._metric_add("request_starts")
             self._metric_add("wire_request_starts")
+            if permit is not None and permit.probe and self.network_callback and getattr(self._permit_local,"reported_probe_generation",None) != permit.generation:
+                self._permit_local.reported_probe_generation = permit.generation
+                self.network_callback("Internet Archive recovery probe admitted")
             network_started = time.monotonic()
             try:
                 yield

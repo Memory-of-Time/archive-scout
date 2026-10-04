@@ -14,8 +14,10 @@ from .cdx.indexer import index_archive
 from .analysis.workflow import run_analysis
 from .config import KeywordSetConfig, ProjectConfig, save_project_config
 from .database.connection import open_database
+from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
 from .downloads.downloader import download_archive, download_archive_only, recover_pending_discard_cleanup
+from .downloads.rate_limit import shared_host_gate
 from .downloads.retry import retry_error_urls, retry_error_downloads
 from .events import ConnectivityPaused, ProgressEvent, Stopped
 from .media.downloader import download_media, retry_media_errors
@@ -160,6 +162,7 @@ def _run_standard_media_phase(
     return media_config
 
 
+@guard_project
 def run_project(
     config: ProjectConfig,
     mode: str = "all",
@@ -326,6 +329,7 @@ def run_project(
         if not config.network.persistent_retries:
             raise exc
         _reset_transient_inflight()
+        gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
         now_epoch = time.time()
         if isinstance(exc, RateLimitDeferred):
             eligible_at = float(exc.eligible_at_epoch or 0.0)
@@ -335,15 +339,14 @@ def run_project(
             reason = "rate_limit"
             detail = exc.to_detail()
         else:
-            wait_seconds = max(1.0, float(config.network.connection_retry_seconds))
+            gate.pause_for_connection_outage(float(config.network.connection_retry_seconds))
+            wait_seconds = max(gate.remaining(), float(config.network.connection_retry_seconds))
             eligible_at = now_epoch + wait_seconds
             reason = "connectivity"
             detail = {"reason_code": "archive_connectivity", "eligible_at_epoch": eligible_at}
         detail.update({
             "recovery_stage": stage,
             "waiting_seconds": wait_seconds,
-            "pending_text": int(database.execute("SELECT COUNT(*) FROM captures WHERE state='pending'").fetchone()[0]),
-            "pending_media": int(database.execute("SELECT COUNT(*) FROM media_captures WHERE state='pending'").fetchone()[0]),
         })
         update_operation_run(
             database, operation_run_id, message=str(exc),
@@ -365,10 +368,11 @@ def run_project(
                 break
             if stop_event.wait(min(1.0, remaining)):
                 raise Stopped
+        gate.renew_recovery_cycle(getattr(exc, "incident_id", None))
         emit(callback, ProgressEvent(
             "network",
-            f"Probing Internet Archive again after a recoverable {reason.replace('_', ' ')} pause…",
-            detail={**detail, "probe": True},
+            f"Recovery wait finished; continuing saved {stage} work…",
+            detail=detail,
         ))
 
     def _recovering_call(stage: str, function):
