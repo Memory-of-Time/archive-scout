@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import os
 import re
@@ -47,6 +48,36 @@ class PreviewRejected(RuntimeError):
     def __init__(self, classification: str) -> None:
         self.classification = str(classification or "unknown")
         super().__init__(f"replay prefix classified as {self.classification}")
+
+
+class BackendsCoolingDown(RuntimeError):
+    """No transport backend is currently eligible for a new wire attempt."""
+
+    def __init__(self, wait_seconds: float) -> None:
+        self.wait_seconds = max(0.0, float(wait_seconds))
+        super().__init__(f"all network backends are cooling down for about {self.wait_seconds:.1f}s")
+
+
+class ServiceStatusResponse(RuntimeError):
+    """A live Wayback service status was known from headers before body I/O."""
+
+    def __init__(self, status: int, headers: dict[str, str], url: str, backend: str) -> None:
+        self.status = int(status)
+        self.headers = dict(headers)
+        self.url = str(url)
+        self.backend = str(backend)
+        super().__init__(f"HTTP {self.status}: {self.url}")
+
+
+class RedirectPolicyError(RuntimeError):
+    """A redirect was rejected before contacting the destination."""
+
+    def __init__(self, source: str, destination: str, category: str = "external_redirect_blocked") -> None:
+        self.source = str(source)
+        self.destination = str(destination)
+        self.category = str(category)
+        self.status = None
+        super().__init__(f"{self.category}: {self.source} -> {self.destination}")
 
 
 class TransportExhaustedError(RuntimeError):
@@ -166,6 +197,52 @@ def is_transport_read_timeout(exc: BaseException) -> bool:
             continue
         current = current.__cause__ or current.__context__
     return False
+
+
+def is_local_storage_error(exc: BaseException) -> bool:
+    """Return True for local filesystem failures that must never rotate HTTP stacks."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    storage_errnos = {
+        errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES, errno.EPERM,
+        errno.ENAMETOOLONG, errno.ENOENT,
+    }
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, OSError) and getattr(current, "errno", None) in storage_errnos:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_archived_memento(headers: dict[str, str], url: str) -> bool:
+    if "/web/" not in str(url):
+        return False
+    lowered = {str(k).casefold(): str(v) for k, v in headers.items()}
+    return bool(lowered.get("memento-datetime"))
+
+
+def _raise_live_service_status(status: int, headers: dict[str, str], url: str, backend: str) -> None:
+    if int(status) in {429, 503} and not _is_archived_memento(headers, url):
+        raise ServiceStatusResponse(status, headers, url, backend)
+
+
+def _redirect_destination(
+    current_url: str,
+    location: str,
+    request_headers: dict[str, str],
+    redirect_validator: Callable[[str, str], None] | None,
+) -> str:
+    destination = urllib.parse.urljoin(current_url, location)
+    if "Range" in request_headers or "range" in request_headers:
+        # A saved prefix belongs to the original representation.  Until a
+        # persisted validator proves otherwise, restart this capture from zero
+        # before following any redirect so bytes from two identities can never
+        # be appended together.
+        raise InvalidRangeResponse("replay redirected while resuming a partial file; restarting complete representation")
+    if redirect_validator is not None:
+        redirect_validator(current_url, destination)
+    return destination
 
 def _ssl_context(trust_env: bool = True) -> ssl.SSLContext:
     context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if truststore else ssl.create_default_context()
@@ -335,6 +412,7 @@ class HttpxBackend:
         stop_event: threading.Event,
         *,
         attempt_context_factory=None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -345,10 +423,12 @@ class HttpxBackend:
             with self._attempt(attempt_context_factory):
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
+                    copied_headers = _copy_headers(response.headers.items())
+                    _raise_live_service_status(status, copied_headers, str(response.url), self.name)
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
-                            current_url = urllib.parse.urljoin(current_url, location)
+                            current_url = _redirect_destination(current_url, location, headers, redirect_validator)
                             continue
                     announced = response.headers.get("Content-Length")
                     if announced and announced.isdigit() and int(announced) > max_bytes:
@@ -356,7 +436,7 @@ class HttpxBackend:
                     data = _read_limited(response.iter_bytes(1024 * 1024), max_bytes, stop_event)
                     return TransportResponse(
                         status=status,
-                        headers=_copy_headers(response.headers.items()),
+                        headers=copied_headers,
                         final_url=str(response.url),
                         data=data,
                         backend=self.name,
@@ -375,6 +455,7 @@ class HttpxBackend:
         preview_validator: Callable[[dict[str, str], bytes], str | None] | None = None,
         *,
         attempt_context_factory=None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -385,15 +466,16 @@ class HttpxBackend:
             with self._attempt(attempt_context_factory):
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
+                    copied_headers = _copy_headers(response.headers.items())
+                    _raise_live_service_status(status, copied_headers, str(response.url), self.name)
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
-                            current_url = urllib.parse.urljoin(current_url, location)
+                            current_url = _redirect_destination(current_url, location, headers, redirect_validator)
                             continue
                     announced = response.headers.get("Content-Length")
                     if announced and announced.isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-                    copied_headers = _copy_headers(response.headers.items())
                     append = _validate_range(
                         status, response.headers, headers,
                         destination.stat().st_size if destination.exists() else 0,
@@ -483,6 +565,7 @@ class Urllib3Backend:
     def request(
         self, url: str, headers: dict[str, str], max_bytes: int,
         stop_event: threading.Event, *, attempt_context_factory=None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -498,19 +581,21 @@ class Urllib3Backend:
                         redirect=False, retries=False, timeout=self.timeout,
                     )
                     status = int(response.status)
+                    copied_headers = _copy_headers(response.headers.items())
+                    _raise_live_service_status(status, copied_headers, current_url, self.name)
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
                             self._discard(response)
                             response = None
-                            current_url = urllib.parse.urljoin(current_url, location)
+                            current_url = _redirect_destination(current_url, str(location), headers, redirect_validator)
                             continue
                     announced = response.headers.get("Content-Length")
                     if announced and str(announced).isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
                     data = _read_limited(response.stream(amt=1024 * 1024, decode_content=True), max_bytes, stop_event)
                     result = TransportResponse(
-                        status=status, headers=_copy_headers(response.headers.items()),
+                        status=status, headers=copied_headers,
                         final_url=current_url, data=data, backend=self.name,
                         elapsed=time.monotonic() - started,
                     )
@@ -527,6 +612,7 @@ class Urllib3Backend:
         max_bytes: int, stop_event: threading.Event, compute_hash: bool = True,
         preview_validator: Callable[[dict[str, str], bytes], str | None] | None = None,
         *, attempt_context_factory=None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -542,17 +628,18 @@ class Urllib3Backend:
                         redirect=False, retries=False, timeout=self.timeout,
                     )
                     status = int(response.status)
+                    copied_headers = _copy_headers(response.headers.items())
+                    _raise_live_service_status(status, copied_headers, current_url, self.name)
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
                             self._discard(response)
                             response = None
-                            current_url = urllib.parse.urljoin(current_url, location)
+                            current_url = _redirect_destination(current_url, str(location), headers, redirect_validator)
                             continue
                     announced = response.headers.get("Content-Length")
                     if announced and str(announced).isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-                    copied_headers = _copy_headers(response.headers.items())
                     append = _validate_range(
                         status, response.headers, headers,
                         destination.stat().st_size if destination.exists() else 0,
@@ -662,6 +749,7 @@ class CurlBackend:
     def request(
         self, url: str, headers: dict[str, str], max_bytes: int,
         stop_event: threading.Event, *, attempt_context_factory=None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -675,8 +763,9 @@ class CurlBackend:
                     current_url, headers, body_path, header_path, max_bytes, stop_event,
                     attempt_context_factory=attempt_context_factory,
                 )
+                _raise_live_service_status(status, response_headers, final_url or current_url, self.name)
                 if status in {301, 302, 303, 307, 308} and response_headers.get("location"):
-                    current_url = urllib.parse.urljoin(current_url, response_headers["location"])
+                    current_url = _redirect_destination(current_url, response_headers["location"], headers, redirect_validator)
                     continue
                 data = body_path.read_bytes() if body_path.exists() else b""
                 if len(data) > max_bytes:
@@ -692,6 +781,7 @@ class CurlBackend:
         max_bytes: int, stop_event: threading.Event, compute_hash: bool = True,
         preview_validator: Callable[[dict[str, str], bytes], str | None] | None = None,
         *, attempt_context_factory=None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -707,8 +797,9 @@ class CurlBackend:
                     current_url, headers, body_path, header_path, max_bytes, stop_event,
                     attempt_context_factory=attempt_context_factory,
                 )
+                _raise_live_service_status(status, response_headers, final_url or current_url, self.name)
                 if status in {301, 302, 303, 307, 308} and response_headers.get("location"):
-                    current_url = urllib.parse.urljoin(current_url, response_headers["location"])
+                    current_url = _redirect_destination(current_url, response_headers["location"], headers, redirect_validator)
                     continue
                 append = _validate_range(status, response_headers, headers, existing_size)
                 with body_path.open("rb") as handle:
@@ -787,28 +878,30 @@ class ResilientTransport:
         """Install a context factory invoked for every actual backend/hop attempt."""
         self.attempt_context_factory = factory
 
-    def _request_backend(self, backend, url, headers, max_bytes, stop_event):
+    def _request_backend(self, backend, url, headers, max_bytes, stop_event, redirect_validator=None):
         try:
             return backend.request(
                 url, headers, max_bytes, stop_event,
                 attempt_context_factory=getattr(self, "attempt_context_factory", None),
+                redirect_validator=redirect_validator,
             )
         except TypeError as exc:
-            if "attempt_context_factory" not in str(exc):
+            if "attempt_context_factory" not in str(exc) and "redirect_validator" not in str(exc):
                 raise
             factory = getattr(self, "attempt_context_factory", None)
             with (factory() if factory is not None else contextlib.nullcontext()):
                 return backend.request(url, headers, max_bytes, stop_event)
 
-    def _download_backend(self, backend, url, headers, destination, max_bytes, stop_event, compute_hash, preview_validator):
+    def _download_backend(self, backend, url, headers, destination, max_bytes, stop_event, compute_hash, preview_validator, redirect_validator=None):
         try:
             return backend.download(
                 url, headers, destination, max_bytes, stop_event,
                 compute_hash=compute_hash, preview_validator=preview_validator,
                 attempt_context_factory=getattr(self, "attempt_context_factory", None),
+                redirect_validator=redirect_validator,
             )
         except TypeError as exc:
-            if "attempt_context_factory" not in str(exc):
+            if "attempt_context_factory" not in str(exc) and "redirect_validator" not in str(exc):
                 raise
             factory = getattr(self, "attempt_context_factory", None)
             with (factory() if factory is not None else contextlib.nullcontext()):
@@ -831,9 +924,9 @@ class ResilientTransport:
             preferred = self.last_success
             available = [name for name in self.order if self.cooldown_until.get(name, 0.0) <= now]
         if not available:
-            # All backends are cooling down. Try all of them instead of blocking
-            # forever; the caller owns retry/backoff and can save progress.
-            available = list(self.order)
+            with self.lock:
+                eligible_at = min((self.cooldown_until.get(name, now) for name in self.order), default=now)
+            raise BackendsCoolingDown(max(0.0, eligible_at - now))
         if preferred in available:
             available.remove(preferred)
             available.insert(0, preferred)
@@ -845,6 +938,8 @@ class ResilientTransport:
         headers: dict[str, str],
         max_bytes: int,
         stop_event: threading.Event,
+        *,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportResponse:
         failures: list[tuple[str, BaseException]] = []
         for name in self._ordered_names():
@@ -852,7 +947,7 @@ class ResilientTransport:
                 raise Stopped
             backend = self.backends[name]
             try:
-                response = self._request_backend(backend, url, headers, max_bytes, stop_event)
+                response = self._request_backend(backend, url, headers, max_bytes, stop_event, redirect_validator)
                 with self.lock:
                     changed = self.last_success != name
                     self.last_success = name
@@ -862,6 +957,8 @@ class ResilientTransport:
                 return response
             except Stopped:
                 raise
+            except (ServiceStatusResponse, RedirectPolicyError, BackendsCoolingDown):
+                raise
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
                 # must not be retried using another backend.
@@ -869,6 +966,8 @@ class ResilientTransport:
                     raise
                 failures.append((name, exc))
             except Exception as exc:
+                if is_local_storage_error(exc):
+                    raise
                 failures.append((name, exc))
             with self.lock:
                 self.cooldown_until[name] = time.monotonic() + 30.0
@@ -882,7 +981,13 @@ class ResilientTransport:
                     self.callback(f"Network backend {name} reached Wayback but the response timed out; requeueing without repeating the full timeout on every backend…")
                 break
             if self.callback:
-                self.callback(f"Network backend {name} failed during connection setup; trying another connection method…")
+                if is_transport_connection_failure(last_error):
+                    message = f"Network backend {name} failed during connection setup; trying another connection method…"
+                elif is_transport_timeout(last_error):
+                    message = f"Network backend {name} timed out; trying another connection method…"
+                else:
+                    message = f"Network backend {name} failed with {type(last_error).__name__}; trying another connection method…"
+                self.callback(message)
         raise TransportExhaustedError(url, failures)
 
     def download(
@@ -894,6 +999,7 @@ class ResilientTransport:
         stop_event: threading.Event,
         compute_hash: bool = True,
         preview_validator: Callable[[dict[str, str], bytes], str | None] | None = None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
         names = self._ordered_names()
@@ -911,7 +1017,7 @@ class ResilientTransport:
             try:
                 response = self._download_backend(
                     backend, url, headers, destination, max_bytes, stop_event,
-                    compute_hash, preview_validator,
+                    compute_hash, preview_validator, redirect_validator,
                 )
                 with self.lock:
                     changed = self.last_success != name
@@ -922,11 +1028,15 @@ class ResilientTransport:
                 return response
             except Stopped:
                 raise
+            except (ServiceStatusResponse, RedirectPolicyError, BackendsCoolingDown):
+                raise
             except RuntimeError as exc:
                 if isinstance(exc, (InvalidRangeResponse, PreviewRejected, RequestAdmissionRejected)) or str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     raise
                 failures.append((name, exc))
             except Exception as exc:
+                if is_local_storage_error(exc):
+                    raise
                 failures.append((name, exc))
             # A failure can extend a valid .part prefix. Never send the stale
             # Range header to another backend: the client must calculate the
@@ -944,7 +1054,11 @@ class ResilientTransport:
                     )
                 break
             if self.callback:
-                self.callback(
-                    f"Network backend {name} failed during connection setup; trying another connection method…"
-                )
+                if is_transport_connection_failure(last_error):
+                    message = f"Network backend {name} failed during connection setup; trying another connection method…"
+                elif is_transport_timeout(last_error):
+                    message = f"Network backend {name} timed out; trying another connection method…"
+                else:
+                    message = f"Network backend {name} failed with {type(last_error).__name__}; trying another connection method…"
+                self.callback(message)
         raise TransportExhaustedError(url, failures)

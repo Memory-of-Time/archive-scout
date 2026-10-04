@@ -98,6 +98,42 @@ def is_modern_database(path: Path) -> bool:
     return database_version(path) in {2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION}
 
 
+def open_database_readonly(root: Path, *, timeout: float = 0.5) -> sqlite3.Connection:
+    """Open an existing project for bounded, query-only GUI reads.
+
+    Unlike :func:`open_database`, this helper never creates folders, migrates
+    schemas, recovers stale worker state, checkpoints WAL, or claims writer
+    ownership.  It is therefore safe for background views while another
+    Archive Scout process owns the project writer.
+    """
+    root = Path(root).expanduser().resolve()
+    path = root / DATABASE_NAME
+    if not path.exists():
+        raise FileNotFoundError(f"Archive Scout database does not exist: {path}")
+    uri = path.as_uri() + "?mode=ro"
+    database = sqlite3.connect(uri, uri=True, timeout=max(0.05, float(timeout)))
+    try:
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA query_only=ON")
+        database.execute(f"PRAGMA busy_timeout={max(50, int(float(timeout) * 1000))}")
+        row = database.execute("SELECT version FROM schema_info LIMIT 1").fetchone()
+        version = int(row[0]) if row else None
+        if version is None:
+            raise RuntimeError("Project database does not contain Archive Scout schema metadata")
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Project schema {version} is newer than supported schema {SCHEMA_VERSION}; update Archive Scout before opening it"
+            )
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Project schema {version} requires migration before it can be viewed; open the project for a normal operation first"
+            )
+        return database
+    except Exception:
+        database.close()
+        raise
+
+
 def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True)
     path = root / DATABASE_NAME

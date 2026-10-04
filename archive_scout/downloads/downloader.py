@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -40,7 +41,7 @@ from ..database.repositories import (
     save_match,
     upsert_document,
 )
-from ..events import ProgressEvent, Stopped
+from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..parsing.embeds import extract_embed_candidates_fast
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..scanning.jobs import ScanJob
@@ -50,7 +51,7 @@ from ..storage import capture_path as url_capture_path, sha256_file
 from ..utils import hash_text, normalize_search, utc_now
 from .rate_limit import (SharedFixedRateLimiter, WAYBACK_REPLAY_RATE_KEY, shared_host_gate)
 from .validation import classify_exception
-from ..network.transports import PreviewRejected
+from ..network.transports import PreviewRejected, RedirectPolicyError, is_local_storage_error
 
 CLASSIFIER_REVISION = 2
 
@@ -88,6 +89,75 @@ def replay_url(timestamp: str, original: str, modifier: str = "id_") -> str:
     encoded = urllib.parse.quote(original, safe=":/?&=#%+;,[]@!$'()*")
     clean_modifier = modifier if modifier in {"id_", "if_", "oe_"} else "id_"
     return f"{REPLAY_URL}/{timestamp}{clean_modifier}/{encoded}"
+
+
+def replay_original_url(url: str) -> str | None:
+    """Return the embedded original URL from a Wayback replay URL."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url))
+    except ValueError:
+        return None
+    if parsed.hostname not in {"web.archive.org", "wwwb-app0.us.archive.org"}:
+        return None
+    match = re.match(r"^/web/[^/]+/(https?://.+)$", parsed.path + (("?" + parsed.query) if parsed.query else ""), re.I)
+    if not match:
+        return None
+    return urllib.parse.unquote(match.group(1))
+
+
+def _target_host_scope(config: ProjectConfig) -> list[tuple[str, bool]]:
+    scopes: list[tuple[str, bool]] = []
+    for target in config.targets:
+        raw = str(target).strip().replace("*", "")
+        if not raw:
+            continue
+        parsed = urllib.parse.urlsplit(raw if "://" in raw else "http://" + raw)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        if not host:
+            continue
+        settings = config.settings_for_target(target)
+        match_type = str(settings.get("cdx_match_type") or config.cdx_match_type or "").casefold()
+        scopes.append((host, match_type == "domain"))
+    return scopes
+
+
+def _host_in_project_scope(host: str, scopes: list[tuple[str, bool]]) -> bool:
+    value = str(host or "").casefold().rstrip(".")
+    for allowed, include_subdomains in scopes:
+        if value == allowed or (include_subdomains and value.endswith("." + allowed)):
+            return True
+    return False
+
+
+def make_replay_redirect_validator(config: ProjectConfig, source_original: str):
+    """Return the shared archive-only redirect policy for one stored capture.
+
+    The callback runs before the transport contacts each redirect destination.
+    External is defined by the embedded original host, not by the common
+    web.archive.org replay host. Live destinations are never silently attached
+    to historical evidence in v1.0.3.
+    """
+    normalized = config.normalized()
+    scopes = _target_host_scope(normalized)
+    source_host = (urllib.parse.urlsplit(source_original).hostname or "").casefold().rstrip(".")
+
+    def validate(source_url: str, destination_url: str) -> None:
+        embedded = replay_original_url(destination_url)
+        if embedded is None:
+            parsed = urllib.parse.urlsplit(destination_url)
+            if parsed.hostname and parsed.hostname.casefold() != "web.archive.org":
+                raise RedirectPolicyError(source_url, destination_url, "live_redirect_blocked")
+            # Archive-internal canonical/timestamp redirects without an embedded
+            # original remain eligible; a later hop is checked again.
+            return
+        dest_host = (urllib.parse.urlsplit(embedded).hostname or "").casefold().rstrip(".")
+        if dest_host == source_host or _host_in_project_scope(dest_host, scopes):
+            return
+        if normalized.download_external_redirects:
+            return
+        raise RedirectPolicyError(source_url, destination_url, "external_redirect_blocked")
+
+    return validate
 
 
 def capture_path(root: Path, capture_id: int, timestamp: str, original: str) -> Path:
@@ -595,18 +665,25 @@ def _download_capture(
             return decision.resource_class
         return None
     try:
+        redirect_validator = make_replay_redirect_validator(config, original)
         if compute_hash:
-            response = client.download_to_path(replay, temp, stream_limit, preview_validator=preview_validator)
+            response = client.download_to_path(
+                replay, temp, stream_limit,
+                preview_validator=preview_validator,
+                redirect_validator=redirect_validator,
+            )
         else:
             response = client.download_to_path(
-                replay, temp, stream_limit, compute_hash=False, preview_validator=preview_validator
+                replay, temp, stream_limit, compute_hash=False,
+                preview_validator=preview_validator,
+                redirect_validator=redirect_validator,
             )
     except TypeError as exc:
         # Preserve third-party/test adapters that predate Audit3's optional
         # prefix validator without accidentally re-enabling hashing for the
         # intentionally lean download-only/acquisition path.
         message = str(exc)
-        if "preview_validator" in message:
+        if "preview_validator" in message or "redirect_validator" in message:
             if compute_hash:
                 response = client.download_to_path(replay, temp, stream_limit)
             else:
@@ -1162,6 +1239,8 @@ def _acquire_archive(
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
+        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
+        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
 
     inflight_limit = max(config.workers, config.workers * 3)
@@ -1516,7 +1595,7 @@ def _acquire_archive(
             },
         ))
 
-    deferred_error: RateLimitDeferred | None = None
+    deferred_error: RateLimitDeferred | ConnectivityPaused | None = None
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=config.workers, thread_name_prefix="archive-acquire"
     )
@@ -1668,10 +1747,27 @@ def _acquire_archive(
                             "UPDATE captures SET state='pending',updated_at=? WHERE id=?",
                             (utc_now(), capture_id),
                         )
+                except ConnectivityPaused as exc:
+                    if deferred_error is None:
+                        deferred_error = exc
+                        acquisition_cancel.set()
+                    with database:
+                        database.execute(
+                            "UPDATE captures SET state='pending',updated_at=? WHERE id=?",
+                            (utc_now(), capture_id),
+                        )
                 except Stopped:
                     if deferred_error is None:
                         raise
                 except Exception as exc:
+                    if is_local_storage_error(exc):
+                        acquisition_cancel.set()
+                        with database:
+                            database.execute(
+                                "UPDATE captures SET state='pending',updated_at=? WHERE id=?",
+                                (utc_now(), capture_id),
+                            )
+                        raise
                     error_buffer.append((capture_id, item, exc))
                     failures += 1
 
@@ -1714,6 +1810,7 @@ def _acquire_archive(
             "downloaded": downloaded,
             "skipped": skipped + int(selection_stats["metadata_skipped"]) + int(selection_stats["url_skipped"]),
             "errors": failures,
+            "scan_errors": scan_failures,
             "elapsed": time.monotonic() - started,
             "http_starts": int(metrics["request_starts"]),
             "http_completions": int(metrics["request_completions"]),
@@ -1918,7 +2015,7 @@ def download_archive(
     states: tuple[str, ...] = ("pending",),
     capture_ids: list[int] | None = None,
     scan_jobs: list[ScanJob] | None = None,
-) -> None:
+) -> dict[str, int | float]:
     """Acquire first through the shared replay engine, then scan local files.
 
     When a target has replay-runtime overrides, run bounded target phases so its
@@ -1930,7 +2027,7 @@ def download_archive(
     if config.download_scope == "index_only":
         if callback:
             callback(ProgressEvent("download", "Index-only mode selected; downloads skipped."))
-        return
+        return {"scan_errors": 0, "scanned": 0, "matched": 0}
     jobs = scan_jobs or [ScanJob.create(scan_run_id, config.keyword_set_name, config.keywords)]
     if not jobs or any(not job.patterns for job in jobs):
         raise ValueError("at least one keyword rule is required")
@@ -1943,19 +2040,25 @@ def download_archive(
             "Applying per-target replay worker/delay settings; targets will acquire in bounded phases.",
         ))
 
+    aggregate: dict[str, int | float] = {"scan_errors": 0, "scanned": 0, "matched": 0}
+
     if config.text_retention == "discard_after_scan":
         # Retry only discard-spool files left by an earlier interrupted/failed
         # run. Pre-existing retained/imported captures are never swept into the
         # destructive policy merely because this operation selected discard.
         for runtime_config in runtime_configs:
-            _scan_pending_captures(
+            scan_stats = _scan_pending_captures(
                 runtime_config, database, jobs, stop_event, callback, capture_ids=capture_ids
             )
-            _acquire_archive(
+            aggregate["scan_errors"] += int(scan_stats.get("errors", 0))
+            aggregate["scanned"] += int(scan_stats.get("scanned", 0))
+            aggregate["matched"] += int(scan_stats.get("matched", 0))
+            acquire_stats = _acquire_archive(
                 runtime_config, database, stop_event, callback,
                 patterns=combined_patterns, states=states, capture_ids=capture_ids,
                 progress_stage="download", scan_jobs=jobs,
             )
+            aggregate["scan_errors"] += int(acquire_stats.get("scan_errors", 0))
     else:
         # Preserve the established acquisition-first contract even when runtime
         # settings require per-target replay pools: acquire every target first,
@@ -1967,9 +2070,13 @@ def download_archive(
                 progress_stage="download",
             )
         for runtime_config in runtime_configs:
-            _scan_pending_captures(
+            scan_stats = _scan_pending_captures(
                 runtime_config, database, jobs, stop_event, callback, capture_ids=capture_ids
             )
+            aggregate["scan_errors"] += int(scan_stats.get("errors", 0))
+            aggregate["scanned"] += int(scan_stats.get("scanned", 0))
+            aggregate["matched"] += int(scan_stats.get("matched", 0))
+    return aggregate
 
 
 def download_archive_only(

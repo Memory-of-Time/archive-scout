@@ -2055,6 +2055,8 @@ def index_external_embedded_media(
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
         rate_event_callback=on_rate_event,
+        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
+        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
     try:
         index_embedded_media(
@@ -2126,6 +2128,8 @@ def index_media(
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
         rate_event_callback=on_rate_event,
+        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
+        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
     try:
         index_direct_media(config, database, client, stop_event, callback, signature, state_signature)

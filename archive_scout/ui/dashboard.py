@@ -108,7 +108,7 @@ def _count(database: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
     except sqlite3.DatabaseError as exc:
         if "interrupted" in str(exc).casefold():
             raise DashboardQueryInterrupted("dashboard query deadline exceeded") from exc
-        return 0
+        raise
 
 
 def _has_column(database: sqlite3.Connection, table: str, column: str) -> bool:
@@ -136,6 +136,10 @@ def read_dashboard_counts(database_path: Path, *, max_query_seconds: float = 2.0
         result: dict[str, int | bool | str | None] = {key: None for key in EMPTY_DASHBOARD}
         result["_exact"] = True
         result["_status"] = "exact"
+        # Pin every card to one SQLite read snapshot.  Without an explicit
+        # transaction, each SELECT can observe a different writer commit and
+        # produce impossible combinations such as captures=0, pending=1.
+        database.execute("BEGIN")
 
         queries = [
             ("captures", "SELECT COUNT(*) FROM captures", ()),
@@ -203,6 +207,18 @@ def read_dashboard_counts(database_path: Path, *, max_query_seconds: float = 2.0
         except DashboardQueryInterrupted:
             result["_exact"] = False
             result["_status"] = "deadline_exceeded"
+        except sqlite3.DatabaseError as exc:
+            result["_exact"] = False
+            result["_status"] = "database_error"
+            result["_error"] = str(exc)
+            for key in EMPTY_DASHBOARD:
+                if key not in result or result[key] is None:
+                    result[key] = None
+        finally:
+            try:
+                database.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
         return result
     finally:
         try:

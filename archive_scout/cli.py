@@ -190,6 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--retention", choices=("keep", "discard_after_scan"),
         help="Override text retention for this operation. Resume keeps the saved operation policy.",
     )
+    run.add_argument(
+        "--download-external-redirect-destinations",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="Follow archived replay redirects whose embedded original host is outside the project scope. Live redirects remain blocked.",
+    )
 
     status = sub.add_parser("status", help="Read project/queue status without modifying it")
     _add_project(status)
@@ -235,14 +240,24 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--research-backend", choices=("local-hash", "fastembed"), default="local-hash")
     init.add_argument("--no-auto-research", action="store_true", help="Do not build Research Intelligence automatically after normal scans")
     init.add_argument("--retention", choices=("keep", "discard_after_scan"), default="keep")
+    init.add_argument(
+        "--download-external-redirect-destinations", action="store_true",
+        help="Persist permission to follow archived redirects to original hosts outside the project scope.",
+    )
     init.add_argument("--format", choices=FORMATS, default="text")
     return parser
 
 
 def _run_command(args: argparse.Namespace) -> int:
     config = _load(args.project)
-    if args.retention and args.mode != "resume":
-        config = replace(config, text_retention=args.retention).normalized()
+    retention = getattr(args, "retention", None)
+    if retention and args.mode != "resume":
+        config = replace(config, text_retention=retention).normalized()
+    redirect_override = getattr(args, "download_external_redirect_destinations", None)
+    if redirect_override is not None and args.mode != "resume":
+        config = replace(
+            config, download_external_redirects=bool(redirect_override)
+        ).normalized()
     stop_event = threading.Event()
     interrupted = False
     previous_handlers: dict[int, object] = {}
@@ -352,6 +367,7 @@ def cli_main(argv: list[str] | None = None) -> int:
                 ai=AIConfig(provider=args.ai_provider, model=args.ai_model),
                 research=ResearchConfig(vector_backend=args.research_backend, auto_build=not args.no_auto_research),
                 text_retention=args.retention,
+                download_external_redirects=bool(args.download_external_redirect_destinations),
             ).normalized()
             project_path.parent.mkdir(parents=True, exist_ok=True)
             project_path.write_text(json.dumps(config.to_payload(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

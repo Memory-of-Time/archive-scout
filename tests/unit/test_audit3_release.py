@@ -379,7 +379,7 @@ class Audit3ReleaseTests(unittest.TestCase):
         self.assertEqual(ctl.switch_project(), 1)
         self.assertFalse(ctl.finish(generation))
         self.assertTrue(ctl.automatic_due(5.1, visible=True, operation_active=False))
-        self.assertFalse(ctl.automatic_due(5.1, visible=True, operation_active=True))
+        self.assertTrue(ctl.automatic_due(5.1, visible=True, operation_active=True))
 
     def test_audit3_config_round_trip_retention_and_dashboard(self):
         with tempfile.TemporaryDirectory() as temp:

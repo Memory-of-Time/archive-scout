@@ -20,11 +20,13 @@ _shared_host_gates: dict[str, "SharedHostGate"] = {}
 
 
 class _SharedRateState:
-    def __init__(self, requested_delay: float) -> None:
+    def __init__(self, requested_delay: float, floor_delay: float = 0.0) -> None:
         self.condition = threading.Condition()
         self.next_request = 0.0
+        self.floor_delay = max(0.0, float(floor_delay))
         self.requested_delay = max(0.0, float(requested_delay))
         self.adaptive_delay = self.requested_delay
+        self.registrations: dict[int, float] = {}
         self.last_rate_limit = 0.0
         self.last_rate_signal = 0.0
         self.last_incident_id: int | None = None
@@ -89,18 +91,26 @@ class SharedFixedRateLimiter(FixedRateLimiter):
         elif self.key == WAYBACK_REPLAY_RATE_KEY:
             floor = WAYBACK_REPLAY_MIN_INTERVAL
         self.delay = max(floor, float(delay), 0.0)
+        self._registration_id = id(self)
+        self._closed = False
         with _shared_rate_lock:
             state = _shared_rate_states.get(self.key)
             if state is None:
-                state = _SharedRateState(self.delay)
+                state = _SharedRateState(self.delay, floor)
                 _shared_rate_states[self.key] = state
-            else:
-                with state.condition:
-                    # Preserve slower user choices.  A newly-created faster client
-                    # may share the pool, but it cannot lower the active ceiling.
-                    state.requested_delay = max(state.requested_delay, self.delay)
-                    state.adaptive_delay = max(state.adaptive_delay, state.requested_delay)
-                    state.condition.notify_all()
+            with state.condition:
+                state.floor_delay = max(state.floor_delay, floor)
+                state.registrations[self._registration_id] = self.delay
+                # Only *active* clients contribute their requested pacing floor.
+                # Service-driven adaptive recovery remains a separate state so a
+                # throttle survives operation turnover without a closed slow
+                # client permanently constraining a later faster operation.
+                state.requested_delay = max(
+                    state.floor_delay,
+                    max(state.registrations.values(), default=state.floor_delay),
+                )
+                state.adaptive_delay = max(state.adaptive_delay, state.requested_delay)
+                state.condition.notify_all()
         self._state = state
         self.condition = state.condition
 
@@ -119,6 +129,23 @@ class SharedFixedRateLimiter(FixedRateLimiter):
     @property
     def requested_delay(self) -> float:
         return self.delay
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self.condition:
+            self._state.registrations.pop(self._registration_id, None)
+            requested = max(
+                self._state.floor_delay,
+                max(self._state.registrations.values(), default=self._state.floor_delay),
+            )
+            self._state.requested_delay = requested
+            if self._state.last_rate_limit <= 0.0:
+                self._state.adaptive_delay = requested
+            else:
+                self._state.adaptive_delay = max(requested, self._state.adaptive_delay)
+            self.condition.notify_all()
 
     def note_rate_limit(self, incident_id: int | None = None) -> bool:
         """Apply at most one pacing reduction for a coalesced service incident.
@@ -232,6 +259,8 @@ class SharedHostGate:
         self.generation = 0
         self.probe_required = False
         self.probe_inflight = False
+        self.connection_failures = 0
+        self.last_connection_failure = 0.0
 
     def acquire_request(
         self,
@@ -412,6 +441,28 @@ class SharedHostGate:
             requested_max = max(requested_base, float(max_pause))
             self.base_pause = max(self.base_pause, requested_base)
             self.max_pause = max(self.max_pause, requested_max)
+
+    def note_connection_failure(self, threshold: int) -> tuple[int, bool]:
+        """Track a short burst of genuine connection-setup failures.
+
+        This deliberately does not share the HTTP 429/503 gate: a connection
+        outage should pause the operation and preserve the queue, not masquerade
+        as a server quota incident. Healthy responses reset the streak so one bad
+        URL or one backend does not stop an otherwise working run.
+        """
+        limit = max(2, int(threshold))
+        with self.condition:
+            now = time.monotonic()
+            if self.last_connection_failure and now - self.last_connection_failure > 30.0:
+                self.connection_failures = 0
+            self.last_connection_failure = now
+            self.connection_failures += 1
+            return self.connection_failures, self.connection_failures >= limit
+
+    def note_connection_success(self) -> None:
+        with self.condition:
+            self.connection_failures = 0
+            self.last_connection_failure = 0.0
 
 
 def shared_host_gate(

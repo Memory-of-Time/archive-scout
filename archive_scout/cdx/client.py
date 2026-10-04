@@ -17,15 +17,19 @@ import urllib3
 
 from ..constants import RETRYABLE_STATUS
 from ..downloads.rate_limit import FixedRateLimiter, RecoveryDeadlineExceeded, SharedHostGate
-from ..events import Stopped
+from ..events import ConnectivityPaused, Stopped
 from ..json_codec import JSONDecodeErrors, loads as json_loads
 from ..network.transports import (
+    BackendsCoolingDown,
+    RedirectPolicyError,
     ResilientTransport,
     InvalidRangeResponse,
     PreviewRejected,
     RequestAdmissionRejected,
+    ServiceStatusResponse,
     TransportExhaustedError,
     is_transport_connection_failure,
+    is_local_storage_error,
     is_transport_read_timeout,
     is_transport_timeout,
 )
@@ -44,6 +48,8 @@ class TransientRequestError(RuntimeError):
         connection_failed: bool = False,
         splittable: bool = False,
         endpoint: str | None = None,
+        category: str = "",
+        backend: str = "",
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -52,6 +58,8 @@ class TransientRequestError(RuntimeError):
         self.timed_out = bool(timed_out or read_timed_out)
         self.splittable = splittable
         self.endpoint = endpoint
+        self.category = str(category or "")
+        self.backend = str(backend or "")
 
 
 class MalformedCDXResponse(TransientRequestError):
@@ -188,6 +196,8 @@ class HttpClient:
         network_callback: Callable[[str], None] | None = None,
         rate_event_callback: Callable[[dict[str, object]], None] | None = None,
         transport: ResilientTransport | None = None,
+        connection_failure_pause_threshold: int = 0,
+        connection_retry_seconds: float = 3.0,
     ) -> None:
         self.limiter = limiter
         self.retries = max(1, int(retries))
@@ -198,6 +208,8 @@ class HttpClient:
         self.stop_event = stop_event
         self.retry_callback = retry_callback
         self.rate_event_callback = rate_event_callback
+        self.connection_failure_pause_threshold = max(0, int(connection_failure_pause_threshold))
+        self.connection_retry_seconds = max(0.1, float(connection_retry_seconds))
         self.host_gate = host_gate or SharedHostGate()
         self.rate_limit_attempts = max(0, int(rate_limit_attempts))
         self.rate_limit_max_wait = max(0.0, float(rate_limit_max_wait))
@@ -234,7 +246,12 @@ class HttpClient:
             self.transport.set_attempt_context_factory(self._wire_attempt)
 
     def close(self) -> None:
-        self.transport.close()
+        try:
+            self.transport.close()
+        finally:
+            close_limiter = getattr(self.limiter, "close", None)
+            if callable(close_limiter):
+                close_limiter()
 
     def _metric_add(self, name: str, value: float = 1.0) -> None:
         with self.metrics_lock:
@@ -325,6 +342,75 @@ class HttpClient:
         # protocol. Production SharedHostGate always takes the typed path above.
         wait_seconds = float(self.host_gate.pause_for_rate_limit(retry_after, f"HTTP {status}"))
         return wait_seconds, int(rate_attempt), time.time() + max(0.0, wait_seconds)
+
+    def _note_connection_success(self) -> None:
+        note = getattr(self.host_gate, "note_connection_success", None)
+        if callable(note):
+            note()
+
+    def _raise_if_common_connection_outage(self, exc: BaseException) -> None:
+        if self.connection_failure_pause_threshold <= 0:
+            return
+        if not bool(getattr(exc, "connection_failed", False)) and not is_transport_connection_failure(exc):
+            return
+        note = getattr(self.host_gate, "note_connection_failure", None)
+        if not callable(note):
+            return
+        count, should_pause = note(self.connection_failure_pause_threshold)
+        if should_pause:
+            raise ConnectivityPaused(
+                "Repeated connection failures indicate a common network/Wayback outage "
+                f"({count} consecutive connection failures). Untouched work remains pending; "
+                "check connectivity and Resume later."
+            ) from exc
+
+    def _handle_early_service_status(self, exc: ServiceStatusResponse, rate_attempt: int) -> int:
+        """Apply live 429/503 recovery using headers before any response body is read."""
+        self._note_connection_success()
+        status = int(exc.status)
+        retry_after_header = exc.headers.get("retry-after") or exc.headers.get("Retry-After")
+        retry_after = parse_retry_after(retry_after_header)
+        rate_attempt += 1
+        wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt)
+        if hasattr(self.limiter, "note_rate_limit"):
+            self.limiter.note_rate_limit(incident_id)
+        self._metric_add("rate_limit_events")
+        gate_state = self._gate_snapshot()
+        self._emit_rate_event(
+            "cooldown",
+            http_status=status,
+            incident_id=incident_id,
+            wait_seconds=wait_seconds,
+            eligible_at_epoch=eligible_at_epoch,
+            attempt=rate_attempt,
+            attempt_limit=self.rate_limit_attempts,
+        )
+        if self.retry_callback and self.rate_event_callback is None:
+            self.retry_callback(
+                rate_attempt,
+                self.rate_limit_attempts,
+                f"HTTP {status}; Wayback service quota/overload cooldown active",
+                wait_seconds,
+            )
+        if self.rate_limit_attempts > 0 and rate_attempt >= self.rate_limit_attempts:
+            deferred = RateLimitDeferred(
+                f"Wayback continued returning HTTP {status} after {rate_attempt} coordinated pauses. Progress was saved for resume.",
+                status=status,
+                waited=float(gate_state.get("incident_elapsed", 0.0) or 0.0),
+                eligible_at_epoch=eligible_at_epoch,
+                incident_id=incident_id,
+            )
+            self._emit_rate_event("paused", **deferred.to_detail())
+            raise deferred
+        return rate_attempt
+
+    def _wait_for_backend_cooldown(self, exc: BackendsCoolingDown) -> None:
+        wait_seconds = max(0.05, float(exc.wait_seconds))
+        if self.retry_callback:
+            self.retry_callback(1, self.retries, "network backends cooling down", wait_seconds)
+        stop_event = self._active_stop_event()
+        if stop_event.wait(wait_seconds):
+            raise Stopped
 
     def _acquire_host_permit(self):
         started = time.monotonic()
@@ -436,6 +522,7 @@ class HttpClient:
                 finally:
                     self._permit_local.permit = None
                 self._metric_add("network_bytes", len(response.data))
+                self._note_connection_success()
                 status = int(response.status)
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
                 archived_memento = self._is_archived_memento(response.headers, response.final_url or url)
@@ -541,6 +628,17 @@ class HttpClient:
                     "backend": response.backend,
                     "elapsed": response.elapsed,
                 }
+            except ServiceStatusResponse as exc:
+                self.host_gate.finish_request(permit, recovered=False)
+                rate_attempt = self._handle_early_service_status(exc, rate_attempt)
+                continue
+            except BackendsCoolingDown as exc:
+                self.host_gate.finish_request(permit, recovered=False)
+                self._wait_for_backend_cooldown(exc)
+                continue
+            except RedirectPolicyError:
+                self.host_gate.finish_request(permit, recovered=True)
+                raise
             except RequestAdmissionRejected:
                 self.host_gate.finish_request(permit, recovered=False)
                 continue
@@ -556,6 +654,7 @@ class HttpClient:
                 if isinstance(exc, TransportExhaustedError):
                     timed_out = is_timeout_error(exc)
                     read_timed_out = bool(getattr(exc, "read_timed_out", False))
+                    self._raise_if_common_connection_outage(exc)
                     generic_attempt += 1
                     if generic_attempt >= self.retries:
                         raise TransientRequestError(
@@ -565,7 +664,8 @@ class HttpClient:
                             connection_failed=bool(getattr(exc, "connection_failed", False)),
                             splittable=True,
                         ) from exc
-                    self.retry_wait(generic_attempt - 1, "read timeout" if timed_out else str(exc))
+                    reason = "read timeout" if read_timed_out else ("connection timeout" if timed_out else str(exc))
+                    self.retry_wait(generic_attempt - 1, reason)
                     continue
                 if str(exc).startswith("response exceeds"):
                     raise TransientRequestError(
@@ -575,10 +675,13 @@ class HttpClient:
                 raise
             except (httpx.HTTPError, urllib3.exceptions.HTTPError, TimeoutError, OSError) as exc:
                 self.host_gate.finish_request(permit, recovered=False)
+                if is_local_storage_error(exc):
+                    raise
                 if is_missing_frozen_bundle_error(exc):
                     raise frozen_bundle_error_from_exception(exc) from exc
                 timed_out = is_timeout_error(exc)
                 read_timed_out = is_transport_read_timeout(exc)
+                self._raise_if_common_connection_outage(exc)
                 generic_attempt += 1
                 if generic_attempt >= self.retries:
                     raise TransientRequestError(
@@ -588,7 +691,8 @@ class HttpClient:
                         connection_failed=is_transport_connection_failure(exc),
                         splittable=True,
                     ) from exc
-                self.retry_wait(generic_attempt - 1, "read timeout" if timed_out else str(exc))
+                reason = "read timeout" if read_timed_out else ("connection timeout" if timed_out else str(exc))
+                self.retry_wait(generic_attempt - 1, reason)
             except Exception:
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
@@ -602,6 +706,7 @@ class HttpClient:
         *,
         compute_hash: bool = True,
         preview_validator: Callable[[dict[str, str], bytes], str | None] | None = None,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> dict:
         """Stream a replay response to disk under the shared Wayback policy."""
         headers = {
@@ -635,12 +740,12 @@ class HttpClient:
                     if compute_hash:
                         response = self._transport_download(
                             url, request_headers, destination, max_bytes,
-                            preview_validator=preview_validator,
+                            preview_validator=preview_validator, redirect_validator=redirect_validator,
                         )
                     else:
                         response = self._transport_download(
                             url, request_headers, destination, max_bytes,
-                            compute_hash=False, preview_validator=preview_validator,
+                            compute_hash=False, preview_validator=preview_validator, redirect_validator=redirect_validator,
                         )
                 except TypeError as exc:
                     # Preserve lightweight third-party/test transports that do not
@@ -667,6 +772,7 @@ class HttpClient:
                 finally:
                     self._permit_local.permit = None
                 self._metric_add("network_bytes", int(getattr(response, "bytes_written", 0) or 0))
+                self._note_connection_success()
                 status = int(response.status)
                 archived_memento = self._is_archived_memento(response.headers, response.final_url or url)
                 if status == 416 and existing_size:
@@ -744,6 +850,17 @@ class HttpClient:
                     "elapsed": response.elapsed,
                     "archived_origin_status": bool(archived_memento and status >= 400),
                 }
+            except ServiceStatusResponse as exc:
+                self.host_gate.finish_request(permit, recovered=False)
+                rate_attempt = self._handle_early_service_status(exc, rate_attempt)
+                continue
+            except BackendsCoolingDown as exc:
+                self.host_gate.finish_request(permit, recovered=False)
+                self._wait_for_backend_cooldown(exc)
+                continue
+            except RedirectPolicyError:
+                self.host_gate.finish_request(permit, recovered=True)
+                raise
             except PreviewRejected:
                 self.host_gate.finish_request(permit, recovered=True)
                 destination.unlink(missing_ok=True)
@@ -777,6 +894,7 @@ class HttpClient:
                 if isinstance(exc, TransportExhaustedError):
                     timed_out = is_timeout_error(exc)
                     read_timed_out = bool(getattr(exc, "read_timed_out", False))
+                    self._raise_if_common_connection_outage(exc)
                     generic_attempt += 1
                     if generic_attempt >= self.retries:
                         raise TransientRequestError(
@@ -785,17 +903,21 @@ class HttpClient:
                             connection_failed=bool(getattr(exc, "connection_failed", False)),
                             splittable=False,
                         ) from exc
-                    self.retry_wait(generic_attempt - 1, "read timeout" if timed_out else str(exc))
+                    reason = "read timeout" if read_timed_out else ("connection timeout" if timed_out else str(exc))
+                    self.retry_wait(generic_attempt - 1, reason)
                     continue
                 destination.unlink(missing_ok=True)
                 raise
             except (httpx.HTTPError, urllib3.exceptions.HTTPError, TimeoutError, OSError) as exc:
                 self.host_gate.finish_request(permit, recovered=False)
+                if is_local_storage_error(exc):
+                    raise
                 if is_missing_frozen_bundle_error(exc):
                     destination.unlink(missing_ok=True)
                     raise frozen_bundle_error_from_exception(exc) from exc
                 timed_out = is_timeout_error(exc)
                 read_timed_out = is_transport_read_timeout(exc)
+                self._raise_if_common_connection_outage(exc)
                 generic_attempt += 1
                 if generic_attempt >= self.retries:
                     raise TransientRequestError(
@@ -804,7 +926,8 @@ class HttpClient:
                         connection_failed=is_transport_connection_failure(exc),
                         splittable=False,
                     ) from exc
-                self.retry_wait(generic_attempt - 1, "read timeout" if timed_out else str(exc))
+                reason = "read timeout" if read_timed_out else ("connection timeout" if timed_out else str(exc))
+                self.retry_wait(generic_attempt - 1, reason)
             except Exception:
                 destination.unlink(missing_ok=True)
                 self.host_gate.finish_request(permit, recovered=False)

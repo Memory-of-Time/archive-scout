@@ -1,25 +1,28 @@
 # Archive Scout
 
-**Archive Scout 1.0.2** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **11**.
+**Archive Scout 1.0.3** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **11**.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.2/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.2/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.2/ArchiveScout-macOS-Universal.zip)
+- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.3/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.3/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.3/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
-## 1.0.2 highlights
+## 1.0.3 highlights
 
-- Clear, theme-aware outlines around multiline text-entry areas on Windows, macOS, and Linux, with labeled Media sites/include/exclude editor groups.
-- Per-target date/match/query overrides remain associated with their indexed inventory through text acquisition and local scanning, including Simple mode.
-- Per-target Download workers and Replay delay overrides are now honored by bounded target acquisition phases without weakening the shared Wayback request floor.
-- Resume-first CDX/Timemap indexing with durable page/window checkpoints and a conservative shared **2.5-second index request-attempt interval (24/minute)**.
-- Independent replay pacing at **0.125 seconds per actual request attempt (8/second)**. Redirect hops, retries, and transport-backend fallbacks are paced and counted at the wire-attempt boundary.
-- Coordinated Wayback 429/503 handling: Retry-After is treated as a minimum, missing headers start with at least a 60-second cooldown, recovery is gradual, and rate-limit pauses remain distinct from connectivity failures.
-- Durable text/media classification, replay resume, local scanning, reports, review state, Research Intelligence, optional AI relevance, and media workflows.
-- Windows DPI-aware startup, system/dark/high-contrast theme handling, named-font scaling rather than global Tk DPI overrides, screen-clamped geometry, reusable scrolling, and independently scrollable tables.
+- Canonical project identity now follows GUI operations, asynchronous queries, row maps, and mutations so stale rows or progress from one project cannot write into another.
+- Resume now considers recoverable failed operation snapshots and preserves the original operation contract, including keyword-free download-only recovery and compatible scan lineage.
+- Live Wayback 429/503 status is handled from response headers before body reads or media validation, preventing service cooldown instructions from being hidden by later body failures.
+- Replay and media acquisition now coordinate common connection outages, honor transport-backend cooldown eligibility, preserve untouched captures as pending, and keep local storage failures typed instead of rotating HTTP backends.
+- Closed clients release their requested pacing floor while service-driven adaptive cooldown state remains shared, preventing a previous slower operation from permanently constraining a later faster one.
+- Added **Download external redirect destinations**. External archived redirect targets are blocked by default, live escapes remain blocked, and resumed partial files restart safely across representation-changing redirects.
+- Added an acquisition-only text error retry route that does not require keywords or create scan/document/match rows.
+- Results now keep editable Notes separate from read-only snippets. Errors, Results, AI relevance, Research Intelligence, and Scan history have bounded asynchronous reads with clearer detail/copy affordances and stale-project guards.
+- Dashboard refresh honors its selected interval during active work, coalesces reads, uses bounded read-only snapshots, and reports unavailable counts instead of silently turning read failures into zero.
+- Loading a moved `project.json` now treats the selected manifest folder as the active project root instead of silently reopening an older saved absolute output path.
+- Project schema remains **11**.
 
 The source still recognizes serialized project identifiers from pre-release development builds so existing project folders can be migrated safely. Those compatibility identifiers are not separate public releases.
 

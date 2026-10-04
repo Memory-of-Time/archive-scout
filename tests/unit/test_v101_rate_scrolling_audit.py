@@ -26,7 +26,7 @@ class V101RateAndScrollingAuditTests(unittest.TestCase):
         reset_shared_traffic_state_for_tests()
 
     def test_release_identity_keeps_schema_11(self):
-        self.assertEqual(VERSION, "1.0.2")
+        self.assertEqual(VERSION, "1.0.3")
         self.assertEqual(SCHEMA_VERSION, 11)
 
     def test_text_paged_service_pause_stops_admission_and_preserves_cursor(self):

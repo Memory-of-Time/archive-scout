@@ -228,14 +228,23 @@ def latest_scan_run(database: sqlite3.Connection, keyword_set_id: int | None = N
     return int(row["id"]) if row else None
 
 
-def list_scan_runs(database: sqlite3.Connection) -> list[sqlite3.Row]:
-    return database.execute(
-        """
+def count_scan_runs(database: sqlite3.Connection) -> int:
+    return int(database.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0])
+
+
+def list_scan_runs(
+    database: sqlite3.Connection, *, limit: int | None = None, offset: int = 0
+) -> list[sqlite3.Row]:
+    sql = """
         SELECT sr.*,ks.name AS keyword_set_name
         FROM scan_runs sr JOIN keyword_sets ks ON ks.id=sr.keyword_set_id
         ORDER BY sr.id DESC
-        """
-    ).fetchall()
+    """
+    params: list[object] = []
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit)), max(0, int(offset))])
+    return database.execute(sql, params).fetchall()
 
 
 def rename_scan_run(database: sqlite3.Connection, scan_run_id: int, name: str) -> None:
@@ -576,8 +585,27 @@ def ignore_errors(database: sqlite3.Connection, error_ids: list[int], ignored: b
         )
 
 
-def list_error_categories(database: sqlite3.Connection, unresolved_only: bool = True) -> list[str]:
-    where = "WHERE resolved=0 AND ignored=0" if unresolved_only else ""
+def _error_status_clause(status: str) -> tuple[str, list[object]]:
+    value = str(status or "open").strip().casefold()
+    if value == "open":
+        return "e.resolved=0 AND e.ignored=0", []
+    if value == "resolved":
+        return "e.resolved=1", []
+    if value == "ignored":
+        return "e.ignored=1", []
+    if value in {"all", "all history", "history"}:
+        return "", []
+    raise ValueError(f"unsupported error status filter: {status}")
+
+
+def list_error_categories(
+    database: sqlite3.Connection, unresolved_only: bool = True, *, status: str | None = None
+) -> list[str]:
+    if status is None:
+        where = "WHERE resolved=0 AND ignored=0" if unresolved_only else ""
+    else:
+        clause, _ = _error_status_clause(status)
+        where = ("WHERE " + clause.replace("e.", "")) if clause else ""
     return [
         str(row[0])
         for row in database.execute(
@@ -586,17 +614,31 @@ def list_error_categories(database: sqlite3.Connection, unresolved_only: bool = 
     ]
 
 
+def count_errors(
+    database: sqlite3.Connection, *, category: str = "", status: str = "open"
+) -> int:
+    clause, params = _error_status_clause(status)
+    clauses = [clause] if clause else []
+    if category:
+        clauses.append("e.category=?")
+        params.append(category)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    return int(database.execute(f"SELECT COUNT(*) FROM errors e {where}", params).fetchone()[0])
+
+
 def list_errors(
     database: sqlite3.Connection,
     unresolved_only: bool = True,
     category: str = "",
     limit: int = 2000,
     offset: int = 0,
+    *,
+    status: str | None = None,
 ) -> list[sqlite3.Row]:
-    clauses: list[str] = []
-    params: list[object] = []
-    if unresolved_only:
-        clauses.extend(["e.resolved=0", "e.ignored=0"])
+    if status is None:
+        status = "open" if unresolved_only else "all"
+    clause, params = _error_status_clause(status)
+    clauses: list[str] = [clause] if clause else []
     if category:
         clauses.append("e.category=?")
         params.append(category)
@@ -1088,11 +1130,52 @@ def record_site_issue(
     return int(row[0])
 
 
-def list_site_issues(database: sqlite3.Connection, unresolved_only: bool = True, limit: int = 1000) -> list[sqlite3.Row]:
-    where = "WHERE resolved=0" if unresolved_only else ""
+def count_site_issues(
+    database: sqlite3.Connection, *, category: str = "", status: str = "open"
+) -> int:
+    clauses: list[str] = []
+    params: list[object] = []
+    value = str(status or "open").casefold()
+    if value == "open":
+        clauses.append("resolved=0")
+    elif value == "resolved":
+        clauses.append("resolved=1")
+    elif value == "ignored":
+        return 0  # grouped site issues have no ignored state
+    elif value not in {"all", "all history", "history"}:
+        raise ValueError(f"unsupported site-issue status filter: {status}")
+    if category:
+        clauses.append("category=?")
+        params.append(category)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    return int(database.execute(f"SELECT COUNT(*) FROM site_issues {where}", params).fetchone()[0])
+
+
+def list_site_issues(
+    database: sqlite3.Connection, unresolved_only: bool = True, limit: int = 1000,
+    offset: int = 0, *, category: str = "", status: str | None = None,
+) -> list[sqlite3.Row]:
+    if status is None:
+        status = "open" if unresolved_only else "all"
+    clauses: list[str] = []
+    params: list[object] = []
+    value = str(status or "open").casefold()
+    if value == "open":
+        clauses.append("resolved=0")
+    elif value == "resolved":
+        clauses.append("resolved=1")
+    elif value == "ignored":
+        return []
+    elif value not in {"all", "all history", "history"}:
+        raise ValueError(f"unsupported site-issue status filter: {status}")
+    if category:
+        clauses.append("category=?")
+        params.append(category)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    params.extend([max(1, int(limit)), max(0, int(offset))])
     return database.execute(
-        f"SELECT * FROM site_issues {where} ORDER BY last_seen DESC,id DESC LIMIT ?",
-        (max(1, int(limit)),),
+        f"SELECT * FROM site_issues {where} ORDER BY last_seen DESC,id DESC LIMIT ? OFFSET ?",
+        params,
     ).fetchall()
 
 

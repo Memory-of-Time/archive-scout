@@ -425,6 +425,7 @@ class ProjectConfig:
     scan_workers: int = 0
     download_scope: str = "all_text"
     text_retention: str = "keep"
+    download_external_redirects: bool = False
     text_collapse_scope: str = "range"
     search_media_descriptors: bool = False
     discard_spool_mb: float = 512.0
@@ -556,6 +557,7 @@ class ProjectConfig:
             scan_workers=min(32, max(0, int(self.scan_workers))),
             download_scope=self.download_scope if self.download_scope in {"all_text", "keyword_urls", "index_only"} else "all_text",
             text_retention=retention,
+            download_external_redirects=bool(self.download_external_redirects),
             text_collapse_scope=collapse_scope,
             search_media_descriptors=bool(self.search_media_descriptors),
             discard_spool_mb=max(32.0, float(self.discard_spool_mb)),
@@ -752,7 +754,11 @@ def load_project_config(path: Path) -> ProjectConfig:
         loaded_workers = 10
         loaded_download_delay = WAYBACK_REPLAY_MIN_INTERVAL
     return ProjectConfig(
-        output_dir=Path(payload.get("output_dir") or path.parent),
+        # The manifest selected by the user defines the project root.  Saved
+        # absolute output_dir values are retained only as historical metadata;
+        # preferring them here made copied/moved project.json files silently
+        # reopen and write into the old project folder.
+        output_dir=path.parent,
         targets=list(payload.get("targets") or []),
         keywords=list(payload.get("keywords") or []),
         keyword_set_name=str(payload.get("keyword_set_name") or "Current keywords"),
@@ -769,6 +775,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         scan_workers=int(payload.get("scan_workers", 0)),
         download_scope=str(payload.get("download_scope", "all_text")),
         text_retention=str(payload.get("text_retention", "keep")),
+        download_external_redirects=bool(payload.get("download_external_redirects", False)),
         text_collapse_scope=loaded_text_collapse_scope,
         search_media_descriptors=bool(payload.get("search_media_descriptors", False)),
         discard_spool_mb=float(payload.get("discard_spool_mb", 512.0)),

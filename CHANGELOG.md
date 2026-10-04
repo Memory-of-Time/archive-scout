@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3 — Recovery correctness, project identity, and network integrity
+
+- Tagged GUI operations, asynchronous views, row maps, and mutations with canonical project identity so stale data from one project cannot alter another.
+- Preserved failed operation/scan lineage through Resume, including download-only recovery without keywords and acquisition-only error retry.
+- Added header-first 429/503 handling, typed transport/storage diagnostics, coordinated replay/media outage pauses, backend cooldown enforcement, and release of inactive-client pacing floors.
+- Added the **Download external redirect destinations** policy, blocked live replay escapes, and protected partial Range downloads from cross-representation redirects.
+- Separated deterministic snippets from editable Notes and added bounded, read-only, paginated/copyable detail views across Errors, Results, AI relevance, Research Intelligence, and Scan history.
+- Made Dashboard auto refresh honor the selected interval during active work, use consistent bounded read snapshots, and report query failures as unavailable instead of zero.
+- Made moved project manifests resolve to the folder selected by the user.
+- Keeps project schema 11 and preserves existing v1.0.2 acquisition/scanning semantics outside the audited fixes.
+
 ## 1.0.2 — Interface outlines and per-target correctness
 
 - Added explicit cross-platform outlines for multiline text-entry areas and labeled Media input groups.

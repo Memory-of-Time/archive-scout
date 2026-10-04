@@ -16,15 +16,15 @@ from ..database.repositories import (
     blocked_site_reasons, get_or_create_target, record_error, record_site_issue,
     save_media_success, upsert_capture,
 )
-from ..downloads.downloader import replay_url
+from ..downloads.downloader import make_replay_redirect_validator, replay_url
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_REPLAY_RATE_KEY, shared_host_gate)
 from ..downloads.validation import classify_exception
 from ..content import classify_replay_content, decode_bytes
-from ..events import ProgressEvent, Stopped
+from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..storage import url_filename, media_path as storage_media_path, sha256_file
 from ..classification import classify_payload_prefix
-from ..network.transports import PreviewRejected
+from ..network.transports import PreviewRejected, is_local_storage_error
 from ..resource_detection import payload_media_format
 from ..utils import utc_now
 from .indexer import media_query_signature, media_signature_is_date_bound
@@ -134,12 +134,13 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient) -> 
             response = client.download_to_path(
                 media_replay_url(row), temp, config.media.max_file_bytes,
                 preview_validator=preview_validator,
+                redirect_validator=make_replay_redirect_validator(config, str(row["original_url"])),
             )
         except TypeError as exc:
             # Preserve compatibility with lightweight adapters/test doubles that
             # predate the bounded-prefix hook. Built-in transports use the hook;
             # legacy adapters are still validated before finalization below.
-            if "preview_validator" not in str(exc):
+            if "preview_validator" not in str(exc) and "redirect_validator" not in str(exc):
                 raise
             response = client.download_to_path(
                 media_replay_url(row), temp, config.media.max_file_bytes
@@ -366,6 +367,8 @@ def download_media(
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
+        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
+        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
     complete = errors = 0
     started = time.monotonic()
@@ -461,7 +464,7 @@ def download_media(
                                 promoted = _promote_next_snapshot(database, config, row)
                                 if promoted is not None:
                                     promoted_ids.add(promoted)
-                    except RateLimitDeferred:
+                    except (RateLimitDeferred, ConnectivityPaused):
                         stop_event.set()
                         with database:
                             database.execute(
@@ -478,6 +481,17 @@ def download_media(
                             database.execute("UPDATE media_captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))
                         raise
                     except Exception as exc:
+                        if is_local_storage_error(exc):
+                            # A local disk/filesystem failure is not a reason to
+                            # rotate HTTP backends or consume every media row.
+                            for pending in futures:
+                                pending.cancel()
+                            with database:
+                                database.execute(
+                                    "UPDATE media_captures SET state='pending',updated_at=? WHERE state='downloading' OR id=?",
+                                    (utc_now(), row["id"]),
+                                )
+                            raise
                         errors += 1
                         category, status, retryable = classify_exception(exc)
                         issue_message = site_issue_message(

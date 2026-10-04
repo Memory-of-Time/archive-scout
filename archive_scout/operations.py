@@ -15,7 +15,7 @@ from .config import KeywordSetConfig, ProjectConfig, save_project_config
 from .database.connection import open_database
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
 from .downloads.downloader import download_archive, download_archive_only, recover_pending_discard_cleanup
-from .downloads.retry import retry_error_urls
+from .downloads.retry import retry_error_urls, retry_error_downloads
 from .events import ConnectivityPaused, ProgressEvent, Stopped
 from .media.downloader import download_media, retry_media_errors
 from .media.indexer import index_external_embedded_media, index_media
@@ -35,7 +35,7 @@ from .scanning.rescanner import rescan_keyword_sets
 from .scanning.hitlist import load_hitlist, search_with_hitlist
 
 SUPPORTED_MODES = {
-    "all", "external_media_after_scan", "index", "download_only", "download", "resume", "rescan", "retry_errors", "report", "integrity",
+    "all", "external_media_after_scan", "index", "download_only", "download", "resume", "rescan", "retry_errors", "retry_download_errors", "report", "integrity",
     "repair", "backup", "diagnostics", "import_folder",
     "media_all", "media_index", "media_download", "media_retry",
     "analysis", "research_index", "forum_rebuild", "merge_project", "hitlist", "compact",
@@ -69,9 +69,14 @@ def prepare_scan_jobs(
         if keyword_set_id in seen_keyword_set_ids:
             continue
         seen_keyword_set_ids.add(keyword_set_id)
-        compatible_sources = (mode,) if mode not in {"resume", "download", "all"} else ("all", "download", "resume")
+        compatible_sources = (mode,) if mode not in {"resume", "download", "all"} else ("all", "external_media_after_scan", "download", "resume", "retry_errors")
         placeholders = ",".join("?" for _ in compatible_sources)
-        statuses = ("interrupted", "complete") if reuse_completed else ("interrupted",)
+        if reuse_completed:
+            statuses = ("interrupted", "failed", "complete")
+        elif mode == "resume":
+            statuses = ("interrupted", "failed")
+        else:
+            statuses = ("interrupted",)
         status_placeholders = ",".join("?" for _ in statuses)
         existing = database.execute(
             f"""SELECT id FROM scan_runs WHERE keyword_set_id=? AND status IN ({status_placeholders})
@@ -200,12 +205,17 @@ def run_project(
     if mode == "resume":
         previous = database.execute(
             """SELECT mode,retention_policy,config_json,progress_json FROM operation_runs
-               WHERE status IN ('interrupted','paused') AND mode<>'resume'
+               WHERE status IN ('interrupted','paused','failed') AND mode<>'resume'
                ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         if previous is not None:
             previous_mode = str(previous["mode"] or "")
-            if previous_mode in {"all", "external_media_after_scan", "download_only", "download"}:
+            if previous_mode in {
+                "all", "external_media_after_scan", "download_only", "download", "rescan",
+                "retry_errors", "retry_download_errors", "media_all", "media_index",
+                "media_download", "media_retry", "analysis", "research_index",
+                "forum_rebuild", "hitlist",
+            }:
                 mode = previous_mode
             raw_snapshot = str(previous["config_json"] or "").strip()
             if raw_snapshot:
@@ -305,7 +315,7 @@ def run_project(
     try:
         save_project_config(config)
         network_modes = {
-            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_errors",
+            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_errors", "retry_download_errors",
             "media_all", "media_index", "media_download", "media_retry", "analysis",
         }
         eligible_at = float(saved_rate_pause_detail.get("eligible_at_epoch") or 0.0)
@@ -475,6 +485,18 @@ def run_project(
             finish_operation_run(database, operation_run_id, "complete", "Download-only acquisition complete")
             database.commit()
             return paths
+        if mode == "retry_download_errors":
+            stats = retry_error_downloads(config, database, stop_event, callback)
+            paths = {"project": config.output_dir / "project.json"}
+            emit(callback, ProgressEvent(
+                "download_retry",
+                f"Acquisition-only retry complete: {int(stats['downloaded']):,} saved; "
+                f"{int(stats['skipped']):,} skipped; {int(stats['errors']):,} errors.",
+                int(stats["queued"]), int(stats["queued"]),
+            ))
+            finish_operation_run(database, operation_run_id, "complete", "Acquisition-only retry complete")
+            database.commit()
+            return paths
         if mode == "index":
             index_archive(config, database, stop_event, callback)
             paths = generate_index_reports(config, database)
@@ -538,13 +560,17 @@ def run_project(
             ).fetchone()[0])
             resume_media_only = unfinished_text == 0 and latest_scan_run(database) is not None
 
+        scan_incomplete = False
         if not resume_media_only:
-            jobs = prepare_scan_jobs(database, config, mode)
+            job_mode = "resume" if requested_mode == "resume" else mode
+            jobs = prepare_scan_jobs(database, config, job_mode)
             primary_run_id = jobs[0].scan_run_id
             if mode in {"all", "external_media_after_scan"}:
-                download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
+                scan_stats = download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
+                scan_incomplete = bool(scan_stats and int(scan_stats.get("scan_errors", 0)))
             elif mode in {"download", "resume"}:
-                download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
+                scan_stats = download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
+                scan_incomplete = bool(scan_stats and int(scan_stats.get("scan_errors", 0)))
             elif mode == "rescan":
                 rescan_keyword_sets(database, jobs, stop_event, callback, workers=(config.scan_workers or None), report_config=config.report)
             elif mode == "retry_errors":
@@ -601,7 +627,7 @@ def run_project(
                 raise RuntimeError("text/media routing did not converge after four bounded recovery cycles")
 
         if jobs:
-            finish_jobs(database, jobs, "complete")
+            finish_jobs(database, jobs, "interrupted" if scan_incomplete else "complete")
             database.commit()
             paths = generate_job_reports(config, database, jobs)
         else:
@@ -626,7 +652,17 @@ def run_project(
                 research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 paths["research_index"] = research_report
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-        finish_operation_run(database, operation_run_id, "complete", "Operation complete")
+        if scan_incomplete:
+            finish_operation_run(
+                database, operation_run_id, "interrupted",
+                "Acquisition completed, but one or more scan items remain retryable; Resume continues the same scan lineage.",
+            )
+            emit(callback, ProgressEvent(
+                "scan",
+                "Acquisition completed, but scan coverage is incomplete. Progress and existing matches were preserved; use Resume to retry the remaining scan items.",
+            ))
+        else:
+            finish_operation_run(database, operation_run_id, "complete", "Operation complete")
         database.commit()
         return paths
     except ConnectivityPaused as exc:

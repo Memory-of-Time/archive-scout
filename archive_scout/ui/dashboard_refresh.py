@@ -32,15 +32,22 @@ class DashboardRefreshController:
         return self.generation
 
     def automatic_due(self, now: float, *, visible: bool, operation_active: bool) -> bool:
-        if self.mode != "auto" or not visible or operation_active or self.inflight:
+        # Active acquisition does not disable the user's selected recount
+        # interval.  The read itself is bounded/query-only and coalesced.
+        if self.mode != "auto" or not visible or self.inflight:
             return False
         return self.last_started is None or now - self.last_started >= self.interval_seconds
 
     def begin(self, now: float, *, manual: bool = False) -> int | None:
         if self.inflight:
             return None
-        if not manual and self.mode != "auto":
-            return None
+        if not manual:
+            if self.mode != "auto":
+                return None
+            # Route navigation, timer ticks, project-load and completion through
+            # the same interval gate so tab changes cannot bypass scheduling.
+            if self.last_started is not None and float(now) - self.last_started < self.interval_seconds:
+                return None
         self.inflight = True
         self.last_started = float(now)
         return self.generation

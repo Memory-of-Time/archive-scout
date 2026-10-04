@@ -9,7 +9,7 @@ from ..config import ProjectConfig
 from ..events import ProgressEvent
 from ..scanning.jobs import ScanJob
 from ..scanning.rescanner import rescan_documents, rescan_keyword_sets
-from .downloader import download_archive
+from .downloader import download_archive, download_archive_only
 
 
 def retry_error_urls(
@@ -20,7 +20,8 @@ def retry_error_urls(
     callback: Callable[[ProgressEvent], None] | None,
     scan_jobs: list[ScanJob] | None = None,
 ) -> None:
-    clauses = ["e.resolved=0", "e.ignored=0", "e.retryable=1", "e.capture_id IS NOT NULL"]
+    retry_clause = "(e.retryable=1 OR e.category='external_redirect_blocked')" if config.download_external_redirects else "e.retryable=1"
+    clauses = ["e.resolved=0", "e.ignored=0", retry_clause, "e.capture_id IS NOT NULL"]
     params: list[object] = []
     if config.retry_error_categories:
         clauses.append("e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")")
@@ -74,3 +75,55 @@ def retry_error_urls(
                 config, database, scan_run_id, stop_event, callback,
                 states=("error", "pending", "downloaded"), capture_ids=download_capture_ids, scan_jobs=jobs,
             )
+
+
+def retry_error_downloads(
+    config: ProjectConfig,
+    database: sqlite3.Connection,
+    stop_event: threading.Event,
+    callback: Callable[[ProgressEvent], None] | None,
+) -> dict[str, int | float]:
+    """Retry only retryable capture acquisition failures, without scanning.
+
+    This preserves a download-only project's contract: no keyword set, document,
+    match, report-enrichment, or Research Intelligence work is introduced just
+    because a replay GET previously failed.
+    """
+    retry_clause = "(e.retryable=1 OR e.category='external_redirect_blocked')" if config.download_external_redirects else "e.retryable=1"
+    clauses = ["e.resolved=0", "e.ignored=0", retry_clause, "e.capture_id IS NOT NULL"]
+    params: list[object] = []
+    if config.retry_error_categories:
+        clauses.append("e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")")
+        params.extend(config.retry_error_categories)
+    if config.retry_capture_ids:
+        ids = [int(value) for value in config.retry_capture_ids]
+        clauses.append("e.capture_id IN (" + ",".join("?" for _ in ids) + ")")
+        params.extend(ids)
+    rows = database.execute(
+        "SELECT DISTINCT e.capture_id FROM errors e WHERE " + " AND ".join(clauses) + " ORDER BY e.capture_id",
+        params,
+    ).fetchall()
+    capture_ids = [int(row[0]) for row in rows]
+    if callback:
+        callback(ProgressEvent("download_retry", f"Retrying {len(capture_ids):,} retryable text acquisition error(s) without scanning."))
+    if not capture_ids:
+        return {"queued": 0, "downloaded": 0, "skipped": 0, "errors": 0, "elapsed": 0.0}
+    # Retry selection is explicit.  Restore only these capture rows to pending;
+    # permanent/ignored errors remain untouched and automatic retry loops do not
+    # reinterpret redirect-policy failures.
+    placeholders = ",".join("?" for _ in capture_ids)
+    with database:
+        database.execute(
+            f"UPDATE captures SET state='pending',updated_at=datetime('now') WHERE id IN ({placeholders})",
+            capture_ids,
+        )
+    acquisition_config = config.normalized()
+    if acquisition_config.text_retention == "discard_after_scan":
+        # Acquisition-only retry has no scan completion that could authorize a
+        # payload deletion.  Preserve the successfully recovered file.
+        from dataclasses import replace
+        acquisition_config = replace(acquisition_config, text_retention="keep").normalized()
+    return download_archive_only(
+        acquisition_config, database, stop_event, callback,
+        states=("pending", "error"), capture_ids=capture_ids,
+    )

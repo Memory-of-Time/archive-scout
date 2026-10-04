@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 SCHEMA_VERSION = 11
 
 # Shared September 2026 Wayback operating profile. These values describe
@@ -54,6 +54,7 @@ OPERATION_MODES = {
     "Resume interrupted work": "resume",
     "Rescan existing downloads with selected keyword sets": "rescan",
     "Retry only errored URLs": "retry_errors",
+    "Retry only errored downloads (no scanning)": "retry_download_errors",
     "Regenerate reports only": "report",
     "Check project integrity": "integrity",
     "Repair project and rebuild indexes": "repair",
