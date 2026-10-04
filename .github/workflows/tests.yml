@@ -22,11 +22,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-22.04
-          - windows-2022
-          - macos-15-intel
-          - macos-15
+        # GitHub's hosted macOS ARM64 pool can have long capacity queues.
+        # Keep ARM64 coverage available for manual workflow_dispatch runs,
+        # while routine push/PR CI uses the consistently available Intel runner.
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-22.04","windows-2022","macos-15-intel","macos-15"]' || '["ubuntu-22.04","windows-2022","macos-15-intel"]') }}
         python-version:
           - "3.11"
           - "3.12"
@@ -59,7 +58,7 @@ jobs:
         run: >-
           python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.0.2';
+          assert importlib.metadata.version('archive-scout') == '1.0.3';
           print('Archive Scout native accelerator imports and metadata checks passed')"
 
       - name: Run tests
