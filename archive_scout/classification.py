@@ -97,6 +97,79 @@ def _extension_class(ext: str) -> str | None:
     return None
 
 
+
+def capture_routing_decision(
+    resource_class: str | None,
+    state: str | None,
+    skip_reason: str | None = None,
+    payload_availability: str | None = None,
+) -> str:
+    """Return one stable, user-facing routing/disposition label for a capture.
+
+    Resource class describes what Archive Scout believes the archived response is;
+    routing describes what the text/media pipeline actually did with that capture.
+    Keep these dimensions separate so dashboards/reports never infer coverage from
+    a single ``state`` value.
+    """
+    kind = str(resource_class or "unknown").strip().casefold() or "unknown"
+    state_value = str(state or "pending").strip().casefold() or "pending"
+    reason = str(skip_reason or "").strip().casefold()
+    availability = str(payload_availability or "not_acquired").strip().casefold()
+
+    if state_value == "error":
+        return "failed"
+    if state_value == "downloading":
+        return "downloading"
+    if state_value == "scanning":
+        return "scanning"
+    if availability == "partial":
+        return "partial"
+    if availability == "discarded":
+        return "scanned_discarded"
+    if state_value in {"downloaded", "downloaded_unscanned"} or availability in {
+        "retained", "retained_unscanned", "spooled_unscanned", "cleanup_pending",
+    }:
+        return "downloaded" if state_value == "downloaded" else "downloaded_awaiting_scan"
+    if reason in {"classified_media", "payload_validation_deferred"}:
+        return "deferred_to_media"
+    if reason == "classified_media_descriptor":
+        return "media_descriptor_excluded"
+    if reason in {"known_non_text", "sniffed_non_text", "unsupported_binary"}:
+        return "skipped_non_text"
+    if reason == "url_keyword_filter":
+        return "skipped_url_filter"
+    if state_value == "skipped":
+        return "skipped_other"
+    if kind in {"image", "video", "audio", "media_descriptor", "other_binary"} and state_value == "pending":
+        return "classified_not_routed"
+    if kind == "unknown":
+        return "awaiting_classification" if state_value == "pending" else state_value
+    return state_value
+
+
+def capture_body_coverage(
+    resource_class: str | None,
+    state: str | None,
+    payload_availability: str | None,
+) -> str:
+    """Describe whether the capture body is actually available for local searching."""
+    kind = str(resource_class or "unknown").strip().casefold() or "unknown"
+    state_value = str(state or "pending").strip().casefold() or "pending"
+    availability = str(payload_availability or "not_acquired").strip().casefold()
+    if kind in {"image", "video", "audio", "media_descriptor", "other_binary"}:
+        return "non_text"
+    if availability == "discarded":
+        return "discarded"
+    if availability == "partial":
+        return "partial"
+    if availability in {"retained", "retained_unscanned", "spooled_unscanned", "cleanup_pending"}:
+        return "body_available"
+    if state_value in {"downloaded", "downloaded_unscanned", "scanning"}:
+        return "body_available"
+    if state_value == "error":
+        return "unavailable_failed"
+    return "url_only"
+
 def classify_indexed_resource(url: str, mimetype: str | None) -> ResourceDecision:
     """Classify CDX metadata without pretending metadata can prove payload bytes.
 

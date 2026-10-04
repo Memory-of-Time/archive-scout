@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..database.connection import DATABASE_NAME
+from ..constants import SCHEMA_VERSION
 from ..utils import utc_now
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
 
 def create_project_backup(root: Path, reason: str = "manual", keep: int = 5, max_mb: float = 1024.0) -> Path:
@@ -102,7 +103,13 @@ def restore_project_backup(root: Path, backup_path: Path) -> Path:
     if target.exists():
         safety = root / "backups" / f"archive_scout_{_timestamp()}_before_restore.sqlite3"
         safety.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target, safety)
+        source_db = sqlite3.connect(target)
+        safety_db = sqlite3.connect(safety)
+        try:
+            source_db.backup(safety_db)
+        finally:
+            safety_db.close()
+            source_db.close()
     temp = target.with_suffix(".restore.tmp")
     _materialize_backup(backup_path, temp)
     check = sqlite3.connect(temp)
@@ -110,6 +117,12 @@ def restore_project_backup(root: Path, backup_path: Path) -> Path:
         result = check.execute("PRAGMA integrity_check").fetchone()
         if not result or str(result[0]).lower() != "ok":
             raise RuntimeError(f"backup failed SQLite integrity check: {result}")
+        schema = check.execute("SELECT version FROM schema_info LIMIT 1").fetchone()
+        if not schema:
+            raise RuntimeError("backup does not contain Archive Scout schema metadata")
+        version = int(schema[0])
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(f"backup schema {version} is newer than supported schema {SCHEMA_VERSION}")
     finally:
         check.close()
     temp.replace(target)

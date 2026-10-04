@@ -70,7 +70,7 @@ class NetworkTuningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "project.json"
             path.write_text(json.dumps({
-                "version": "1.0.3",
+                "version": "1.0.4",
                 "output_dir": temp,
                 "targets": ["example.com/*"],
                 "keywords": [],
@@ -87,7 +87,7 @@ class NetworkTuningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "project.json"
             path.write_text(json.dumps({
-                "version": "1.0.3",
+                "version": "1.0.4",
                 "output_dir": temp,
                 "targets": ["example.com/*"],
                 "keywords": [],

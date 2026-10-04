@@ -135,7 +135,7 @@ def make_replay_redirect_validator(config: ProjectConfig, source_original: str):
     The callback runs before the transport contacts each redirect destination.
     External is defined by the embedded original host, not by the common
     web.archive.org replay host. Live destinations are never silently attached
-    to historical evidence in v1.0.3.
+    to historical evidence in v1.0.4.
     """
     normalized = config.normalized()
     scopes = _target_host_scope(normalized)

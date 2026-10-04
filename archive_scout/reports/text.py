@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from ..config import ProjectConfig
+from ..classification import capture_body_coverage, capture_routing_decision
 from ..downloads.downloader import replay_url
 from ..utils import atomic_write_lines, atomic_write_text, json_value, utc_now
 
@@ -117,13 +118,25 @@ def _indexed_url_lines(database: sqlite3.Connection, fields: list[str]) -> Itera
     if not fields:
         return
     for row in database.execute(
-        "SELECT timestamp,mimetype,state,original_url FROM captures ORDER BY original_url,timestamp"
+        """SELECT timestamp,mimetype,resource_class,classification_reason,state,skip_reason,
+                  payload_availability,original_url
+           FROM captures ORDER BY original_url,timestamp"""
     ):
         yield _tab_line(
             {
                 "timestamp": row["timestamp"],
                 "mime_type": row["mimetype"] or "",
+                "resource_class": row["resource_class"] or "unknown",
+                "classification_reason": row["classification_reason"] or "",
+                "routing_decision": capture_routing_decision(
+                    row["resource_class"], row["state"], row["skip_reason"], row["payload_availability"]
+                ),
+                "body_coverage": capture_body_coverage(
+                    row["resource_class"], row["state"], row["payload_availability"]
+                ),
                 "state": row["state"],
+                "payload_availability": row["payload_availability"] or "",
+                "skip_reason": row["skip_reason"] or "",
                 "original_url": row["original_url"],
             },
             fields,
@@ -217,7 +230,8 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) 
             "operation": "Operation: Index URLs only",
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
-            "indexed_captures": f"Indexed captures: {capture_count:,}",
+            "indexed_captures": f"Indexed captures: {capture_count:,} (URL inventory; bodies searched are reported separately)",
+            "bodies_searched": "Bodies searched: 0 (index-only operation; no replay bodies were checked)",
             "unresolved_errors": f"Unresolved errors: {error_count:,}",
             "site_issues": f"Open site-specific issues: {issue_count:,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
@@ -471,7 +485,8 @@ def generate_reports(
             "scan_completed": f"Scan completed: {run['completed_at'] or '(not marked complete)'}",
             "targets": f"Targets: {', '.join(config.targets) or '(project database only)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
-            "indexed_captures": f"Indexed captures: {capture_count:,}",
+            "indexed_captures": f"Indexed captures: {capture_count:,} (URL inventory; bodies searched are reported separately)",
+            "bodies_searched": f"Bodies searched by this scan: {int(run['document_count'] or 0):,}",
             "ranked_matches": f"Ranked matches at score >= {config.minimum_score}: {match_count:,}",
             "unresolved_errors": f"Unresolved errors: {unresolved_count:,}",
             "site_issues": f"Open site-specific issues: {site_issue_count:,}",

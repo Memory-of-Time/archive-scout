@@ -19,6 +19,8 @@ from .scoring import analyze_content, prepare_analysis_fields
 
 
 def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob], report_config=None) -> dict[str, object]:
+    if str(row.get("payload_availability") or "") == "discarded":
+        return {"kind": "discarded", "row": row}
     path = Path(str(row["path"]))
     if not path.exists():
         return {"kind": "missing", "row": row, "path": path}
@@ -91,20 +93,48 @@ def _document_rows(
     params: list[object],
     batch_size: int = 1000,
 ) -> Iterator[dict[str, object]]:
+    """Stream both processed documents and retained download-only captures."""
     last_id = 0
     while True:
         page_clauses = [*clauses, "d.id>?"]
         batch = database.execute(
             """
-            SELECT d.*,c.original_url,c.mimetype,c.detected_encoding,c.id AS capture_id FROM documents d
-            JOIN captures c ON c.id=d.capture_id
+            SELECT d.*,c.original_url,c.mimetype,c.detected_encoding,c.id AS capture_id,
+                   c.payload_availability,c.local_path AS capture_local_path
+            FROM documents d JOIN captures c ON c.id=d.capture_id
             WHERE """ + " AND ".join(page_clauses) + " ORDER BY d.id LIMIT ?",
             [*params, last_id, max(1, int(batch_size))],
         ).fetchall()
         if not batch:
-            return
+            break
         for row in batch:
             last_id = int(row["id"])
+            yield dict(row)
+
+    # Download-only deliberately has no document rows. The capture manifest is
+    # still a complete local-text inventory, so make those saved bodies eligible
+    # for the first local scan without any Wayback request.
+    if clauses:
+        return
+    last_capture_id = 0
+    while True:
+        batch = database.execute(
+            """SELECT c.id AS capture_id,c.original_url,c.mimetype,c.detected_encoding,c.local_path AS path,
+                      c.payload_availability,'' AS title,'' AS body_text,NULL AS body_zlib,'[]' AS links_json,
+                      COALESCE(c.content_hash,'') AS content_hash,'' AS normalized_hash,0 AS size_bytes,
+                      0 AS id
+               FROM captures c
+               WHERE c.id>? AND c.document_id IS NULL
+                 AND c.resource_class IN ('text','unknown')
+                 AND c.payload_availability IN ('retained','retained_unscanned','spooled_unscanned','cleanup_pending')
+                 AND COALESCE(c.local_path,'')<>''
+               ORDER BY c.id LIMIT ?""",
+            (last_capture_id, max(1, int(batch_size))),
+        ).fetchall()
+        if not batch:
+            return
+        for row in batch:
+            last_capture_id = int(row["capture_id"])
             yield dict(row)
 
 
@@ -136,10 +166,16 @@ def rescan_keyword_sets(
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     total = int(
         database.execute(
-            "SELECT COUNT(*) FROM documents d JOIN captures c ON c.id=d.capture_id" + where,
-            params,
+            "SELECT COUNT(*) FROM documents d JOIN captures c ON c.id=d.capture_id" + where, params,
         ).fetchone()[0]
     )
+    if not document_ids:
+        total += int(database.execute(
+            """SELECT COUNT(*) FROM captures c WHERE c.document_id IS NULL
+               AND c.resource_class IN ('text','unknown')
+               AND c.payload_availability IN ('retained','retained_unscanned','spooled_unscanned','cleanup_pending')
+               AND COALESCE(c.local_path,'')<>''"""
+        ).fetchone()[0])
     if not total:
         if callback:
             callback(ProgressEvent("rescan", "No saved documents to rescan.", 0, 0))
@@ -186,9 +222,13 @@ def rescan_keyword_sets(
                     row = result["row"]
                     assert isinstance(row, dict)
                     capture_id = int(row["capture_id"])
-                    document_id = int(row["id"])
+                    document_id = int(row.get("id") or 0)
                     kind = str(result["kind"])
-                    if kind == "missing":
+                    if kind == "discarded":
+                        # Explicitly unavailable by retention policy; this is
+                        # coverage information, not a retryable acquisition error.
+                        pass
+                    elif kind == "missing":
                         path = Path(result["path"])
                         record_error(
                             database,
@@ -196,11 +236,12 @@ def rescan_keyword_sets(
                             "missing_local_file",
                             f"saved file is missing: {path}",
                             capture_id=capture_id,
-                            document_id=document_id,
+                            document_id=(document_id or None),
                             retryable=True,
                         )
                         database.execute(
-                            "UPDATE captures SET state='error' WHERE id=?", (capture_id,)
+                            """UPDATE captures SET state='pending',payload_availability='not_acquired',
+                                      local_path=NULL WHERE id=?""", (capture_id,)
                         )
                     elif kind == "error":
                         record_error(
@@ -213,7 +254,7 @@ def rescan_keyword_sets(
                             retryable=True,
                         )
                     else:
-                        if bool(result.get("document_changed")):
+                        if document_id == 0 or bool(result.get("document_changed")):
                             saved_document_id = upsert_document(
                                 database,
                                 capture_id,
@@ -239,7 +280,7 @@ def rescan_keyword_sets(
             for result in results:
                 completed += 1
                 if callback:
-                    prefix = "Missing local file" if result["kind"] == "missing" else "Rescanned"
+                    prefix = "Unavailable local file" if result["kind"] == "missing" else ("Skipped discarded body" if result["kind"] == "discarded" else "Scanned")
                     callback(
                         ProgressEvent(
                             "rescan",

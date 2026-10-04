@@ -63,7 +63,7 @@ class PrefixClient:
 
 class Audit5ReleaseTests(unittest.TestCase):
     def test_release_identity_and_historical_healthy_cdx_default(self):
-        self.assertEqual(VERSION, "1.0.3")
+        self.assertEqual(VERSION, "1.0.4")
         cfg = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(cfg.cdx_delay, 2.5)
         self.assertEqual(cfg.network.cdx_workers, 10)
@@ -317,6 +317,7 @@ class Audit5ReleaseTests(unittest.TestCase):
             root=Path(temp)
             cfg=ProjectConfig(root,["example.com/*"],["needle"],from_date="2001",to_date="2001",
                 media=MediaConfig(enabled=True,include_images=True,include_extensions=["jpg"]),
+                network=NetworkConfig(persistent_retries=False),
                 research=ResearchConfig(enabled=False,auto_build=False)).normalized()
             fake_job=SimpleNamespace(scan_run_id=1,name="k")
             media=mock.Mock()

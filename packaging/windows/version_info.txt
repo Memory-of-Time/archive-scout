@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Archive Scout contributors'),
           StringStruct('FileDescription', 'Archive Scout public web archive research workspace'),
-          StringStruct('FileVersion', '1.0.3'),
+          StringStruct('FileVersion', '1.0.4'),
           StringStruct('InternalName', 'ArchiveScout'),
           StringStruct('LegalCopyright', 'Copyright (c) Archive Scout contributors'),
           StringStruct('OriginalFilename', 'ArchiveScout.exe'),
           StringStruct('ProductName', 'Archive Scout'),
-          StringStruct('ProductVersion', '1.0.3')
+          StringStruct('ProductVersion', '1.0.4')
         ]
       )
     ]),

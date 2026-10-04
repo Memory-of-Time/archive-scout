@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import replace
 import webbrowser
 import tkinter as tk
 from datetime import datetime
@@ -38,7 +39,7 @@ from ..constants import (
     APP_NAME, DEFAULT_IMAGE_EXTENSIONS, DEFAULT_VIDEO_EXTENSIONS, OPERATION_MODES, REVIEW_STATUSES, SCOPE_LABELS, VERSION,
     WAYBACK_INDEX_MIN_INTERVAL, WAYBACK_REPLAY_MIN_INTERVAL, WAYBACK_RATE_LIMIT_BASE_PAUSE, WAYBACK_RATE_LIMIT_MAX_PAUSE,
 )
-from ..database.connection import open_database, open_database_readonly
+from ..database.connection import live_project_writer_pids, open_database, open_database_readonly
 from ..database.repositories import (
     ai_result_rows,
     count_errors,
@@ -72,7 +73,7 @@ from ..runtime import FrozenBundleError, bundled_resource, ensure_frozen_bundle_
 from ..scanning.full_text import search_documents
 from ..utils import normalize_cdx_date
 from ..projects.backups import list_project_backups, restore_project_backup
-from .dashboard import format_media_policy_summary, format_progress_message, read_dashboard_counts
+from .dashboard import format_media_policy_summary, format_progress_message, read_classification_rows, read_dashboard_counts
 from .dashboard_refresh import DashboardRefreshController
 from .event_queue import CoalescingEventQueue
 from .theme import apply_text_theme, apply_theme, enable_windows_dpi_awareness, review_colors_for
@@ -183,6 +184,7 @@ class ArchiveScoutApp(tk.Tk):
         self.result_sort_column = "score"
         self.result_sort_reverse = True
         self.target_settings: dict[str, dict] = {}
+        self.loaded_project_config: ProjectConfig | None = None
         self.target_override_status_var = tk.StringVar(value="No per-target override on the current line.")
         self.nav_buttons: dict[str, ttk.Button] = {}
         self.page_names: list[str] = []
@@ -329,6 +331,14 @@ class ArchiveScoutApp(tk.Tk):
         self.dashboard_refresh_mode_var = tk.StringVar(value="auto")
         self.dashboard_refresh_seconds_var = tk.StringVar(value="10")
         self.dashboard_last_refresh_var = tk.StringVar(value="Not refreshed yet")
+        self.dashboard_operation_state_var = tk.StringVar(value="No operation inventory yet")
+        self.dashboard_classification_summary_var = tk.StringVar(value="Classification: not refreshed")
+        self.dashboard_coverage_summary_var = tk.StringVar(value="Body coverage: not refreshed")
+        self.dashboard_failure_summary_var = tk.StringVar(value="Failures: not refreshed")
+        self.classification_class_var = tk.StringVar(value="All")
+        self.classification_disposition_var = tk.StringVar(value="All")
+        self.classification_filter_var = tk.StringVar()
+        self.classification_scope_var = tk.StringVar(value="Newest operation inventory; up to 500 captures shown")
         self.text_retention_var = tk.StringVar(value="Keep downloaded text files")
         self.result_page_var = tk.StringVar(value="Page 1")
         self.keyword_set_var = tk.StringVar()
@@ -476,7 +486,7 @@ class ArchiveScoutApp(tk.Tk):
         page = ScrollablePage(self.notebook, padding=16)
         tab = page.body
         tab.columnconfigure((0, 1, 2, 3), weight=1)
-        tab.rowconfigure(4, weight=1)
+        tab.rowconfigure(5, weight=1)
         self.notebook.add(page, text="Dashboard")
         ttk.Label(tab, text="Project dashboard", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(tab, textvariable=self.dashboard_project_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 12))
@@ -525,8 +535,54 @@ class ArchiveScoutApp(tk.Tk):
             justify="left", wraplength=1100,
         ).pack(fill="x", anchor="w", pady=(8, 0))
 
+        accounting = ttk.LabelFrame(tab, text="Account for current operation", padding=10)
+        accounting.grid(row=5, column=0, columnspan=4, sticky="nsew", pady=(14, 0))
+        accounting.columnconfigure(0, weight=1)
+        ttk.Label(accounting, textvariable=self.dashboard_operation_state_var, justify="left", wraplength=1100).grid(row=0, column=0, sticky="ew")
+        ttk.Label(accounting, textvariable=self.dashboard_classification_summary_var, style="Muted.TLabel", justify="left", wraplength=1100).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(accounting, textvariable=self.dashboard_coverage_summary_var, style="Muted.TLabel", justify="left", wraplength=1100).grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        ttk.Label(accounting, textvariable=self.dashboard_failure_summary_var, style="Muted.TLabel", justify="left", wraplength=1100).grid(row=3, column=0, sticky="ew", pady=(2, 6))
+
+        class_controls = ttk.Frame(accounting)
+        class_controls.grid(row=4, column=0, sticky="ew")
+        class_controls.columnconfigure(5, weight=1)
+        ttk.Label(class_controls, text="Class:").grid(row=0, column=0, sticky="w")
+        class_box = ttk.Combobox(class_controls, textvariable=self.classification_class_var, state="readonly", width=18,
+                                 values=("All","text","image","video","audio","media_descriptor","other_binary","unknown"))
+        class_box.grid(row=0, column=1, padx=(4, 10))
+        ttk.Label(class_controls, text="Routing:").grid(row=0, column=2, sticky="w")
+        route_box = ttk.Combobox(class_controls, textvariable=self.classification_disposition_var, state="readonly", width=18,
+                                 values=("All","downloaded","deferred_to_media","skipped","failed","pending"))
+        route_box.grid(row=0, column=3, padx=(4, 10))
+        ttk.Label(class_controls, text="Filter:").grid(row=0, column=4, sticky="w")
+        class_filter = ttk.Entry(class_controls, textvariable=self.classification_filter_var)
+        class_filter.grid(row=0, column=5, sticky="ew", padx=(4, 8))
+        ttk.Button(class_controls, text="Refresh captures", command=self.refresh_classification_view).grid(row=0, column=6)
+        class_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_classification_view())
+        route_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_classification_view())
+        class_filter.bind("<Return>", lambda _e: self.refresh_classification_view())
+
+        class_table = ttk.Frame(accounting)
+        class_table.grid(row=5, column=0, sticky="nsew", pady=(6, 0))
+        class_table.columnconfigure(0, weight=1)
+        class_table.rowconfigure(0, weight=1)
+        class_columns = ("class","routing","coverage","state","reason","skip","timestamp","url")
+        self.classification_tree = ttk.Treeview(class_table, columns=class_columns, show="headings", height=9)
+        headings = {"class":"Class","routing":"Routing","coverage":"Body coverage","state":"State","reason":"Evidence","skip":"Skip/exclusion","timestamp":"Timestamp","url":"Original URL"}
+        widths = {"class":115,"routing":145,"coverage":125,"state":115,"reason":230,"skip":170,"timestamp":125,"url":430}
+        for name in class_columns:
+            self.classification_tree.heading(name, text=headings[name])
+            self.classification_tree.column(name, width=widths[name], anchor="w", stretch=name in {"reason","skip","url"})
+        self.classification_tree.grid(row=0, column=0, sticky="nsew")
+        class_y = ttk.Scrollbar(class_table, orient="vertical", command=self.classification_tree.yview)
+        class_y.grid(row=0, column=1, sticky="ns")
+        class_x = ttk.Scrollbar(class_table, orient="horizontal", command=self.classification_tree.xview)
+        class_x.grid(row=1, column=0, sticky="ew")
+        self.classification_tree.configure(yscrollcommand=class_y.set, xscrollcommand=class_x.set)
+        ttk.Label(accounting, textvariable=self.classification_scope_var, style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=(4, 0))
+
         actions = ttk.LabelFrame(tab, text="Project maintenance", padding=12)
-        actions.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(14, 0), padx=(0, 6))
+        actions.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(14, 0), padx=(0, 6))
         refresh_controls = ttk.Frame(actions)
         refresh_controls.pack(fill="x", pady=(0, 6))
         ttk.Label(refresh_controls, text="Dashboard refresh:").grid(row=0, column=0, sticky="w")
@@ -553,7 +609,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(actions, text="Compact project storage", command=lambda: self.start(self.build_config(require_keywords=False), "compact")).pack(fill="x", pady=3)
         ttk.Button(actions, text="Export diagnostics", command=lambda: self.start(self.build_config(require_keywords=False), "diagnostics")).pack(fill="x", pady=3)
         quick = ttk.LabelFrame(tab, text="Quick start", padding=12)
-        quick.grid(row=5, column=2, columnspan=2, sticky="nsew", pady=(14, 0), padx=(6, 0))
+        quick.grid(row=6, column=2, columnspan=2, sticky="nsew", pady=(14, 0), padx=(6, 0))
         quick_text = (
             "1. Add one or more sites.\n"
             "2. Choose or import keyword sets.\n"
@@ -812,14 +868,115 @@ class ArchiveScoutApp(tk.Tk):
         self.dashboard_media_excluded_var.set(display_count("media_excluded"))
         self.dashboard_media_errors_var.set(display_count("media_errors"))
         self.dashboard_media_deferred_var.set(display_count("media_deferred_from_text"))
+        total = counts.get("operation_total")
+        if total is None:
+            self.dashboard_operation_state_var.set("Operation reconciliation unavailable for this refresh.")
+        else:
+            parts = [
+                ("pending", counts.get("operation_pending")),
+                ("downloading", counts.get("operation_downloading")),
+                ("saved awaiting scan", counts.get("operation_saved_unscanned")),
+                ("scanning", counts.get("operation_scanning")),
+                ("scanned", counts.get("operation_scanned")),
+                ("skipped", counts.get("operation_skipped")),
+                ("failed", counts.get("operation_failed")),
+                ("other state", counts.get("operation_unclassified_state")),
+            ]
+            accounted = sum(int(value or 0) for _label, value in parts)
+            detail = " • ".join(f"{label} {int(value or 0):,}" for label, value in parts)
+            op_id = int(counts.get("operation_id") or 0)
+            op_status = str(counts.get("operation_status") or "")
+            self.dashboard_operation_state_var.set(
+                f"Operation {op_id or 'project'} ({op_status or 'inventory'}): {int(total):,} capture URLs • accounted {accounted:,}/{int(total):,} • {detail}"
+            )
+        self.dashboard_classification_summary_var.set(
+            "Resource classes — " + " • ".join((
+                f"text {int(counts.get('operation_class_text') or 0):,}",
+                f"images {int(counts.get('operation_class_image') or 0):,}",
+                f"videos {int(counts.get('operation_class_video') or 0):,}",
+                f"audio {int(counts.get('operation_class_audio') or 0):,}",
+                f"media descriptors {int(counts.get('operation_class_media_descriptor') or 0):,}",
+                f"other binary {int(counts.get('operation_class_other_binary') or 0):,}",
+                f"unknown {int(counts.get('operation_class_unknown') or 0):,}",
+            ))
+        )
+        self.dashboard_coverage_summary_var.set(
+            "Routing/body coverage — " + " • ".join((
+                f"downloaded/routed {int(counts.get('operation_downloaded') or 0):,}",
+                f"deferred to media {int(counts.get('operation_deferred_media') or 0):,}",
+                f"skipped non-text {int(counts.get('operation_skipped_non_text') or 0):,}",
+                f"skipped URL filter {int(counts.get('operation_skipped_url_filter') or 0):,}",
+                f"other skipped {int(counts.get('operation_skipped_other') or 0):,}",
+                f"bodies available {int(counts.get('operation_body_available') or 0):,}",
+                f"URL-only {int(counts.get('operation_body_url_only') or 0):,}",
+                f"discarded {int(counts.get('operation_body_discarded') or 0):,}",
+                f"partial {int(counts.get('operation_body_partial') or 0):,}",
+                f"non-text {int(counts.get('operation_body_non_text') or 0):,}",
+                f"latest scan bodies checked {int(counts.get('latest_scan_documents') or 0):,}",
+            ))
+        )
+        self.dashboard_failure_summary_var.set(
+            f"Failures — unique text captures {int(counts.get('failed_captures') or 0):,} • open error records {int(counts.get('errors') or 0):,} • media errors {int(counts.get('media_errors') or 0):,} • recovered incidents {int(counts.get('recovery_events') or 0):,}"
+        )
         if counts.get("_exact", True):
             label = "Exact counts refreshed "
         else:
             label = "Refresh incomplete (query deadline; unavailable values shown as —) "
         self.dashboard_last_refresh_var.set(label + datetime.now().strftime("%H:%M:%S"))
 
+    def refresh_classification_view(self) -> None:
+        if not hasattr(self, "classification_tree"):
+            return
+        root = Path(self.output_var.get()).expanduser()
+        identity = self.project_identity()
+        resource_class = self.classification_class_var.get()
+        disposition = self.classification_disposition_var.get()
+        text_filter = self.classification_filter_var.get()
+        self.classification_scope_var.set("Refreshing newest operation inventory…")
+
+        def worker() -> None:
+            try:
+                rows = read_classification_rows(
+                    root / "archive_scout.sqlite3", resource_class=resource_class,
+                    disposition=disposition, text_filter=text_filter, limit=500,
+                )
+                self.events.put(("classification_rows", (identity, rows, "")))
+            except Exception as exc:
+                self.events.put(("classification_rows", (identity, [], str(exc))))
+
+        threading.Thread(target=worker, name="archive-classification-read", daemon=True).start()
+
+    def _apply_classification_rows(self, payload) -> None:
+        identity, rows, error = payload
+        if identity != self.project_identity() or not hasattr(self, "classification_tree"):
+            return
+        self.classification_tree.delete(*self.classification_tree.get_children())
+        if error:
+            self.classification_scope_var.set(f"Classification view unavailable: {error}")
+            return
+        for row in rows:
+            self.classification_tree.insert("", "end", values=(
+                row.get("resource_class") or "unknown",
+                row.get("routing_decision") or "",
+                row.get("body_coverage") or "",
+                row.get("state") or "",
+                row.get("classification_reason") or "",
+                row.get("skip_reason") or "",
+                row.get("timestamp") or "",
+                row.get("original_url") or "",
+            ))
+        suffix = " (first 500)" if len(rows) >= 500 else ""
+        self.classification_scope_var.set(f"Newest operation inventory: {len(rows):,} matching capture(s){suffix}. URLs and body coverage are shown separately.")
+
     def restore_backup_ui(self) -> None:
         root = Path(self.output_var.get()).expanduser()
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showinfo(APP_NAME, "Pause the active operation and wait for it to stop before restoring a database backup.")
+            return
+        owners = live_project_writer_pids(root)
+        if owners:
+            messagebox.showinfo(APP_NAME, "This project still has an active writer. Close or pause that operation before restoring the database.")
+            return
         backups = list_project_backups(root)
         selected = filedialog.askopenfilename(
             title="Restore Archive Scout database backup",
@@ -828,7 +985,7 @@ class ArchiveScoutApp(tk.Tk):
         )
         if not selected:
             return
-        if not messagebox.askyesno(APP_NAME, "Restore this database backup? A safety copy of the current database will be created first."):
+        if not messagebox.askyesno(APP_NAME, "Restore this database-state backup? Capture/media payload files are not included. A WAL-consistent safety snapshot of the current database will be created first."):
             return
         try:
             safety = restore_project_backup(root, Path(selected))
@@ -1290,85 +1447,93 @@ class ArchiveScoutApp(tk.Tk):
     def create_settings_tab(self) -> None:
         page = ScrollablePage(self.notebook, padding=14)
         tab = page.body
+        tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
-        tab.columnconfigure(3, weight=1)
         self.notebook.add(page, text="Settings")
 
-        ttk.Label(tab, text="Performance", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        performance = [
+        performance = ttk.LabelFrame(tab, text="Performance and acquisition", padding=10)
+        performance.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        performance.columnconfigure(1, weight=1)
+        perf_rows = [
             ("Download workers (10 = fast default)", self.workers_var),
             ("Scanner workers (0 = automatic)", self.scan_workers_var),
-            ("Maximum text-page size (MB)", self.max_file_var),
+            ("Maximum text-page budget (MB)", self.max_file_var),
             ("Index/CDX spacing (2.5 sec = 24/min shared ceiling)", self.cdx_delay_var),
             ("Replay spacing (0.125 sec = 8/sec shared ceiling)", self.download_delay_var),
-            ("429/503 minimum shared cooldown (seconds)", self.rate_limit_base_var),
-            ("429/503 maximum adaptive cooldown (seconds)", self.rate_limit_max_var),
         ]
-        for row, (label, variable) in enumerate(performance, start=1):
-            ttk.Label(tab, text=label + ":").grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Entry(tab, textvariable=variable, width=18).grid(row=row, column=1, sticky="w", padx=(10, 24), pady=4)
-        scope_row = len(performance) + 1
-        ttk.Label(tab, text="Download scope:").grid(row=scope_row, column=0, sticky="w", pady=4)
-        ttk.Combobox(tab, textvariable=self.scope_var, values=list(SCOPE_LABELS), state="readonly", width=38).grid(row=scope_row, column=1, sticky="w", padx=(10, 24), pady=4)
+        for row, (label, variable) in enumerate(perf_rows):
+            ttk.Label(performance, text=label + ":", wraplength=360).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(performance, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        row = len(perf_rows)
+        ttk.Label(performance, text="Download scope:").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Combobox(performance, textvariable=self.scope_var, values=list(SCOPE_LABELS), state="readonly").grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(
+            performance,
+            text="The text-page value is the normal budget for unknown-length responses; known CDX lengths may receive bounded headroom. Download-only intentionally acquires the eligible text inventory regardless of URL-keyword shortcut settings.",
+            style="Muted.TLabel", wraplength=520, justify="left",
+        ).grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        ttk.Label(tab, text="Network recovery", style="Section.TLabel").grid(row=0, column=2, columnspan=2, sticky="w", pady=(0, 6))
+        connection = ttk.LabelFrame(tab, text="Connection and indexing", padding=10)
+        connection.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
+        connection.columnconfigure(1, weight=1)
         network_rows = [
             ("Connection backend", self.network_backend_var, ("auto", "httpx", "urllib3", "curl")),
             ("CDX endpoint", self.network_endpoint_var, ("auto", "cdx", "timemap")),
-            ("Index strategy (auto = fast parallel)", self.network_strategy_var, ("auto", "paged", "resume")),
+            ("Index strategy (auto = resume-first adaptive)", self.network_strategy_var, ("auto", "paged", "resume")),
         ]
-        for row, (label, variable, values) in enumerate(network_rows, start=1):
-            ttk.Label(tab, text=label + ":").grid(row=row, column=2, sticky="w", pady=4)
-            ttk.Combobox(tab, textvariable=variable, values=values, state="readonly", width=18).grid(row=row, column=3, sticky="w", padx=(10, 0), pady=4)
-        numeric = [
-            ("Parallel CDX requests", self.network_cdx_workers_var),
-            ("Page blocks (custom paged mode only)", self.network_page_blocks_var),
-            ("Retry base (seconds)", self.network_retry_base_var),
-            ("Retry ceiling (seconds)", self.network_retry_max_var),
-            ("Failures before graceful pause", self.network_failure_limit_var),
-        ]
-        for offset, (label, variable) in enumerate(numeric, start=4):
-            ttk.Label(tab, text=label + ":").grid(row=offset, column=2, sticky="w", pady=4)
-            ttk.Entry(tab, textvariable=variable, width=18).grid(row=offset, column=3, sticky="w", padx=(10, 0), pady=4)
-        ttk.Checkbutton(tab, text="Honor system proxy and certificate environment", variable=self.network_trust_env_var).grid(row=9, column=2, columnspan=2, sticky="w", pady=4)
-        ttk.Checkbutton(tab, text="Keep retrying recoverable windows during this run", variable=self.network_persistent_var).grid(row=10, column=2, columnspan=2, sticky="w", pady=4)
-        ttk.Checkbutton(
-            tab, text="Download external redirect destinations",
-            variable=self.download_external_redirects_var,
-        ).grid(row=11, column=2, columnspan=2, sticky="w", pady=4)
-        ttk.Label(
-            tab,
-            text="External redirect destinations applies only to archived replay redirects whose original host is outside this project's allowed targets. Live-web redirects remain blocked so live content is never silently stored as historical evidence.",
-            wraplength=520, style="Muted.TLabel",
-        ).grid(row=12, column=2, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(
-            tab,
-            text="Auto uses persistent pooled connections and independent fallback stacks. Broad CDX targets use resumable queues and bounded retrieval. Repeated common failures are paused instead of consuming the whole inventory.",
-            wraplength=520,
-            style="Muted.TLabel",
-        ).grid(row=13, column=2, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(
-            tab,
-            text="Rate policy: every actual redirect/backend attempt consumes the shared pool. Index/CDX defaults to 24 starts/minute; replay defaults to 8 starts/second. Server Retry-After is never shortened, and a headerless 429/503 pauses at least 60 seconds.",
-            wraplength=980, style="Muted.TLabel",
-        ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        for row, (label, variable, values) in enumerate(network_rows):
+            ttk.Label(connection, text=label + ":", wraplength=300).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Combobox(connection, textvariable=variable, values=values, state="readonly").grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        for row, (label, variable) in enumerate((("Parallel CDX requests", self.network_cdx_workers_var), ("Page blocks (custom paged mode only)", self.network_page_blocks_var)), start=3):
+            ttk.Label(connection, text=label + ":", wraplength=300).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(connection, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Checkbutton(connection, text="Honor system proxy and certificate environment", variable=self.network_trust_env_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(connection, text="Auto keeps the resumable queue authoritative and only switches to bounded paging when the target proves dense.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        separator = ttk.Separator(tab, orient="horizontal")
-        separator.grid(row=13, column=0, columnspan=4, sticky="ew", pady=14)
-        ttk.Label(tab, text="Interface and project safety", style="Section.TLabel").grid(row=14, column=0, columnspan=4, sticky="w")
-        ttk.Label(tab, text="Font scale:").grid(row=15, column=0, sticky="w", pady=4)
-        font_entry = ttk.Entry(tab, textvariable=self.font_scale_var, width=18)
-        font_entry.grid(row=15, column=1, sticky="w", padx=(10, 24), pady=4)
-        ttk.Button(tab, text="Apply scale", command=self.apply_interface_theme).grid(row=15, column=1, sticky="e", padx=(0, 24))
-        ttk.Checkbutton(tab, text="Create automatic safety backups", variable=self.auto_backup_var).grid(row=16, column=0, columnspan=2, sticky="w", pady=4)
-        ttk.Label(tab, text="Backups to keep:").grid(row=17, column=0, sticky="w", pady=4)
-        ttk.Entry(tab, textvariable=self.backup_keep_var, width=18).grid(row=17, column=1, sticky="w", padx=(10, 24), pady=4)
-        ttk.Label(tab, text="Backup disk budget (MB):").grid(row=18, column=0, sticky="w", pady=4)
-        ttk.Entry(tab, textvariable=self.backup_max_var, width=18).grid(row=18, column=1, sticky="w", padx=(10, 24), pady=4)
-        ttk.Label(tab, text="Import existing archive folder:").grid(row=15, column=2, sticky="w", pady=4)
-        ttk.Entry(tab, textvariable=self.import_source_var).grid(row=15, column=3, sticky="ew", padx=(10, 0), pady=4)
-        ttk.Button(tab, text="Browse…", command=self.choose_import_source).grid(row=15, column=3, sticky="w", padx=(10, 0))
-        ttk.Label(tab, text="Choose ‘Import an existing archive folder’ from Operation after selecting a source.", style="Muted.TLabel", wraplength=460).grid(row=16, column=2, columnspan=2, sticky="w")
+        recovery = ttk.LabelFrame(tab, text="Automatic archive recovery", padding=10)
+        recovery.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=8)
+        recovery.columnconfigure(1, weight=1)
+        recovery_rows = [
+            ("Per-capture retry base (seconds)", self.network_retry_base_var),
+            ("Per-capture retry ceiling (seconds)", self.network_retry_max_var),
+            ("Failures before shared automatic recovery", self.network_failure_limit_var),
+            ("429/503 minimum host cooldown (seconds)", self.rate_limit_base_var),
+            ("429/503 maximum adaptive cooldown (seconds)", self.rate_limit_max_var),
+        ]
+        for row, (label, variable) in enumerate(recovery_rows):
+            ttk.Label(recovery, text=label + ":", wraplength=340).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(recovery, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
+        ttk.Label(recovery, text="Recommended and enabled by default. A recovery-cycle threshold pauses archive admissions and schedules another shared probe; it does not end the operation. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        redirect = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
+        redirect.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)
+        ttk.Checkbutton(redirect, text="Download external archived redirect destinations", variable=self.download_external_redirects_var).pack(anchor="w")
+        ttk.Label(redirect, text="This applies only to archived replay redirects whose original host is outside the configured targets. Live-web redirects remain blocked. This is separate from Media → Allow external hosts, which controls discovered embedded media.", style="Muted.TLabel", wraplength=520, justify="left").pack(fill="x", anchor="w", pady=(6, 0))
+
+        appearance = ttk.LabelFrame(tab, text="Appearance", padding=10)
+        appearance.grid(row=2, column=0, sticky="nsew", padx=(0, 6), pady=8)
+        appearance.columnconfigure(1, weight=1)
+        ttk.Label(appearance, text="Font scale:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(appearance, textvariable=self.font_scale_var, width=18).grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(appearance, text="Apply scale", command=self.apply_interface_theme).grid(row=0, column=2)
+
+        storage = ttk.LabelFrame(tab, text="Storage and database backups", padding=10)
+        storage.grid(row=2, column=1, sticky="nsew", padx=(6, 0), pady=8)
+        storage.columnconfigure(1, weight=1)
+        ttk.Checkbutton(storage, text="Create automatic safety backups", variable=self.auto_backup_var).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(storage, text="Backups to keep:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(storage, textvariable=self.backup_keep_var, width=18).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(storage, text="Backup disk budget (MB):").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(storage, textvariable=self.backup_max_var, width=18).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(storage, text="Database backups preserve project state, not capture/media payloads. Copy the whole project folder for a complete independent backup.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        importer = ttk.LabelFrame(tab, text="Import local archive", padding=10)
+        importer.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        importer.columnconfigure(0, weight=1)
+        ttk.Entry(importer, textvariable=self.import_source_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(importer, text="Browse…", command=self.choose_import_source).grid(row=0, column=1)
+        ttk.Label(importer, text="Choose ‘Import an existing archive folder’ from Operation after selecting a source. Imported files are ingested into project storage so local search remains portable.", style="Muted.TLabel", wraplength=1050, justify="left").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
     def choose_hitlist_file(self) -> None:
         selected = filedialog.askopenfilename(title="Choose hitlist", filetypes=[("Text files", "*.txt"), ("All files", "*")])
@@ -1915,6 +2080,12 @@ class ArchiveScoutApp(tk.Tk):
                 snapshot_strategy=self.media_strategy_var.get(),
                 max_file_mb=float(self.media_max_var.get()),
                 preserve_paths=False,
+                cdx_collapses=(
+                    list(self.loaded_project_config.media.normalized().cdx_collapses)
+                    if self.loaded_project_config is not None
+                    and Path(self.loaded_project_config.output_dir).expanduser() == Path(self.output_var.get()).expanduser()
+                    else []
+                ),
             )
             analysis = AnalysisConfig(
                 forum_profile=self.forum_profile_var.get(),
@@ -1929,31 +2100,26 @@ class ArchiveScoutApp(tk.Tk):
                 build_provenance=self.analysis_provenance_var.get(),
                 merge_source=self.analysis_merge_source_var.get(),
             )
-            ai = AIConfig(
-                provider=self.ai_provider_var.get(),
-                model=self.ai_model_var.get(),
-                candidate_limit=int(self.ai_candidate_limit_var.get()),
-                batch_size=int(self.ai_batch_size_var.get()),
-                minimum_relevance=int(self.ai_min_relevance_var.get()),
-                excerpt_chars=int(self.ai_excerpt_chars_var.get()),
+            loaded = self.loaded_project_config if self.loaded_project_config is not None else None
+            same_project = bool(loaded and Path(loaded.output_dir).expanduser() == Path(self.output_var.get()).expanduser())
+            ai_base = loaded.ai.normalized() if same_project else AIConfig().normalized()
+            ai = replace(
+                ai_base, provider=self.ai_provider_var.get(), model=self.ai_model_var.get(),
+                candidate_limit=int(self.ai_candidate_limit_var.get()), batch_size=int(self.ai_batch_size_var.get()),
+                minimum_relevance=int(self.ai_min_relevance_var.get()), excerpt_chars=int(self.ai_excerpt_chars_var.get()),
             )
-            research = ResearchConfig(
-                enabled=True,
-                auto_build=self.research_auto_var.get(),
-                vector_backend=self.research_backend_var.get(),
-                result_limit=int(self.research_limit_var.get()),
+            research_base = loaded.research.normalized() if same_project else ResearchConfig().normalized()
+            research = replace(
+                research_base, enabled=True, auto_build=self.research_auto_var.get(),
+                vector_backend=self.research_backend_var.get(), result_limit=int(self.research_limit_var.get()),
             )
-            network = NetworkConfig(
-                backend=self.network_backend_var.get(),
-                trust_environment=self.network_trust_env_var.get(),
-                endpoint_mode=self.network_endpoint_var.get(),
-                index_strategy=self.network_strategy_var.get(),
-                page_blocks=int(self.network_page_blocks_var.get()),
-                cdx_workers=int(self.network_cdx_workers_var.get()),
-                persistent_retries=self.network_persistent_var.get(),
-                retry_base_seconds=float(self.network_retry_base_var.get()),
-                retry_max_seconds=float(self.network_retry_max_var.get()),
-                failure_pause_threshold=int(self.network_failure_limit_var.get()),
+            network_base = loaded.network.normalized() if same_project else NetworkConfig().normalized()
+            network = replace(
+                network_base, backend=self.network_backend_var.get(), trust_environment=self.network_trust_env_var.get(),
+                endpoint_mode=self.network_endpoint_var.get(), index_strategy=self.network_strategy_var.get(),
+                page_blocks=int(self.network_page_blocks_var.get()), cdx_workers=int(self.network_cdx_workers_var.get()),
+                persistent_retries=self.network_persistent_var.get(), retry_base_seconds=float(self.network_retry_base_var.get()),
+                retry_max_seconds=float(self.network_retry_max_var.get()), failure_pause_threshold=int(self.network_failure_limit_var.get()),
             )
             from_date = normalize_cdx_date(self.from_date_var.get(), end=False)
             to_date = normalize_cdx_date(self.to_date_var.get(), end=True)
@@ -2015,6 +2181,23 @@ class ArchiveScoutApp(tk.Tk):
                 import_source=self.import_source_var.get(),
                 download_external_redirects=self.download_external_redirects_var.get(),
             ).normalized()
+            if same_project and loaded is not None:
+                config = replace(
+                    config,
+                    text_collapse_scope=loaded.text_collapse_scope,
+                    search_media_descriptors=loaded.search_media_descriptors,
+                    discard_spool_mb=loaded.discard_spool_mb,
+                    retries=loaded.retries,
+                    rate_limit_attempts=loaded.rate_limit_attempts,
+                    connect_timeout=loaded.connect_timeout,
+                    read_timeout=loaded.read_timeout,
+                    max_attempts=loaded.max_attempts,
+                    user_agent=loaded.user_agent,
+                    retry_error_categories=list(loaded.retry_error_categories),
+                    retry_capture_ids=list(loaded.retry_capture_ids),
+                    retry_media_capture_ids=list(loaded.retry_media_capture_ids),
+                    compact_storage=loaded.compact_storage,
+                ).normalized()
         except (ValueError, KeyError) as exc:
             raise ValueError(f"Check the numeric settings, keyword rules, and target lines: {exc}") from exc
         mode = selected_mode
@@ -2176,6 +2359,8 @@ class ArchiveScoutApp(tk.Tk):
                 processed += 1
                 if kind == "dashboard":
                     self._apply_dashboard_result(payload)
+                elif kind == "classification_rows":
+                    self._apply_classification_rows(payload)
                 elif kind == "ui_query":
                     if len(payload) == 6:
                         key, generation, identity, apply_result, result, error = payload
@@ -3419,6 +3604,8 @@ class ArchiveScoutApp(tk.Tk):
             messagebox.showerror(APP_NAME, f"Could not load project:\n{exc}")
 
     def apply_config(self, config: ProjectConfig) -> None:
+        config = config.normalized()
+        self.loaded_project_config = config
         self.output_var.set(str(config.output_dir))
         self.replace_text(self.targets_text, config.targets)
         self.keyword_sets = [item.to_payload() for item in config.normalized_keyword_sets()]

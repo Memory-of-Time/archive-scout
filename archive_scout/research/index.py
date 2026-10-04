@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -38,6 +39,18 @@ class ResearchIndexSummary:
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
     if callback:
         callback(event)
+
+
+def _research_config_fingerprint(research) -> str:
+    payload = {
+        "backend": research.vector_backend,
+        "dimensions": int(research.vector_dimensions),
+        "excerpt_chars": int(research.excerpt_chars),
+        "entity_extraction": bool(research.entity_extraction),
+        "duplicate_clustering": bool(research.duplicate_clustering),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def _document_text(row: sqlite3.Row, excerpt_chars: int) -> str:
@@ -227,6 +240,8 @@ def build_research_index(
 
     processed = 0
     pending_writes = 0
+    config_fingerprint = _research_config_fingerprint(research)
+    desired_backend_tag = f"{research.vector_backend}|cfg:{config_fingerprint}"
     rows = database.execute(
         """
         SELECT d.*,c.original_url,c.timestamp,
@@ -246,15 +261,14 @@ def build_research_index(
         content_hash = str(row["content_hash"] or "")
         existing_backend = str(row["research_backend"] or "")
         desired_backend = research.vector_backend
-        backend_matches = (
-            (desired_backend == "local-hash" and existing_backend.startswith("local-hash"))
-            or (desired_backend == "fastembed" and existing_backend.startswith("fastembed"))
-        )
-        if str(row["research_content_hash"] or "") == content_hash and backend_matches:
+        backend_matches = existing_backend.endswith(f"|cfg:{config_fingerprint}")
+        dimensions_match = int(row["research_dimensions"] or 0) == int(research.vector_dimensions)
+        if str(row["research_content_hash"] or "") == content_hash and backend_matches and dimensions_match:
             summary.unchanged += 1
         else:
             text = _document_text(row, research.excerpt_chars)
             backend_name, vector = encode_text(text, research.vector_backend, research.vector_dimensions)
+            backend_name = f"{backend_name}|cfg:{config_fingerprint}"
             try:
                 links = list(json.loads(str(row["links_json"] or "[]")))
             except Exception:
@@ -280,6 +294,8 @@ def build_research_index(
                     str(row["title"] or ""), document_body(row), str(row["original_url"] or ""), links
                 )
                 summary.entities += _replace_entities(database, document_id, entities)
+            else:
+                database.execute("DELETE FROM research_document_entities WHERE document_id=?", (document_id,))
             summary.indexed += 1
             pending_writes += 1
             if pending_writes >= 128:

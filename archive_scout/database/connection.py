@@ -79,6 +79,24 @@ def _pid_is_alive(pid: int | None) -> bool:
     return True
 
 
+
+def live_project_writer_pids(root: Path) -> list[int]:
+    """Return live foreign/current operation owners without mutating project state."""
+    path = Path(root).expanduser().resolve() / DATABASE_NAME
+    if not path.exists():
+        return []
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute(
+            "SELECT DISTINCT process_id FROM operation_runs WHERE status IN ('running','waiting_archive') AND process_id IS NOT NULL"
+        ).fetchall()
+        return sorted({int(row[0]) for row in rows if _pid_is_alive(int(row[0]))})
+    except sqlite3.DatabaseError:
+        return []
+    finally:
+        db.close()
+
 def database_version(path: Path) -> int | None:
     if not path.exists():
         return None

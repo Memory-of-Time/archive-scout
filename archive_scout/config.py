@@ -33,7 +33,11 @@ REPORT_FIELD_NAMES: dict[str, tuple[str, ...]] = {
     "wayback_urls": ("wayback_url",),
     "interesting_links": ("source_url", "link"),
     "keyword_counts": ("count", "keyword"),
-    "all_indexed_urls": ("timestamp", "mime_type", "state", "original_url"),
+    "all_indexed_urls": (
+        "timestamp", "mime_type", "resource_class", "classification_reason",
+        "routing_decision", "body_coverage", "state", "payload_availability",
+        "skip_reason", "original_url",
+    ),
     "errors": (
         "last_seen", "operation", "category", "attempts", "retryable",
         "http_status", "timestamp", "source", "message",
@@ -44,7 +48,7 @@ REPORT_FIELD_NAMES: dict[str, tuple[str, ...]] = {
     "summary": (
         "heading", "generated", "output_directory", "operation", "scan_run",
         "keyword_set", "keyword_rules", "source_operation", "scan_started",
-        "scan_completed", "targets", "date_range", "indexed_captures",
+        "scan_completed", "targets", "date_range", "indexed_captures", "bodies_searched",
         "ranked_matches", "unresolved_errors", "site_issues", "states",
     ),
     "media_indexed": ("timestamp", "media_kind", "extension", "state", "original_url"),

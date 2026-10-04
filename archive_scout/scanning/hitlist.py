@@ -50,13 +50,29 @@ def _count_matches(automaton: LiteralAutomaton, text: str) -> dict[str, int]:
 def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> tuple[int, int, int]:
     fingerprint = hitlist_fingerprint(keywords)
     row = database.execute(
-        """SELECT id,last_capture_id,match_count FROM quick_search_runs
+        """SELECT id,last_capture_id,match_count,updated_at FROM quick_search_runs
            WHERE fingerprint=? AND status IN ('running','interrupted') ORDER BY id DESC LIMIT 1""",
         (fingerprint,),
     ).fetchone()
     now = utc_now()
     if row:
         run_id = int(row["id"])
+        # A URL checkpoint is not body coverage. If capture availability/content
+        # changed after the last Hitlist checkpoint, revisit the inventory from
+        # the beginning so an earlier URL whose body just arrived is not skipped.
+        corpus_changed = database.execute(
+            "SELECT 1 FROM captures WHERE updated_at>? LIMIT 1",
+            (str(row["updated_at"] or ""),),
+        ).fetchone() is not None
+        if corpus_changed:
+            database.execute("DELETE FROM quick_search_hits WHERE run_id=?", (run_id,))
+            database.execute(
+                """UPDATE quick_search_runs SET status='running',last_capture_id=0,indexed_checked=0,
+                       local_checked=0,unavailable_count=0,discarded_count=0,missing_count=0,
+                       non_text_count=0,incomplete_count=0,match_count=0,updated_at=? WHERE id=?""",
+                (now, run_id),
+            )
+            return run_id, 0, 0
         database.execute(
             "UPDATE quick_search_runs SET status='running',updated_at=? WHERE id=?", (now, run_id)
         )

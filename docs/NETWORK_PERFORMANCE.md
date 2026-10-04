@@ -1,6 +1,6 @@
 # Network performance and Wayback pacing
 
-Archive Scout 1.0.3 uses two shared request-attempt clocks. CDX/Timemap/index traffic starts at a conservative 2.5-second interval (24 attempts/minute) and replay traffic at 0.125 seconds (8 attempts/second). These are attempt ceilings, not throughput promises: redirects, retry attempts, and transport-backend fallbacks each consume admission because they each create network load.
+Archive Scout 1.0.4 uses two shared request-attempt clocks. CDX/Timemap/index traffic starts at a conservative 2.5-second interval (24 attempts/minute) and replay traffic at 0.125 seconds (8 attempts/second). These are attempt ceilings, not throughput promises: redirects, retry attempts, and transport-backend fallbacks each consume admission because they each create network load.
 
 The scheduler uses monotonic time and does not accumulate burst credit after idle periods or cooldowns. Per-target settings can make a target slower, but cannot silently weaken the effective project pool. Multiple workers are therefore useful for hiding response latency, not for multiplying the allowed request-start rate.
 

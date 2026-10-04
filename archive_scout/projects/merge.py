@@ -16,10 +16,28 @@ from ..media.downloader import media_path
 from ..utils import atomic_write_text, utc_now
 
 
-def _fingerprint(path: Path) -> str:
-    stat = path.stat()
-    raw = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "replace")
-    return hashlib.sha256(raw).hexdigest()[:24]
+def _logical_fingerprint(source_root: Path, database: sqlite3.Connection) -> str:
+    """Fingerprint committed project state, including rows currently visible through WAL."""
+    parts = [str(source_root.resolve())]
+    for table in (
+        "captures", "documents", "media_captures", "scan_runs", "document_matches",
+        "reviews", "notes", "extractions",
+    ):
+        if not _table_exists(database, table):
+            parts.append(f"{table}:missing")
+            continue
+        columns = _columns(database, table)
+        count = int(database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if "updated_at" in columns:
+            newest = database.execute(f"SELECT COALESCE(MAX(updated_at),'') FROM {table}").fetchone()[0]
+        elif "created_at" in columns:
+            newest = database.execute(f"SELECT COALESCE(MAX(created_at),'') FROM {table}").fetchone()[0]
+        elif "id" in columns:
+            newest = database.execute(f"SELECT COALESCE(MAX(id),0) FROM {table}").fetchone()[0]
+        else:
+            newest = ""
+        parts.append(f"{table}:{count}:{newest}")
+    return hashlib.sha256("|".join(parts).encode("utf-8", "replace")).hexdigest()[:24]
 
 
 def _source_file(source_root: Path, value: str) -> Path | None:
@@ -99,13 +117,13 @@ def merge_projects(
     source_db_path = source_root / DATABASE_NAME
     if not source_db_path.exists():
         raise FileNotFoundError(f"Archive Scout database not found: {source_db_path}")
-    fingerprint = _fingerprint(source_db_path)
-    existing = database.execute("SELECT summary_json FROM project_merges WHERE source_fingerprint=?", (fingerprint,)).fetchone()
-    if existing:
-        return json.loads(existing["summary_json"] or "{}")
-
     source = sqlite3.connect(f"file:{source_db_path}?mode=ro", uri=True)
     source.row_factory = sqlite3.Row
+    fingerprint = _logical_fingerprint(source_root, source)
+    existing = database.execute("SELECT summary_json FROM project_merges WHERE source_fingerprint=?", (fingerprint,)).fetchone()
+    if existing:
+        source.close()
+        return json.loads(existing["summary_json"] or "{}")
     stop_event = stop_event or threading.Event()
     summary = {"captures": 0, "documents": 0, "media": 0, "scan_runs": 0, "matches": 0, "reviews": 0, "notes": 0, "extractions": 0}
     target_map: dict[int, int] = {}
@@ -127,46 +145,120 @@ def merge_projects(
             for row in source.execute("SELECT * FROM targets ORDER BY id"):
                 target_map[int(row["id"])] = get_or_create_target(database, str(row["pattern"]))
 
+            capture_columns = _columns(source, "captures")
             capture_total = int(source.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
             capture_rows = source.execute("SELECT * FROM captures ORDER BY id")
+            payload_availabilities = {"retained", "retained_unscanned", "spooled_unscanned", "cleanup_pending", "partial"}
             for index, row in enumerate(capture_rows, 1):
                 if stop_event.is_set():
                     raise Stopped
                 target_id = target_map.get(int(row["target_id"])) if row["target_id"] is not None else None
+                state = str(_value(row, capture_columns, "state", "pending") or "pending")
+                source_local = str(_value(row, capture_columns, "local_path", "") or "")
+                availability = str(_value(row, capture_columns, "payload_availability", "") or "")
+                if not availability:
+                    availability = "retained" if source_local and state in {"downloaded", "downloaded_unscanned", "scanning"} else "not_acquired"
+                copied_path = None
+                if source_local and availability != "discarded":
+                    copied_path = _copy_file(_source_file(source_root, source_local), destination_root, "captures", fingerprint)
+                missing_required_payload = availability in payload_availabilities and copied_path is None
+                if availability == "discarded":
+                    destination_local = None
+                elif copied_path is not None:
+                    destination_local = str(copied_path)
+                else:
+                    destination_local = None
+                if missing_required_payload:
+                    state = "pending"
+                    availability = "not_acquired"
+
+                values = (
+                    row["original_url"], row["timestamp"], target_id, row["query_signature"],
+                    str(_value(row, capture_columns, "urlkey", "") or ""),
+                    _value(row, capture_columns, "mimetype"), _value(row, capture_columns, "statuscode"),
+                    _value(row, capture_columns, "digest"), int(_value(row, capture_columns, "length", 0) or 0),
+                    state, _value(row, capture_columns, "skip_reason"),
+                    int(_value(row, capture_columns, "classifier_revision", 0) or 0), destination_local,
+                    _value(row, capture_columns, "content_hash"), _value(row, capture_columns, "detected_encoding"),
+                    0 if missing_required_payload else int(_value(row, capture_columns, "download_attempts", 0) or 0),
+                    _value(row, capture_columns, "http_status"), _value(row, capture_columns, "final_url"),
+                    0 if missing_required_payload else int(_value(row, capture_columns, "bytes_saved", 0) or 0),
+                    _value(row, capture_columns, "created_at", utc_now()), _value(row, capture_columns, "updated_at", utc_now()),
+                    str(_value(row, capture_columns, "resource_class", "unknown") or "unknown"),
+                    _value(row, capture_columns, "classification_reason"),
+                    int(_value(row, capture_columns, "resource_classifier_revision", 0) or 0), availability,
+                    str(_value(row, capture_columns, "payload_origin", "") or ""),
+                    str(_value(row, capture_columns, "payload_retention", "keep") or "keep"),
+                    0 if missing_required_payload else int(_value(row, capture_columns, "cleanup_pending", 0) or 0),
+                    _value(row, capture_columns, "discarded_at"),
+                )
                 database.execute(
                     """
                     INSERT OR IGNORE INTO captures(
-                        original_url,timestamp,target_id,query_signature,mimetype,statuscode,digest,length,state,
-                        download_attempts,http_status,final_url,bytes_saved,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        row["original_url"], row["timestamp"], target_id, row["query_signature"], row["mimetype"],
-                        row["statuscode"], row["digest"], row["length"], row["state"], row["download_attempts"],
-                        row["http_status"], row["final_url"], row["bytes_saved"], row["created_at"], row["updated_at"],
-                    ),
+                        original_url,timestamp,target_id,query_signature,urlkey,mimetype,statuscode,digest,length,state,
+                        skip_reason,classifier_revision,local_path,content_hash,detected_encoding,download_attempts,
+                        http_status,final_url,bytes_saved,created_at,updated_at,resource_class,classification_reason,
+                        resource_classifier_revision,payload_availability,payload_origin,payload_retention,cleanup_pending,discarded_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, values,
                 )
                 merged = database.execute(
-                    "SELECT id FROM captures WHERE original_url=? AND timestamp=? AND query_signature=?",
+                    "SELECT * FROM captures WHERE original_url=? AND timestamp=? AND query_signature=?",
                     (row["original_url"], row["timestamp"], row["query_signature"]),
                 ).fetchone()
-                capture_map[int(row["id"])] = int(merged["id"])
+                merged_id = int(merged["id"])
+                capture_map[int(row["id"])] = merged_id
+
+                # If this source owns a retained payload and the destination copy does not, adopt the copied payload
+                # and its lifecycle/classification metadata without degrading an already-retained destination row.
+                if copied_path is not None and str(merged["payload_availability"] or "") not in payload_availabilities:
+                    database.execute(
+                        """UPDATE captures SET local_path=?,content_hash=?,detected_encoding=?,bytes_saved=?,state=?,
+                           resource_class=?,classification_reason=?,resource_classifier_revision=?,payload_availability=?,
+                           payload_origin=?,payload_retention=?,cleanup_pending=?,discarded_at=?,skip_reason=?,updated_at=?
+                           WHERE id=?""",
+                        (str(copied_path), _value(row, capture_columns, "content_hash"),
+                         _value(row, capture_columns, "detected_encoding"), int(_value(row, capture_columns, "bytes_saved", 0) or 0),
+                         state, str(_value(row, capture_columns, "resource_class", "unknown") or "unknown"),
+                         _value(row, capture_columns, "classification_reason"),
+                         int(_value(row, capture_columns, "resource_classifier_revision", 0) or 0), availability,
+                         str(_value(row, capture_columns, "payload_origin", "") or ""),
+                         str(_value(row, capture_columns, "payload_retention", "keep") or "keep"),
+                         int(_value(row, capture_columns, "cleanup_pending", 0) or 0),
+                         _value(row, capture_columns, "discarded_at"), _value(row, capture_columns, "skip_reason"),
+                         _value(row, capture_columns, "updated_at", utc_now()), merged_id),
+                    )
                 summary["captures"] += 1
                 if index % 1000 == 0:
                     emit(f"Merged {index:,}/{capture_total:,} captures", index, capture_total)
 
+            document_columns = _columns(source, "documents")
             for row in source.execute("SELECT * FROM documents ORDER BY id"):
                 old_capture = int(row["capture_id"])
                 if old_capture not in capture_map:
                     continue
-                source_path = _source_file(source_root, str(row["path"]))
-                destination_path = _copy_file(source_path, destination_root, "captures", fingerprint)
-                if destination_path is None:
-                    destination_path = (
-                        destination_root / "captures" / "merged" / fingerprint / f"recovered_{int(row['id'])}.txt"
-                    )
-                    atomic_write_text(destination_path, _source_body(row))
+                merged_capture = database.execute(
+                    "SELECT local_path,payload_availability FROM captures WHERE id=?", (capture_map[old_capture],)
+                ).fetchone()
+                availability = str(merged_capture["payload_availability"] or "not_acquired")
+                destination_path = Path(str(merged_capture["local_path"])) if merged_capture["local_path"] else None
                 body = _source_body(row)
+                if destination_path is None and availability != "discarded":
+                    raw_path = str(_value(row, document_columns, "path", "") or "")
+                    source_path = _source_file(source_root, raw_path) if raw_path else None
+                    destination_path = _copy_file(source_path, destination_root, "captures", fingerprint)
+                    if destination_path is None and body:
+                        destination_path = destination_root / "captures" / "merged" / fingerprint / f"recovered_{int(row['id'])}.txt"
+                        atomic_write_text(destination_path, body)
+                    if destination_path is not None:
+                        database.execute(
+                            "UPDATE captures SET local_path=?,payload_availability='retained',payload_origin=CASE WHEN payload_origin='' THEN 'merge' ELSE payload_origin END WHERE id=?",
+                            (str(destination_path), capture_map[old_capture]),
+                        )
+                if destination_path is None:
+                    # Preserve document/match/review history without inventing a payload for intentionally discarded
+                    # or genuinely unavailable content. Integrity understands this as an unavailable local body.
+                    destination_path = destination_root / "captures" / "merged" / fingerprint / f"unavailable_{int(row['id'])}.txt"
                 try:
                     links = json.loads(str(row["links_json"] or "[]"))
                     links = [str(value) for value in links] if isinstance(links, list) else []
@@ -176,6 +268,20 @@ def merge_projects(
                     database, capture_map[old_capture], destination_path, str(row["title"] or ""), body, links,
                     str(row["content_hash"] or ""), str(row["normalized_hash"] or ""), int(row["size_bytes"] or 0),
                 )
+                if availability == "discarded":
+                    # upsert_document records the historical document path, but an
+                    # intentional discard must remain explicit in the capture manifest
+                    # and must never gain a fake local payload path.
+                    database.execute(
+                        "UPDATE captures SET local_path=NULL,payload_availability='discarded' WHERE id=?",
+                        (capture_map[old_capture],),
+                    )
+                elif not destination_path.is_file():
+                    database.execute(
+                        """UPDATE captures SET local_path=NULL,state='pending',payload_availability='not_acquired',
+                           bytes_saved=0,cleanup_pending=0 WHERE id=?""",
+                        (capture_map[old_capture],),
+                    )
                 document_map[int(row["id"])] = document_id
                 summary["documents"] += 1
 

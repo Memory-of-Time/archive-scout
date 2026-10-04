@@ -1,16 +1,16 @@
 # Archive Scout
 
-**Archive Scout 1.0.3** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **11**.
+**Archive Scout 1.0.4** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **11**.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.3/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.3/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.3/ArchiveScout-macOS-Universal.zip)
+- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.4/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.4/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.4/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
-## 1.0.3 highlights
+## 1.0.4 highlights
 
 - Canonical project identity now follows GUI operations, asynchronous queries, row maps, and mutations so stale rows or progress from one project cannot write into another.
 - Resume now considers recoverable failed operation snapshots and preserves the original operation contract, including keyword-free download-only recovery and compatible scan lineage.

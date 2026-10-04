@@ -12,12 +12,13 @@ from typing import Callable
 from ..cdx.client import HttpClient, RateLimitDeferred, TransientRequestError
 from ..cdx.parameters import parse_cdx
 from ..config import ProjectConfig
+from ..content import decode_bytes
 from ..constants import CDX_URL
 from ..cdx.parameters import cdx_endpoints
 from ..database.repositories import upsert_media_capture
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_INDEX_RATE_KEY, shared_host_gate)
 from ..document_store import document_body
-from ..events import ProgressEvent, Stopped
+from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..extraction.provenance import trace_provenance
 from ..extraction.regex import parse_extractor_rules, run_extractors
 from ..media.extensions import extension_from_url, media_kind
@@ -36,7 +37,7 @@ def _emit(callback: Callable[[ProgressEvent], None] | None, stage: str, message:
 def _read_source(path_value: str) -> str:
     path = Path(path_value)
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return decode_bytes(path.read_bytes())
     except Exception:
         return ""
 
@@ -44,9 +45,13 @@ def _read_source(path_value: str) -> str:
 def _target_hosts(config: ProjectConfig) -> set[str]:
     hosts: set[str] = set()
     for target in config.targets:
-        host = target.split("/", 1)[0].rstrip("*").strip()
+        raw = str(target or "").strip().rstrip("*")
+        if not raw:
+            continue
+        parsed = urllib.parse.urlsplit(raw if "://" in raw else "https://" + raw.lstrip("/"))
+        host = (parsed.hostname or "").casefold().strip(".")
         if host:
-            hosts.add(host.casefold())
+            hosts.add(host)
     return hosts
 
 
@@ -166,10 +171,18 @@ def _lookup_external_assets(
                         _emit(callback, "asset_search", f"Searched external assets {completed:,}/{total:,}; found {found:,}", completed, total)
                 if results:
                     now = utc_now()
+                    shared_pause: BaseException | None = None
                     with database:
                         for row, captures, error in results:
                             if error is not None:
-                                if isinstance(error, (TransientRequestError, RateLimitDeferred)):
+                                if isinstance(error, (RateLimitDeferred, ConnectivityPaused)):
+                                    database.execute(
+                                        "UPDATE legacy_assets SET archive_status='retry',context=?,updated_at=? WHERE id=?",
+                                        (f"{type(error).__name__}: {error}", now, row["id"]),
+                                    )
+                                    shared_pause = shared_pause or error
+                                    continue
+                                if isinstance(error, TransientRequestError):
                                     database.execute(
                                         "UPDATE legacy_assets SET archive_status='retry',context=?,updated_at=? WHERE id=?",
                                         (f"{type(error).__name__}: {error}", now, row["id"]),
@@ -197,6 +210,10 @@ def _lookup_external_assets(
                                 (media_row["id"] if media_row else None, now, row["id"]),
                             )
                             found += 1
+                    if shared_pause is not None:
+                        # Service-wide recovery belongs to the operation coordinator,
+                        # not one retry row per external asset.
+                        raise shared_pause
     finally:
         client.close()
     return found
@@ -294,6 +311,8 @@ def run_analysis(
     forum_only: bool = False,
 ) -> dict[str, Path]:
     analysis = config.analysis.normalized()
+    if stop_event.is_set():
+        raise Stopped
     started = utc_now()
     cursor = database.execute(
         "INSERT INTO analysis_runs(status,started_at,metadata_json) VALUES('running',?,?)",
@@ -320,6 +339,8 @@ def run_analysis(
     hosts = _target_hosts(config)
     document_count = int(database.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
     try:
+        if stop_event.is_set():
+            raise Stopped
         with database:
             database.execute("DELETE FROM forum_posts")
             database.execute("DELETE FROM forum_threads")
