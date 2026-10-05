@@ -146,10 +146,11 @@ class SelectionTests(unittest.TestCase):
     def test_curl_ignores_proxy_and_incomplete_headers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "headers"
-            path.write_text("HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n")
+            # Preserve wire line endings: Windows text mode would double the CR.
+            path.write_bytes(b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n")
             self.assertIsNone(tr.CurlBackend._origin_headers(path))
-            with path.open("a") as handle:
-                handle.write("\r\n")
+            with path.open("ab") as handle:
+                handle.write(b"\r\n")
             status, headers = tr.CurlBackend._origin_headers(path)
             self.assertEqual((status, headers["retry-after"]), (429, "120"))
 
