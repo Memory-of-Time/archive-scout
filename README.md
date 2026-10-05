@@ -1,16 +1,23 @@
 # Archive Scout
 
-**Archive Scout 1.0.5** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **12**.
+**Archive Scout 1.0.6** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **12**.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-macOS-Universal.zip)
+- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.6/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.6/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.6/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
-## 1.0.5 highlights
+## 1.0.6 highlights
+
+- Pooled connections recover their preference after temporary fallback; isolated body stalls do not disable the entire HTTP stack.
+- All backends preserve useful small replay prefixes for validated resumption. Curl reacts to live throttle and redirect headers before waiting on their bodies.
+- Text-acquisition retry backoff releases worker capacity so fresh captures can proceed. The delayed queue stays bounded and Pause & save retains pending work.
+- Failed external redirect destinations do not trigger a common Wayback connection-outage pause. Local pool/file pressure is distinguished from remote failure.
+
+The following improvements from 1.0.5 remain included:
 
 - Temporary Wayback outages keep the existing replay worker pool, HTTP client and cumulative progress. Expired recovery cycles can resume while respecting Retry-After and admitting one real recovery probe.
 - Validated text downloads can use the existing curl fallback when eligible Python backends fail.
@@ -20,7 +27,7 @@ The repository can also be run from source on Python 3.11+. Tagged releases are 
 - Hitlist resumes preserve unchanged results and revisit bodies that arrived or changed after a checkpoint. Schema **12** adds small coverage records and body revisions; it does not duplicate capture contents.
 - Whole project operations and database restores use a crash-released OS lock. GUI restore runs in the background after existing view reads finish.
 
-The CDX strategies, request-rate settings, text/media byte classifier and deterministic scanning algorithm remain those of the supplied 1.0.4 source. These are targeted recovery, visibility and correctness changes, not a new acquisition or scanner pipeline. See [release notes](docs/RELEASE_1_0_5.md).
+The current CDX strategies, request-rate settings, text/media byte classifier and deterministic scanner are preserved. v1.0.6 improves transport selection, partial-file retention and text retry scheduling. See [release notes](docs/RELEASE_1_0_6.md).
 
 The source still recognizes serialized project identifiers from pre-release development builds so existing project folders can be migrated safely. Those compatibility identifiers are not separate public releases.
 

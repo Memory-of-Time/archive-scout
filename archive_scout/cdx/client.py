@@ -66,6 +66,16 @@ class MalformedCDXResponse(TransientRequestError):
     """A successful CDX response whose body cannot be parsed safely."""
 
 
+class ReplayRetryScheduled(TransientRequestError):
+    """A replay attempt released its worker until its next eligible retry."""
+
+    def __init__(self, reason: str, wait_seconds: float, attempt_number: int) -> None:
+        super().__init__(reason, splittable=False)
+        self.wait_seconds = max(0.0, float(wait_seconds))
+        self.eligible_at = time.monotonic() + self.wait_seconds
+        self.attempt_number = int(attempt_number)
+
+
 class PermanentRequestError(RuntimeError):
     """A deterministic HTTP rejection that should not enter transient retry loops."""
 
@@ -280,6 +290,7 @@ class HttpClient:
             "pacing_wait_seconds",
             "host_gate_wait_seconds",
             "retry_wait_seconds",
+            "scheduled_retry_seconds",
             "rate_limit_wait_seconds",
             "network_seconds",
         ):
@@ -726,7 +737,7 @@ class HttpClient:
             "Accept-Language": "en-US,en;q=0.8",
         }
         ensure_frozen_bundle_available()
-        generic_attempt = 0
+        generic_attempt = max(0, int(getattr(self._permit_local, "replay_attempt", 1)) - 1)
         rate_attempt = 0
         destination = Path(destination)
         range_restarts = 0
@@ -844,7 +855,7 @@ class HttpClient:
                             f"HTTP {status} after {self.retries} attempts: {url}",
                             status=status, splittable=False,
                         )
-                    self.retry_wait(generic_attempt - 1, f"HTTP {status}", parse_retry_after(retry_after_header))
+                    self._replay_retry(generic_attempt, f"HTTP {status}", parse_retry_after(retry_after_header))
                     continue
 
                 return {
@@ -865,6 +876,8 @@ class HttpClient:
                 continue
             except BackendsCoolingDown as exc:
                 self.host_gate.finish_request(permit, recovered=False)
+                if getattr(self._permit_local, "scheduled_replay", False):
+                    raise ReplayRetryScheduled(str(exc), exc.wait_seconds, generic_attempt + 1) from exc
                 self._wait_for_backend_cooldown(exc)
                 continue
             except RedirectPolicyError:
@@ -884,7 +897,6 @@ class HttpClient:
                     self.retry_callback(1, 1, str(exc), 0.0)
                 continue
             except RateLimitDeferred:
-                destination.unlink(missing_ok=True)
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
             except RequestAdmissionRejected:
@@ -913,7 +925,7 @@ class HttpClient:
                             splittable=False,
                         ) from exc
                     reason = "read timeout" if read_timed_out else ("connection timeout" if timed_out else str(exc))
-                    self.retry_wait(generic_attempt - 1, reason)
+                    self._replay_retry(generic_attempt, reason)
                     continue
                 destination.unlink(missing_ok=True)
                 raise
@@ -936,11 +948,34 @@ class HttpClient:
                         splittable=False,
                     ) from exc
                 reason = "read timeout" if read_timed_out else ("connection timeout" if timed_out else str(exc))
-                self.retry_wait(generic_attempt - 1, reason)
+                self._replay_retry(generic_attempt, reason)
             except Exception:
                 destination.unlink(missing_ok=True)
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
+
+    @contextlib.contextmanager
+    def replay_attempt(self, attempt_number: int = 1):
+        """Enable coordinator-owned retry timing for this worker thread only."""
+        self._permit_local.scheduled_replay = True
+        self._permit_local.replay_attempt = max(1, int(attempt_number))
+        try:
+            yield
+        finally:
+            self._permit_local.scheduled_replay = False
+            self._permit_local.replay_attempt = 1
+
+    def _replay_retry(self, failed_attempt: int, reason: str, retry_after: float | None = None) -> None:
+        if not getattr(self._permit_local, "scheduled_replay", False):
+            self.retry_wait(failed_attempt - 1, reason, retry_after)
+            return
+        base = max(float(retry_after or 0), min(120.0, 2 ** (failed_attempt - 1)))
+        wait_seconds = base * random.uniform(1.0, 1.2)
+        self._metric_add("retry_waits")
+        self._metric_add("scheduled_retry_seconds", wait_seconds)
+        if self.retry_callback:
+            self.retry_callback(failed_attempt + 1, self.retries, reason, wait_seconds)
+        raise ReplayRetryScheduled(reason, wait_seconds, failed_attempt + 1)
 
     def get_json(self, url: str, params: list[tuple[str, str]], max_bytes: int = 64 * 1024 * 1024) -> object:
         return self.get_json_any((url,), params, max_bytes=max_bytes)

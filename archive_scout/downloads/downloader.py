@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import heapq
 import hashlib
 import os
 import re
@@ -13,7 +15,7 @@ from collections import deque
 from pathlib import Path
 from typing import Callable, Iterator
 
-from ..cdx.client import HttpClient, RateLimitDeferred
+from ..cdx.client import HttpClient, RateLimitDeferred, ReplayRetryScheduled
 from ..cdx.parameters import adopt_compatible_index_identity, cdx_query_signature, cdx_signature_is_date_bound
 from ..classification import (
     PREVIEW_BUDGET, RESOURCE_CLASSIFIER_REVISION, classify_capture_inventory,
@@ -1247,6 +1249,8 @@ def _acquire_archive(
     inflight_limit = max(config.workers, config.workers * 3)
     stage_limit = max(64, min(512, config.workers * 16))
     ready_downloads: deque[tuple[dict[str, object], Path]] = deque()
+    delayed_retries: list[tuple[float, int, dict[str, object], Path]] = []
+    retry_sequence = 0
     futures: dict[concurrent.futures.Future, dict[str, object]] = {}
     rows_exhausted = False
     submitted = downloaded = skipped = failures = 0
@@ -1390,11 +1394,11 @@ def _acquire_archive(
 
     def stage_candidates() -> None:
         nonlocal rows_exhausted
-        if rows_exhausted or len(ready_downloads) >= stage_limit:
+        if rows_exhausted or len(ready_downloads) + len(delayed_retries) >= stage_limit:
             return
         staged: list[tuple[dict[str, object], Path]] = []
         reserved_paths: set[str] = set()
-        while len(ready_downloads) + len(staged) < stage_limit:
+        while len(ready_downloads) + len(delayed_retries) + len(staged) < stage_limit:
             try:
                 row = next(row_iter)
             except StopIteration:
@@ -1567,6 +1571,7 @@ def _acquire_archive(
             f"responses {completions:,}; transport failures {request_failures:,}; "
             f"saved {downloaded:,} ({downloaded/elapsed:.1f}/s); retries {retries:,}; "
             f"worker waits {worker_wait_seconds:.1f}s; scheduled rate pauses {scheduled_rate_pause:.1f}s; "
+            f"delayed retries {len(delayed_retries):,}; "
             f"skipped {skipped + metadata_skipped + url_skipped:,}; errors {failures:,}; {settled:,}/{total:,}" + discard_detail,
             min(settled, total), total,
             {
@@ -1575,6 +1580,10 @@ def _acquire_archive(
                 "replay_start_rate": starts / elapsed,
                 "http_completions": completions,
                 "network_retries": retries,
+                "delayed_retries": len(delayed_retries),
+                "scheduled_retry_seconds": float(metrics.get("scheduled_retry_seconds", 0.0)),
+                "requested_request_interval": float(getattr(limiter, "delay", config.download_delay)),
+                "effective_request_interval": float(getattr(limiter, "effective_delay", config.download_delay)),
                 "transport_failures": request_failures,
                 "worker_wait_seconds": worker_wait_seconds,
                 "scheduled_rate_pause_seconds": scheduled_rate_pause,
@@ -1598,6 +1607,15 @@ def _acquire_archive(
 
     last_recovery_emit = 0.0
     deferred_error: RateLimitDeferred | ConnectivityPaused | None = None
+
+    def run_attempt(item, path):
+        scope = getattr(type(client), "replay_attempt", None)
+        with (scope(client, int(item.get("retry_attempt", 1))) if callable(scope) else contextlib.nullcontext()):
+            return _download_capture(
+                item, path, config, client, verify_existing_hash=False,
+                compute_hash=False, stop_event=worker_stop,
+            )
+
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=config.workers, thread_name_prefix="archive-acquire"
     )
@@ -1605,6 +1623,11 @@ def _acquire_archive(
         while True:
             if stop_event.is_set():
                 raise Stopped
+
+            now = time.monotonic()
+            while delayed_retries and delayed_retries[0][0] <= now:
+                _due, _sequence, item, path = heapq.heappop(delayed_retries)
+                ready_downloads.append((item, path))
 
             process_discard_scans(0.0)
             schedule_discard_scans()
@@ -1634,6 +1657,13 @@ def _acquire_archive(
             reserved_bytes = sum(discard_reservation(item) for item in futures.values()) if discard_mode else 0
             while slots > 0 and ready_downloads and deferred_error is None:
                 item, path = ready_downloads[0]
+                if int(item.get("retry_attempt", 1)) > 1:
+                    retry_inflight = sum(int(row.get("retry_attempt", 1)) > 1 for row in futures.values())
+                    fresh_index = next((i for i, (row, _path) in enumerate(ready_downloads)
+                                        if int(row.get("retry_attempt", 1)) == 1), None)
+                    if fresh_index is not None and retry_inflight >= max(1, config.workers // 4):
+                        ready_downloads.rotate(-fresh_index)
+                        item, path = ready_downloads[0]
                 reservation = discard_reservation(item)
                 if discard_mode and spool_bytes + reserved_bytes + reservation > spool_high:
                     # Permit one oversize object only when no other temporary
@@ -1642,10 +1672,7 @@ def _acquire_archive(
                         backpressure_active = True
                         break
                 ready_downloads.popleft()
-                futures[pool.submit(
-                    _download_capture, item, path, config, client,
-                    verify_existing_hash=False, compute_hash=False, stop_event=worker_stop,
-                )] = item
+                futures[pool.submit(run_attempt, item, path)] = item
                 reserved_bytes += reservation
                 submitted += 1
                 slots -= 1
@@ -1664,7 +1691,7 @@ def _acquire_archive(
                     acquisition_cancel.clear()
                     deferred_error = None
                     continue
-                if rows_exhausted and not ready_downloads and not waiting_scan and not scan_futures:
+                if rows_exhausted and not ready_downloads and not delayed_retries and not waiting_scan and not scan_futures:
                     flush_results(force=True)
                     break
                 if discard_mode and spool_bytes >= spool_high and not ready_downloads and not waiting_scan and not scan_futures:
@@ -1673,6 +1700,9 @@ def _acquire_archive(
                         "free disk space or resolve cleanup errors, then Resume"
                     )
                 flush_results()
+                emit_progress()
+                stop_event.wait(min(0.05, max(0.0, delayed_retries[0][0] - time.monotonic()))
+                                if delayed_retries else 0.05)
                 continue
 
             done, _ = concurrent.futures.wait(
@@ -1742,6 +1772,12 @@ def _acquire_archive(
                         waiting_scan.append((scan_item, size, discard_eligible))
                         if discard_eligible:
                             spool_bytes += size
+                except ReplayRetryScheduled as exc:
+                    item["retry_attempt"] = exc.attempt_number
+                    retry_sequence += 1
+                    heapq.heappush(delayed_retries, (
+                        exc.eligible_at, retry_sequence, item, Path(str(item["assigned_path"])),
+                    ))
                 except RateLimitDeferred as exc:
                     # Preserve the original pause reason, stop admitting queued
                     # work, and leave this capture retryable without consuming a

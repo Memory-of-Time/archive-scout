@@ -47,7 +47,7 @@ def client_for(transport, limiter=None):
 
 class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
     def test_initial_release_identity_and_safe_rate_floors(self):
-        self.assertEqual(VERSION, "1.0.5")
+        self.assertEqual(VERSION, "1.0.6")
         config = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(config.cdx_delay, 2.5)
         self.assertEqual(config.download_delay, 0.125)
@@ -114,7 +114,7 @@ class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
             def request(self, url, headers, max_bytes, stop_event):
                 calls.append(self.name)
                 if self.fails:
-                    raise httpx.ReadError("connection reset after request was sent")
+                    raise httpx.ConnectError("connection setup rejected after wire admission")
                 return TransportResponse(200, {}, url, b"ok", self.name, 0)
 
             def close(self):

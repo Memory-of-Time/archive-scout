@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.6
+
+- Requalify pooled Python transports after temporary fallback, one real request at a time. Late curl completions cannot demote a recovered primary.
+- Keep response stalls, body resets and local pool pressure separate from connection setup failures; attribute failed external redirects to the contacted host.
+- Preserve small replay prefixes on HTTPX, urllib3 and curl failures for validated Range resumption. Incomplete responses never become complete captures.
+- Handle curl live 429/503 and redirects from headers before reading stalled bodies; validate binary prefixes early and preserve existing partial files during throttle deferral.
+- Schedule text-acquisition retry backoff outside worker threads in a bounded queue; fresh captures can proceed while isolated failures wait. Cancellation leaves durable pending work.
+- Bound urllib3 pool acquisition and distinguish curl local file-write errors from network failures.
+- Keep schema 12, current scanner/classifier, request ceilings and shared automatic recovery. No new runtime dependencies.
+
 ## 1.0.5
 
 - Keep replay workers and backend health through temporary outages; renew expired recovery cycles without bypassing server cooldowns. Drain attempts before reuse.

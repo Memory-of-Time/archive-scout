@@ -1,6 +1,6 @@
 # Archive Scout automation contract
 
-Archive Scout 1.0.5 ships a separate console executable (`ArchiveScoutCLI`) alongside the desktop GUI. Source installs expose the same interface as `archive-scout`.
+Archive Scout 1.0.6 ships a separate console executable (`ArchiveScoutCLI`) alongside the desktop GUI. Source installs expose the same interface as `archive-scout`.
 
 ## Commands
 

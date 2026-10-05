@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -32,6 +32,10 @@ except ImportError:  # pragma: no cover - exercised in minimal source installs
 
 class BackendUnavailable(RuntimeError):
     pass
+
+
+class LocalStorageError(OSError):
+    """A transport reported a failure writing its local response file."""
 
 
 class RequestAdmissionRejected(RuntimeError):
@@ -87,7 +91,10 @@ class TransportExhaustedError(RuntimeError):
         self.timed_out = any(is_transport_timeout(exc) for _, exc in failures)
         self.read_timed_out = any(is_transport_read_timeout(exc) for _, exc in failures)
         self.connection_failed = bool(failures) and all(
-            is_transport_connection_failure(exc) for _, exc in failures
+            is_transport_connection_failure(exc)
+            and urllib.parse.urlsplit(getattr(exc, "request_url", url)).netloc.casefold()
+                == urllib.parse.urlsplit(url).netloc.casefold()
+            for _, exc in failures
         )
         summary = "; ".join(f"{name}: {type(exc).__name__}: {exc}" for name, exc in failures)
         summary = re.sub(r"([a-zA-Z][\w+.-]*://)[^/\s@]+@", r"\1[redacted]@", summary)
@@ -160,6 +167,12 @@ def is_transport_connection_failure(exc: BaseException) -> bool:
     )
     while current is not None and id(current) not in visited:
         visited.add(id(current))
+        if isinstance(current, (
+            httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout,
+            urllib3.exceptions.ReadTimeoutError, urllib3.exceptions.ProtocolError,
+            urllib3.exceptions.EmptyPoolError,
+        )):
+            return False  # A nested reset during body I/O is not connection setup.
         if isinstance(current, connection_types):
             return True
         if isinstance(current, OSError):
@@ -209,7 +222,27 @@ def is_local_storage_error(exc: BaseException) -> bool:
     }
     while current is not None and id(current) not in visited:
         visited.add(id(current))
+        if isinstance(current, LocalStorageError):
+            return True
         if isinstance(current, OSError) and getattr(current, "errno", None) in storage_errnos:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_response_failure(exc: BaseException) -> bool:
+    """A slow/malformed body or local pool wait does not prove a broken stack."""
+    if is_transport_connection_failure(exc):
+        return False
+    current = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if is_transport_timeout(current) or isinstance(current, (
+            httpx.ReadError, httpx.RemoteProtocolError, httpx.DecodingError,
+            urllib3.exceptions.ProtocolError, urllib3.exceptions.DecodeError,
+            urllib3.exceptions.EmptyPoolError,
+        )):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -373,6 +406,17 @@ def _copy_headers(items: Iterable[tuple[object, object]]) -> dict[str, str]:
     return headers
 
 
+@contextlib.contextmanager
+def _origin_attempt(factory, url: str):
+    """Attribute a redirected wire failure to the host actually contacted."""
+    try:
+        with (factory() if factory is not None else contextlib.nullcontext()):
+            yield
+    except Exception as exc:
+        exc.request_url = url
+        raise
+
+
 class HttpxBackend:
     name = "httpx"
 
@@ -420,7 +464,7 @@ class HttpxBackend:
         for _ in range(11):
             if stop_event.is_set():
                 raise Stopped
-            with self._attempt(attempt_context_factory):
+            with _origin_attempt(attempt_context_factory, current_url):
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
                     copied_headers = _copy_headers(response.headers.items())
@@ -463,7 +507,7 @@ class HttpxBackend:
         for _ in range(11):
             if stop_event.is_set():
                 raise Stopped
-            with self._attempt(attempt_context_factory):
+            with _origin_attempt(attempt_context_factory, current_url):
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
                     copied_headers = _copy_headers(response.headers.items())
@@ -480,9 +524,8 @@ class HttpxBackend:
                         status, response.headers, headers,
                         destination.stat().st_size if destination.exists() else 0,
                     )
-                    chunk_size = 64 * 1024 if preview_validator is not None else 1024 * 1024
                     total, content_hash, preview = _write_limited(
-                        response.iter_bytes(chunk_size), destination, max_bytes, stop_event,
+                        response.iter_bytes(), destination, max_bytes, stop_event,
                         preview_bytes=(64 * 1024 if preview_validator is not None else 20000),
                         append=append, compute_hash=compute_hash,
                         preview_validator=preview_validator, response_headers=copied_headers,
@@ -575,10 +618,11 @@ class Urllib3Backend:
             try:
                 if stop_event.is_set():
                     raise Stopped
-                with self._attempt(attempt_context_factory):
+                with _origin_attempt(attempt_context_factory, current_url):
                     response = self._pool_for(current_url).request(
                         "GET", current_url, headers=headers, preload_content=False,
                         redirect=False, retries=False, timeout=self.timeout,
+                        pool_timeout=max(1.0, float(self.timeout.connect_timeout)),
                     )
                     status = int(response.status)
                     copied_headers = _copy_headers(response.headers.items())
@@ -622,10 +666,11 @@ class Urllib3Backend:
             try:
                 if stop_event.is_set():
                     raise Stopped
-                with self._attempt(attempt_context_factory):
+                with _origin_attempt(attempt_context_factory, current_url):
                     response = self._pool_for(current_url).request(
                         "GET", current_url, headers=headers, preload_content=False,
                         redirect=False, retries=False, timeout=self.timeout,
+                        pool_timeout=max(1.0, float(self.timeout.connect_timeout)),
                     )
                     status = int(response.status)
                     copied_headers = _copy_headers(response.headers.items())
@@ -644,9 +689,17 @@ class Urllib3Backend:
                         status, response.headers, headers,
                         destination.stat().st_size if destination.exists() else 0,
                     )
-                    chunk_size = 64 * 1024 if preview_validator is not None else 1024 * 1024
+                    def chunks():
+                        # read1 returns available decoded bytes without waiting
+                        # to fill a large application chunk. Small prefixes must
+                        # reach disk before a later EOF/read timeout is raised.
+                        while True:
+                            chunk = response.read1(64 * 1024, decode_content=True)
+                            if not chunk:
+                                break
+                            yield chunk
                     total, content_hash, preview = _write_limited(
-                        response.stream(amt=chunk_size, decode_content=True),
+                        chunks(),
                         destination, max_bytes, stop_event,
                         preview_bytes=(64 * 1024 if preview_validator is not None else 20000),
                         append=append, compute_hash=compute_hash,
@@ -702,6 +755,31 @@ class CurlBackend:
             headers[clean_key.casefold()] = clean_value
         return headers
 
+    @classmethod
+    def _origin_headers(cls, header_path: Path) -> tuple[int, dict[str, str]] | None:
+        """Read only a complete final-origin header block, never proxy/interim headers."""
+        try:
+            raw = header_path.read_text(encoding="iso-8859-1", errors="replace").replace("\r\n", "\n")
+        except FileNotFoundError:
+            return None
+        blocks = raw.split("\n\n")[:-1]
+        for block in reversed(blocks):
+            first = block.split("\n", 1)[0]
+            match = re.match(r"HTTP/\S+\s+(\d{3})(?:\s+(.*))?$", first)
+            if not match:
+                continue
+            status = int(match.group(1))
+            if status < 200 or "connection established" in (match.group(2) or "").casefold():
+                continue
+            return status, cls._parse_headers(block)
+        return None
+
+    @staticmethod
+    def _stop_process(proc) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=5)
+
     @staticmethod
     def _attempt(factory):
         return factory() if factory is not None else contextlib.nullcontext()
@@ -709,6 +787,7 @@ class CurlBackend:
     def _run_single(
         self, url: str, headers: dict[str, str], body_path: Path, header_path: Path,
         max_bytes: int, stop_event: threading.Event, *, attempt_context_factory=None,
+        preview_validator=None,
     ) -> tuple[int, dict[str, str], str]:
         command = [
             self.executable, "--disable", "--http1.1", "--silent", "--show-error",
@@ -724,21 +803,52 @@ class CurlBackend:
             command.extend(["--header", f"{key}: {value}"])
         command.extend(["--", url])
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        with self._attempt(attempt_context_factory):
+        with _origin_attempt(attempt_context_factory, url):
+            if stop_event.is_set():
+                raise Stopped
             proc = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 creationflags=creationflags, env=self._environment(),
             )
-            while proc.poll() is None:
-                if stop_event.wait(0.2):
-                    proc.kill()
-                    proc.wait(timeout=5)
-                    raise Stopped
-            stdout, stderr = proc.communicate()
+            preview_checked = False
+            try:
+                while True:
+                    if stop_event.is_set():
+                        raise Stopped
+                    origin = self._origin_headers(header_path)
+                    if origin is not None:
+                        status, response_headers = origin
+                        _raise_live_service_status(status, response_headers, url, self.name)
+                        if status in {301, 302, 303, 307, 308} and response_headers.get("location"):
+                            self._stop_process(proc)
+                            return status, response_headers, url
+                        if (not preview_checked and preview_validator is not None
+                                and status == 200 and body_path.exists()
+                                and body_path.stat().st_size >= 8192):
+                            with body_path.open("rb") as handle:
+                                rejected = preview_validator(response_headers, handle.read(64 * 1024))
+                            preview_checked = True
+                            if rejected:
+                                raise PreviewRejected(str(rejected))
+                    if proc.poll() is not None:
+                        break
+                    stop_event.wait(0.05)
+                stdout, stderr = proc.communicate()
+            except BaseException:
+                self._stop_process(proc)
+                raise
+            # The process may finish between the last poll and header read.
+            origin = self._origin_headers(header_path)
+            if origin is not None:
+                _raise_live_service_status(origin[0], origin[1], url, self.name)
             if proc.returncode != 0:
                 message = (stderr or stdout or f"curl exited {proc.returncode}").strip()
                 if proc.returncode == 28:
                     raise TimeoutError(message)
+                if proc.returncode == 23:
+                    raise LocalStorageError(message)
+                if proc.returncode in {18, 56} and self._origin_headers(header_path) is not None:
+                    raise httpx.RemoteProtocolError(message)
                 raise OSError(message)
         lines = stdout.splitlines()
         status = int(lines[-2]) if len(lines) >= 2 and lines[-2].isdigit() else 0
@@ -793,10 +903,36 @@ class CurlBackend:
             for hop in range(11):
                 body_path = temp / f"body-{hop}.bin"
                 header_path = temp / f"headers-{hop}.txt"
-                status, response_headers, final_url = self._run_single(
-                    current_url, headers, body_path, header_path, max_bytes, stop_event,
-                    attempt_context_factory=attempt_context_factory,
-                )
+                try:
+                    status, response_headers, final_url = self._run_single(
+                        current_url, headers, body_path, header_path, max_bytes, stop_event,
+                        attempt_context_factory=attempt_context_factory,
+                        preview_validator=preview_validator,
+                    )
+                except (OSError, httpx.RemoteProtocolError, Stopped) as failure:
+                    # Preserve a validated identity prefix before the temporary
+                    # curl directory is removed. No HTTP error/redirect body may
+                    # become Range state, and a resumed response must match it.
+                    if is_local_storage_error(failure):
+                        raise
+                    origin = self._origin_headers(header_path)
+                    if (origin and origin[0] in {200, 206} and body_path.exists()
+                            and body_path.stat().st_size > 0):
+                        status, response_headers = origin
+                        encoding = response_headers.get("content-encoding", "identity").casefold()
+                        if encoding in {"", "identity"}:
+                            append = _validate_range(status, response_headers, headers, existing_size)
+                            with body_path.open("rb") as handle:
+                                def partial_chunks():
+                                    while chunk := handle.read(64 * 1024):
+                                        yield chunk
+                                _write_limited(
+                                    partial_chunks(), destination, max_bytes, threading.Event(),
+                                    append=append, compute_hash=False,
+                                    preview_validator=preview_validator,
+                                    response_headers=response_headers,
+                                )
+                    raise
                 _raise_live_service_status(status, response_headers, final_url or current_url, self.name)
                 if status in {301, 302, 303, 307, 308} and response_headers.get("location"):
                     current_url = _redirect_destination(current_url, response_headers["location"], headers, redirect_validator)
@@ -822,6 +958,13 @@ class CurlBackend:
                     preview=preview, backend=self.name, elapsed=time.monotonic() - started,
                 )
         raise RuntimeError(f"too many redirects: {url}")
+
+
+@dataclass
+class _BackendHealth:
+    cooldown_until: dict[str, float] = field(default_factory=dict)
+    last_success: str | None = None
+    probing: set[str] = field(default_factory=set)
 
 
 class ResilientTransport:
@@ -918,18 +1061,72 @@ class ResilientTransport:
         for backend in self.backends.values():
             backend.close()
 
-    def _ordered_names(self) -> list[str]:
+    def _health_locked(self, url: str) -> _BackendHealth:
+        # Proxy/TLS policy is fixed for this transport. Origins must not share
+        # backend penalties (an allowed external redirect can have other needs).
+        key = urllib.parse.urlsplit(url).netloc.casefold()
+        if not hasattr(self, "_health_states"):
+            self._health_states = {}
+        if key not in self._health_states:
+            self._health_states[key] = _BackendHealth()
+        return self._health_states[key]
+
+    def _claim_backend(self, url: str, name: str) -> bool:
+        with self.lock:
+            state = self._health_locked(url)
+            if name in state.probing or state.cooldown_until.get(name, 0.0) > time.monotonic():
+                return False
+            if name in state.cooldown_until:
+                state.probing.add(name)
+            return True
+
+    def _release_backend(self, url: str, name: str) -> None:
+        with self.lock:
+            self._health_locked(url).probing.discard(name)
+
+    def _backend_succeeded(self, url: str, name: str) -> None:
+        with self.lock:
+            state = self._health_locked(url)
+            previous = state.last_success
+            if (previous is None or self.order.index(name) <= self.order.index(previous)
+                    or state.cooldown_until.get(previous, 0.0) > time.monotonic()):
+                state.last_success = name
+            changed = previous != state.last_success
+            state.cooldown_until.pop(name, None)
+            self.last_success = state.last_success  # Legacy diagnostic surface.
+        if changed and self.callback:
+            self.callback(f"Network backend: {self.last_success}")
+
+    def _backend_failed(self, url: str, name: str, exc: BaseException) -> None:
+        actual_url = str(getattr(exc, "request_url", url))
+        with self.lock:
+            state = self._health_locked(actual_url)
+            if is_response_failure(exc):
+                state.cooldown_until.pop(name, None)
+            else:
+                state.cooldown_until[name] = time.monotonic() + 30.0
+
+    def _ordered_names(self, url: str = "") -> list[str]:
         now = time.monotonic()
         with self.lock:
-            preferred = self.last_success
-            available = [name for name in self.order if self.cooldown_until.get(name, 0.0) <= now]
+            state = self._health_locked(url)
+            preferred = state.last_success
+            available = [name for name in self.order
+                         if state.cooldown_until.get(name, 0.0) <= now and name not in state.probing]
+            eligible_at = min((state.cooldown_until.get(name, now) for name in self.order), default=now)
+            recovered = [name for name in available if name in state.cooldown_until]
         if not available:
-            with self.lock:
-                eligible_at = min((self.cooldown_until.get(name, now) for name in self.order), default=now)
-            raise BackendsCoolingDown(max(0.0, eligible_at - now))
+            raise BackendsCoolingDown(max(0.05, eligible_at - now))
         if preferred in available:
             available.remove(preferred)
             available.insert(0, preferred)
+            # One real queued request requalifies a recovered higher-priority
+            # pooled backend. Other workers keep the functioning fallback.
+            for name in recovered:
+                if self.order.index(name) < self.order.index(preferred):
+                    available.remove(name)
+                    available.insert(0, name)
+                    break
         return available
 
     def request(
@@ -942,18 +1139,15 @@ class ResilientTransport:
         redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportResponse:
         failures: list[tuple[str, BaseException]] = []
-        for name in self._ordered_names():
+        for name in self._ordered_names(url):
             if stop_event.is_set():
                 raise Stopped
+            if not self._claim_backend(url, name):
+                continue
             backend = self.backends[name]
             try:
                 response = self._request_backend(backend, url, headers, max_bytes, stop_event, redirect_validator)
-                with self.lock:
-                    changed = self.last_success != name
-                    self.last_success = name
-                    self.cooldown_until.pop(name, None)
-                if changed and self.callback:
-                    self.callback(f"Network backend: {name}")
+                self._backend_succeeded(url, name)
                 return response
             except Stopped:
                 raise
@@ -965,20 +1159,24 @@ class ResilientTransport:
                 if isinstance(exc, (InvalidRangeResponse, PreviewRejected, RequestAdmissionRejected)) or str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     raise
                 failures.append((name, exc))
+                self._backend_failed(url, name, exc)
             except Exception as exc:
                 if is_local_storage_error(exc):
                     raise
                 failures.append((name, exc))
-            with self.lock:
-                self.cooldown_until[name] = time.monotonic() + 30.0
+                self._backend_failed(url, name, exc)
+            finally:
+                self._release_backend(url, name)
             last_error = failures[-1][1]
-            if is_transport_read_timeout(last_error):
+            if (is_response_failure(last_error)
+                    or urllib.parse.urlsplit(getattr(last_error, "request_url", url)).netloc.casefold()
+                        != urllib.parse.urlsplit(url).netloc.casefold()):
                 # Once a server has accepted the connection and stalled while
                 # returning a CDX body, changing Python HTTP stacks normally
                 # repeats the same long wait. Let the indexer retry or requeue
                 # the page instead of multiplying one timeout by every backend.
                 if self.callback:
-                    self.callback(f"Network backend {name} reached Wayback but the response timed out; requeueing without repeating the full timeout on every backend…")
+                    self.callback(f"Network backend {name}: {type(last_error).__name__}; retrying this response without disabling the connection pool…")
                 break
             if self.callback:
                 if is_transport_connection_failure(last_error):
@@ -988,6 +1186,8 @@ class ResilientTransport:
                 else:
                     message = f"Network backend {name} failed with {type(last_error).__name__}; trying another connection method…"
                 self.callback(message)
+        if not failures:
+            raise BackendsCoolingDown(0.05)
         raise TransportExhaustedError(url, failures)
 
     def download(
@@ -1002,25 +1202,22 @@ class ResilientTransport:
         redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
-        names = self._ordered_names()
+        names = self._ordered_names(url)
         # Python streaming remains preferred by the backend order. Curl still
         # applies the same bounded validator after its file-oriented transfer;
         # genuine connection failures must not remove that final fallback.
         for name in names:
             if stop_event.is_set():
                 raise Stopped
+            if not self._claim_backend(url, name):
+                continue
             backend = self.backends[name]
             try:
                 response = self._download_backend(
                     backend, url, headers, destination, max_bytes, stop_event,
                     compute_hash, preview_validator, redirect_validator,
                 )
-                with self.lock:
-                    changed = self.last_success != name
-                    self.last_success = name
-                    self.cooldown_until.pop(name, None)
-                if changed and self.callback:
-                    self.callback(f"Network backend: {name}")
+                self._backend_succeeded(url, name)
                 return response
             except Stopped:
                 raise
@@ -1030,23 +1227,27 @@ class ResilientTransport:
                 if isinstance(exc, (InvalidRangeResponse, PreviewRejected, RequestAdmissionRejected)) or str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     raise
                 failures.append((name, exc))
+                self._backend_failed(url, name, exc)
             except Exception as exc:
                 if is_local_storage_error(exc):
                     raise
                 failures.append((name, exc))
+                self._backend_failed(url, name, exc)
+            finally:
+                self._release_backend(url, name)
             # A failure can extend a valid .part prefix. Never send the stale
             # Range header to another backend: the client must calculate the
             # new offset for its next bounded retry.
             if destination.exists() and destination.stat().st_size:
                 break
-            with self.lock:
-                self.cooldown_until[name] = time.monotonic() + 30.0
             last_error = failures[-1][1]
-            if is_transport_read_timeout(last_error):
+            if (is_response_failure(last_error)
+                    or urllib.parse.urlsplit(getattr(last_error, "request_url", url)).netloc.casefold()
+                        != urllib.parse.urlsplit(url).netloc.casefold()):
                 if self.callback:
                     self.callback(
-                        f"Network backend {name} reached Wayback but the response timed out; "
-                        "requeueing without repeating the full timeout on every backend…"
+                        f"Network backend {name}: {type(last_error).__name__}; "
+                        "retrying this response without disabling the connection pool…"
                     )
                 break
             if self.callback:
@@ -1057,4 +1258,6 @@ class ResilientTransport:
                 else:
                     message = f"Network backend {name} failed with {type(last_error).__name__}; trying another connection method…"
                 self.callback(message)
+        if not failures:
+            raise BackendsCoolingDown(0.05)
         raise TransportExhaustedError(url, failures)
