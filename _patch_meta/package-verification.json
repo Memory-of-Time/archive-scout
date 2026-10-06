@@ -1,0 +1,14 @@
+{
+  "package": "archive-scout",
+  "version": "1.0.7",
+  "installed_wheel_matches_changed_modules": true,
+  "gui_cli_and_native_accelerator_imports": "passed",
+  "runtime_dependencies": {
+    "httpx": "0.28.1",
+    "urllib3": "2.8.0",
+    "truststore": "0.10.4",
+    "ahocorasick-rs": "1.0.3",
+    "selectolax": "0.4.13"
+  },
+  "wheel_sha256": "08a5c3892437ce455dc09f31de185d7437361c73c0f7b86b941189b24aaaa4e0"
+}

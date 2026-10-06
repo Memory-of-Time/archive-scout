@@ -26,6 +26,8 @@ class _SharedRateState:
         self.floor_delay = max(0.0, float(floor_delay))
         self.requested_delay = max(0.0, float(requested_delay))
         self.adaptive_delay = self.requested_delay
+        self.adaptive_factor = 1.0
+        self.healthy_since = 0.0
         self.registrations: dict[int, float] = {}
         self.last_rate_limit = 0.0
         self.last_rate_signal = 0.0
@@ -58,7 +60,7 @@ class FixedRateLimiter:
                     # always scheduled relative to the request that is starting now.
                     self.next_request = now + self.effective_delay
                     break
-                self.condition.wait(timeout=min(max(wait, 0.05), 0.5))
+                self.condition.wait(timeout=min(wait, 0.5))
         yield
 
     def wait(self, stop_event: threading.Event) -> None:
@@ -109,7 +111,7 @@ class SharedFixedRateLimiter(FixedRateLimiter):
                     state.floor_delay,
                     max(state.registrations.values(), default=state.floor_delay),
                 )
-                state.adaptive_delay = max(state.adaptive_delay, state.requested_delay)
+                state.adaptive_delay = state.requested_delay * state.adaptive_factor
                 state.condition.notify_all()
         self._state = state
         self.condition = state.condition
@@ -141,10 +143,7 @@ class SharedFixedRateLimiter(FixedRateLimiter):
                 max(self._state.registrations.values(), default=self._state.floor_delay),
             )
             self._state.requested_delay = requested
-            if self._state.last_rate_limit <= 0.0:
-                self._state.adaptive_delay = requested
-            else:
-                self._state.adaptive_delay = max(requested, self._state.adaptive_delay)
+            self._state.adaptive_delay = requested * self._state.adaptive_factor
             self.condition.notify_all()
 
     def note_rate_limit(self, incident_id: int | None = None) -> bool:
@@ -168,12 +167,13 @@ class SharedFixedRateLimiter(FixedRateLimiter):
                 self._state.last_incident_id = None
             self._state.last_rate_signal = now
             baseline = max(self._state.requested_delay, 0.001)
-            current = max(self._state.adaptive_delay, baseline)
             # Reopen conservatively after a throttle, without changing project
             # semantics or permanently rewriting the user's requested value.
-            self._state.adaptive_delay = min(baseline * 8.0, max(baseline * 2.0, current * 1.5))
+            self._state.adaptive_factor = min(8.0, max(2.0, self._state.adaptive_factor * 1.5))
+            self._state.adaptive_delay = baseline * self._state.adaptive_factor
             self._state.last_rate_limit = now
             self._state.healthy_starts = 0
+            self._state.healthy_since = 0.0
             self.condition.notify_all()
             return True
 
@@ -184,12 +184,15 @@ class SharedFixedRateLimiter(FixedRateLimiter):
                 self._state.adaptive_delay = baseline
                 return
             now = time.monotonic()
+            if self._state.healthy_starts == 0:
+                self._state.healthy_since = now
             self._state.healthy_starts += 1
-            # Require both time and repeated successful service responses before
-            # increasing the effective rate again.  This avoids a one-response
-            # snap-back immediately after the recovery probe.
-            if now - self._state.last_rate_limit >= 60.0 and self._state.healthy_starts >= 32:
-                self._state.adaptive_delay = max(baseline, self._state.adaptive_delay * 0.8)
+            # A cooldown is already enforced by the host gate. Require a small
+            # sustained sample after reopening, rather than adding another minute
+            # and 128 successful CDX responses to every incident.
+            if now - self._state.healthy_since >= 5.0 and self._state.healthy_starts >= 8:
+                self._state.adaptive_factor = max(1.0, self._state.adaptive_factor / 2.0)
+                self._state.adaptive_delay = baseline * self._state.adaptive_factor
                 self._state.healthy_starts = 0
                 self.condition.notify_all()
 
@@ -264,6 +267,35 @@ class SharedHostGate:
         self.probe_inflight = False
         self.connection_failures = 0
         self.last_connection_failure = 0.0
+        self._default_policy = (self.base_pause, self.max_pause)
+        self._policies: dict[object, tuple[float, float]] = {}
+        self._wait_started: float | None = None
+        self._wait_seconds = 0.0
+
+    def register_policy(self, base_pause: float, max_pause: float) -> object:
+        token = object()
+        with self.condition:
+            base = max(0.01, float(base_pause))
+            self._policies[token] = (base, max(base, float(max_pause)))
+            self._configure_active_policy()
+        return token
+
+    def release_policy(self, token: object) -> None:
+        with self.condition:
+            self._policies.pop(token, None)
+            self._configure_active_policy()
+
+    def _configure_active_policy(self) -> None:
+        policies = list(self._policies.values()) or [self._default_policy]
+        self.base_pause = max(value[0] for value in policies)
+        self.max_pause = max(value[1] for value in policies)
+        # Policy turnover affects future fallback waits, never an existing
+        # server deadline or an admitted probe.
+        self.condition.notify_all()
+
+    def _start_wait(self, now: float) -> None:
+        if self._wait_started is None:
+            self._wait_started = now
 
     def acquire_request(
         self,
@@ -286,7 +318,7 @@ class SharedHostGate:
                     )
                 remaining = self.blocked_until - now
                 if remaining > 0:
-                    timeout = min(max(remaining, 0.05), 0.5)
+                    timeout = min(remaining, 0.5)
                     if deadline is not None:
                         timeout = min(timeout, max(0.0, deadline - now))
                     if timeout <= 0:
@@ -336,8 +368,7 @@ class SharedHostGate:
                 return  # Preserve any live service cooldown and existing probe.
             self.connection_outage_cycles += 1
             self.connection_outage_base = max(1.0, float(base_seconds))
-            pause = min(60.0, max(1.0, base_seconds) * 2 ** min(self.connection_outage_cycles - 1, 5))
-            pause *= random.uniform(1.0, 1.1)
+            pause = min(60.0, max(1.0, base_seconds) * 2 ** min(self.connection_outage_cycles - 1, 5) * random.uniform(1.0, 1.1))
             self.incident_id += 1
             self.incident_started = self.recovery_cycle_started = now
             self.incident_started_wall = time.time()
@@ -345,6 +376,7 @@ class SharedHostGate:
             self.blocked_until_wall = time.time() + pause
             self.reason = "connection outage"
             self.probe_required = True
+            self._start_wait(now)
             self.generation += 1
             self.condition.notify_all()
 
@@ -362,10 +394,13 @@ class SharedHostGate:
         if not permit.probe:
             return
         with self.condition:
-            if permit.generation != self.generation:
+            if permit.generation != self.generation or not self.probe_inflight:
                 return
             self.probe_inflight = False
             if recovered:
+                if self._wait_started is not None:
+                    self._wait_seconds += max(0.0, time.monotonic() - self._wait_started)
+                    self._wait_started = None
                 self.probe_required = False
                 self.blocked_until = 0.0
                 self.blocked_until_wall = 0.0
@@ -384,10 +419,10 @@ class SharedHostGate:
                 pause = 5.0
                 if self.reason == "connection outage":
                     self.connection_outage_cycles += 1
-                    pause = min(60.0, self.connection_outage_base * 2 ** min(self.connection_outage_cycles - 1, 5))
-                    pause *= random.uniform(1.0, 1.1)
+                    pause = min(60.0, self.connection_outage_base * 2 ** min(self.connection_outage_cycles - 1, 5) * random.uniform(1.0, 1.1))
                 self.blocked_until = max(self.blocked_until, time.monotonic() + pause)
                 self.blocked_until_wall = max(self.blocked_until_wall, time.time() + pause)
+                self.generation += 1
             self.condition.notify_all()
 
     def wait(self, stop_event: threading.Event) -> None:
@@ -398,12 +433,14 @@ class SharedHostGate:
                 remaining = self.blocked_until - time.monotonic()
                 if remaining <= 0:
                     return
-                self.condition.wait(timeout=min(max(remaining, 0.05), 0.5))
+                self.condition.wait(timeout=min(remaining, 0.5))
 
     def signal_rate_limit(
         self,
         retry_after: float | None = None,
         reason: str = "HTTP 429",
+        *,
+        permit: HostPermit | None = None,
     ) -> tuple[float, int, float, bool]:
         now = time.monotonic()
         wall_now = time.time()
@@ -417,6 +454,13 @@ class SharedHostGate:
                 and (self.probe_required or self.probe_inflight or self.blocked_until > now or self.incident_started > 0.0)
             )
             new_incident = not active_incident
+            fresh_probe = bool(permit and permit.probe and permit.generation == self.generation and self.probe_inflight)
+            stale = bool(permit and permit.generation != self.generation)
+            # An old in-flight response cannot reopen an already recovered gate
+            # without a new server deadline. Nor can duplicate no-header replies
+            # restart the fallback timer or invalidate the current probe.
+            if retry_after is None and ((active_incident and not fresh_probe) or (stale and not active_incident)):
+                return max(0.0, self.blocked_until - now), self.incident_id, self.blocked_until_wall, False
             if not active_incident and now - self.last_signal > self.decay_seconds:
                 self.incidents = 0
             if new_incident:
@@ -425,20 +469,26 @@ class SharedHostGate:
                 self.incident_started = now
                 self.incident_started_wall = wall_now
                 self.recovery_cycle_started = now
+            elif fresh_probe:
+                self.incidents += 1
             self.last_signal = now
 
-            if retry_after is not None and retry_after > 0:
+            if retry_after is not None:
                 # Retry-After is a minimum server deadline; never jitter below it.
-                pause = max(1.0, float(retry_after))
+                pause = max(0.0, float(retry_after))
             else:
                 exponent = max(0, min(self.incidents - 1, 4))
-                pause = min(self.max_pause, self.base_pause * (2**exponent))
-                pause *= random.uniform(1.0, 1.1)
+                pause = min(self.max_pause, self.base_pause * (2**exponent) * random.uniform(1.0, 1.1))
 
+            # A duplicate explicit deadline only changes the generation when it
+            # actually extends eligibility; otherwise keep the one live probe.
+            if active_incident and not fresh_probe and (pause <= 0 or now + pause <= self.blocked_until):
+                return max(0.0, self.blocked_until - now), self.incident_id, self.blocked_until_wall, False
             self.blocked_until = max(self.blocked_until, now + pause)
             self.blocked_until_wall = max(self.blocked_until_wall, wall_now + pause)
             self.reason = reason
             self.probe_required = True
+            self._start_wait(now)
             self.probe_inflight = False
             self.generation += 1
             self.condition.notify_all()
@@ -473,15 +523,16 @@ class SharedHostGate:
                 "probe_required": self.probe_required,
                 "probe_inflight": self.probe_inflight,
                 "eligible_at_epoch": self.blocked_until_wall,
+                "service_wait_seconds": self._wait_seconds + (max(0.0, now - self._wait_started) if self._wait_started is not None else 0.0),
             }
 
     def configure(self, base_pause: float, max_pause: float) -> None:
-        """Adopt the more conservative pause settings from another client."""
+        """Set the idle policy; active clients register and release their own."""
         with self.condition:
             requested_base = max(0.01, float(base_pause))
             requested_max = max(requested_base, float(max_pause))
-            self.base_pause = max(self.base_pause, requested_base)
-            self.max_pause = max(self.max_pause, requested_max)
+            self._default_policy = (requested_base, requested_max)
+            self._configure_active_policy()
 
     def note_connection_failure(self, threshold: int) -> tuple[int, bool]:
         """Track a short burst of genuine connection-setup failures.

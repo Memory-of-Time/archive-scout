@@ -58,7 +58,7 @@ from ..database.repositories import (
 )
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_INDEX_RATE_KEY, shared_host_gate)
 from ..downloads.validation import classify_exception
-from ..events import ConnectivityPaused, ProgressEvent, Stopped
+from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
 from ..utils import json_value, parse_cdx_parameter_lines, utc_now
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from .discovery import discover_media, hosts_related, safe_document_text, target_hosts
@@ -749,7 +749,7 @@ def _defer_media_window(
 
     if plan.pending and all(item.failures >= threshold for item in plan.pending):
         error_id = pause_error(f"all remaining media index windows reached the retry threshold: {exc}")
-        raise ConnectivityPaused(
+        raise IndexResponsePaused(
             "Wayback could not answer any remaining combined-media index window. "
             "The exact media queue was saved and can be continued with Resume."
         ) from exc
@@ -759,10 +759,10 @@ def _defer_media_window(
         return error_id
     if not network.persistent_retries and current.failures >= max(3, config.retries):
         error_id = pause_error(f"media indexing retry limit reached: {exc}")
-        raise ConnectivityPaused(f"media indexing retry limit reached; progress was saved: {exc}") from exc
+        raise IndexResponsePaused(f"media indexing retry limit reached; progress was saved: {exc}") from exc
     if current.failures >= threshold:
         error_id = pause_error(f"media index window remained unreachable after {current.failures} recovery cycles: {exc}")
-        raise ConnectivityPaused(
+        raise IndexResponsePaused(
             f"Wayback remained unreachable for this media window after {current.failures} recovery cycles. Progress was saved."
         ) from exc
     wait = _wait_seconds(config, current.failures)
@@ -1194,7 +1194,7 @@ def index_direct_media(
                                 details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                             )
                             persist_state(encode_plan(plan), False, seen, error_id)
-                        raise ConnectivityPaused(
+                        raise IndexResponsePaused(
                             f"{len(current.retry_pages)} Timemap media page(s) remained unavailable after "
                             f"{highest_page_failures} attempts. Successful pages were preserved and only the exact "
                             "failed media-page queue was saved for Resume."
@@ -1346,7 +1346,7 @@ def index_direct_media(
                                 retryable=True,
                             )
                             persist_state(encode_plan(plan), False, seen, error_id)
-                        raise ConnectivityPaused(
+                        raise IndexResponsePaused(
                             f"Wayback returned no usable media CDX response after {transient_failure_streak} consecutive recovery attempts. "
                             "The exact media queue was saved instead of looping indefinitely."
                         ) from exc
@@ -2049,6 +2049,8 @@ def index_external_embedded_media(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=config.network.normalized().cdx_workers,
         host_gate=host_gate,
+        rate_limit_base_pause=config.rate_limit_base_pause,
+        rate_limit_max_pause=config.rate_limit_max_pause,
         rate_limit_attempts=config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
         network_backend=config.network.normalized().backend,
@@ -2122,6 +2124,8 @@ def index_media(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=config.network.normalized().cdx_workers,
         host_gate=host_gate,
+        rate_limit_base_pause=config.rate_limit_base_pause,
+        rate_limit_max_pause=config.rate_limit_max_pause,
         rate_limit_attempts=config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
         network_backend=config.network.normalized().backend,

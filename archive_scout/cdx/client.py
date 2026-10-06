@@ -199,6 +199,8 @@ class HttpClient:
         read_timeout: float | None = None,
         pool_size: int = 4,
         host_gate: SharedHostGate | None = None,
+        rate_limit_base_pause: float | None = None,
+        rate_limit_max_pause: float | None = None,
         rate_limit_attempts: int = 0,
         rate_limit_max_wait: float = 0.0,
         network_backend: str = "auto",
@@ -251,6 +253,12 @@ class HttpClient:
             trust_env=trust_environment,
             callback=network_callback,
         )
+        register = getattr(self.host_gate, "register_policy", None)
+        self._gate_policy = register(
+            self.host_gate.base_pause if rate_limit_base_pause is None else rate_limit_base_pause,
+            self.host_gate.max_pause if rate_limit_max_pause is None else rate_limit_max_pause,
+        ) if callable(register) else None
+        self._gate_wait_baseline = float(self._gate_snapshot().get("service_wait_seconds", 0.0))
         self._permit_local = threading.local()
         self._transport_attempt_hooks = callable(getattr(self.transport, "set_attempt_context_factory", None))
         if self._transport_attempt_hooks:
@@ -263,6 +271,9 @@ class HttpClient:
             close_limiter = getattr(self.limiter, "close", None)
             if callable(close_limiter):
                 close_limiter()
+            if self._gate_policy is not None:
+                self.host_gate.release_policy(self._gate_policy)
+                self._gate_policy = None
 
     def _metric_add(self, name: str, value: float = 1.0) -> None:
         with self.metrics_lock:
@@ -295,6 +306,7 @@ class HttpClient:
             "network_seconds",
         ):
             values[key] = round(float(values.get(key, 0.0)), 9)
+        values["service_gate_wall_seconds"] = round(max(0.0, float(self._gate_snapshot().get("service_wait_seconds", 0.0)) - self._gate_wait_baseline), 9)
         return values
 
     def _active_stop_event(self):
@@ -345,10 +357,13 @@ class HttpClient:
             return {}
         return dict(value) if isinstance(value, dict) else {}
 
-    def _signal_rate_limit(self, status: int, retry_after: float | None, rate_attempt: int) -> tuple[float, int, float]:
+    def _signal_rate_limit(self, status: int, retry_after: float | None, rate_attempt: int, permit=None) -> tuple[float, int, float]:
         signal = getattr(self.host_gate, "signal_rate_limit", None)
         if callable(signal):
-            wait_seconds, incident_id, eligible_at_epoch, _new_incident = signal(retry_after, f"HTTP {status}")
+            if isinstance(self.host_gate, SharedHostGate):
+                wait_seconds, incident_id, eligible_at_epoch, _new_incident = signal(retry_after, f"HTTP {status}", permit=permit)
+            else:
+                wait_seconds, incident_id, eligible_at_epoch, _new_incident = signal(retry_after, f"HTTP {status}")
             return float(wait_seconds), int(incident_id), float(eligible_at_epoch)
         # Compatibility for integrations/tests implementing the pre-v1.0.1 gate
         # protocol. Production SharedHostGate always takes the typed path above.
@@ -363,7 +378,9 @@ class HttpClient:
     def _raise_if_common_connection_outage(self, exc: BaseException) -> None:
         if self.connection_failure_pause_threshold <= 0:
             return
-        if not bool(getattr(exc, "connection_failed", False)) and not is_transport_connection_failure(exc):
+        connection_failed = (bool(exc.connection_failed) if isinstance(exc, TransportExhaustedError)
+                             else is_transport_connection_failure(exc))
+        if not connection_failed:
             return
         note = getattr(self.host_gate, "note_connection_failure", None)
         if not callable(note):
@@ -379,15 +396,19 @@ class HttpClient:
                 "check connectivity and Resume later."
             ) from exc
 
-    def _handle_early_service_status(self, exc: ServiceStatusResponse, rate_attempt: int) -> int:
+    def _handle_early_service_status(self, exc: ServiceStatusResponse, rate_attempt: int, permit=None) -> int:
         """Apply live 429/503 recovery using headers before any response body is read."""
+        if self._external_hop(exc.url):
+            if permit is not None:
+                self.host_gate.finish_request(permit, recovered=True)
+            raise TransientRequestError(f"External destination HTTP {exc.status}: {exc.url}", status=exc.status, category="external_service_error") from exc
         self._note_connection_success()
         status = int(exc.status)
         retry_after_header = exc.headers.get("retry-after") or exc.headers.get("Retry-After")
         retry_after = parse_retry_after(retry_after_header)
         rate_attempt += 1
-        wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt)
-        if hasattr(self.limiter, "note_rate_limit"):
+        wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt, permit)
+        if status == 429 and hasattr(self.limiter, "note_rate_limit"):
             self.limiter.note_rate_limit(incident_id)
         self._metric_add("rate_limit_events")
         gate_state = self._gate_snapshot()
@@ -465,14 +486,19 @@ class HttpClient:
         return permit
 
     @contextlib.contextmanager
-    def _wire_attempt(self):
+    def _wire_attempt(self, url: str | None = None):
         """Admit and measure one actual transport/backend/redirect attempt."""
         pace_started = time.monotonic()
-        with self.limiter.slot(self._active_stop_event()):
+        external = bool(url and self._external_hop(url))
+        with (contextlib.nullcontext() if external else self.limiter.slot(self._active_stop_event())):
             self._metric_add("pacing_wait_seconds", time.monotonic() - pace_started)
             permit = getattr(self._permit_local, "permit", None)
-            if permit is not None and not self.host_gate.permit_is_current(permit):
-                raise RequestAdmissionRejected("shared Wayback gate changed before this wire attempt")
+            if not external and permit is not None and not self.host_gate.permit_is_current(permit):
+                # A probe released on trustworthy response progress is still
+                # allowed to finish its redirects/body without a second permit.
+                if (getattr(self._permit_local, "recovered_permit", None) != permit
+                        or self._gate_snapshot().get("probe_required")):
+                    raise RequestAdmissionRejected("shared Wayback gate changed before this wire attempt")
             self._metric_add("request_starts")
             self._metric_add("wire_request_starts")
             if permit is not None and permit.probe and self.network_callback and getattr(self._permit_local,"reported_probe_generation",None) != permit.generation:
@@ -480,7 +506,7 @@ class HttpClient:
                 self.network_callback("Internet Archive recovery probe admitted")
             network_started = time.monotonic()
             try:
-                yield
+                yield self._response_progress
             except BaseException:
                 self._metric_add("request_failures")
                 raise
@@ -490,18 +516,49 @@ class HttpClient:
                 self._metric_add("network_seconds", time.monotonic() - network_started)
 
     def _transport_request(self, url: str, headers: dict[str, str], max_bytes: int):
+        self._permit_local.logical_url = url
+        self._permit_local.recovered_permit = None
+        self._permit_local.streaming_download = False
         stop_event = self._active_stop_event()
         if self._transport_attempt_hooks:
             return self.transport.request(url, headers, max_bytes, stop_event)
-        with self._wire_attempt():
+        with self._wire_attempt(url):
             return self.transport.request(url, headers, max_bytes, stop_event)
 
     def _transport_download(self, url: str, headers: dict[str, str], destination: Path, max_bytes: int, **kwargs):
+        self._permit_local.logical_url = url
+        self._permit_local.recovered_permit = None
+        self._permit_local.streaming_download = True
         stop_event = self._active_stop_event()
         if self._transport_attempt_hooks:
             return self.transport.download(url, headers, destination, max_bytes, stop_event, **kwargs)
-        with self._wire_attempt():
+        with self._wire_attempt(url):
             return self.transport.download(url, headers, destination, max_bytes, stop_event, **kwargs)
+
+    def _external_hop(self, url: str) -> bool:
+        original = getattr(self._permit_local, "logical_url", "")
+        return bool(original and urllib.parse.urlsplit(url).netloc.casefold() != urllib.parse.urlsplit(original).netloc.casefold())
+
+    def _response_progress(self, status: int, headers: dict[str, str], url: str, prefix: bytes = b"") -> None:
+        """Release a live-service probe without declaring its payload complete."""
+        permit = getattr(self._permit_local, "permit", None)
+        if (permit is None or not permit.probe or self._external_hop(url)
+                or getattr(self._permit_local, "recovered_permit", None) == permit):
+            return
+        memento = self._is_archived_memento(headers, url)
+        trusted = memento or (status in {301, 302, 303, 307, 308} and bool(headers.get("location") or headers.get("Location")))
+        if int(status) == 200 and prefix:
+            if re.search(r"/web/\d{1,14}(?:[a-z]+_)?/", url):
+                trusted = bool(getattr(self._permit_local, "streaming_download", False))  # Called after the download's prefix validator.
+            else:
+                # A plausible CDX data row proves service activity only. The
+                # complete body still goes through the unchanged strict parser.
+                text = prefix.decode("utf-8", "ignore")
+                trusted = bool(re.search(r"\b\d{14}[\s\",]+https?://", text))
+        if trusted:
+            self.host_gate.finish_request(permit, recovered=True)
+            self._permit_local.recovered_permit = permit
+            self._note_connection_success()
 
     @staticmethod
     def _is_archived_memento(headers: dict[str, str], url: str) -> bool:
@@ -548,10 +605,13 @@ class HttpClient:
                 archived_memento = self._is_archived_memento(response.headers, response.final_url or url)
 
                 if status in {429, 503} and not archived_memento:
+                    if self._external_hop(response.final_url or url):
+                        self.host_gate.finish_request(permit, recovered=True)
+                        raise TransientRequestError(f"External destination HTTP {status}: {response.final_url}", status=status, category="external_service_error")
                     retry_after = parse_retry_after(retry_after_header)
                     rate_attempt += 1
-                    wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt)
-                    if hasattr(self.limiter, "note_rate_limit"):
+                    wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt, permit)
+                    if status == 429 and hasattr(self.limiter, "note_rate_limit"):
                         self.limiter.note_rate_limit(incident_id)
                     self._metric_add("rate_limit_events")
                     gate_state = self._gate_snapshot()
@@ -649,8 +709,7 @@ class HttpClient:
                     "elapsed": response.elapsed,
                 }
             except ServiceStatusResponse as exc:
-                self.host_gate.finish_request(permit, recovered=False)
-                rate_attempt = self._handle_early_service_status(exc, rate_attempt)
+                rate_attempt = self._handle_early_service_status(exc, rate_attempt, permit)
                 continue
             except BackendsCoolingDown as exc:
                 self.host_gate.finish_request(permit, recovered=False)
@@ -802,11 +861,14 @@ class HttpClient:
 
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
                 if status in {429, 503} and not archived_memento:
+                    if self._external_hop(response.final_url or url):
+                        self.host_gate.finish_request(permit, recovered=True)
+                        raise TransientRequestError(f"External destination HTTP {status}: {response.final_url}", status=status, category="external_service_error")
                     destination.unlink(missing_ok=True)
                     retry_after = parse_retry_after(retry_after_header)
                     rate_attempt += 1
-                    wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt)
-                    if hasattr(self.limiter, "note_rate_limit"):
+                    wait_seconds, incident_id, eligible_at_epoch = self._signal_rate_limit(status, retry_after, rate_attempt, permit)
+                    if status == 429 and hasattr(self.limiter, "note_rate_limit"):
                         self.limiter.note_rate_limit(incident_id)
                     self._metric_add("rate_limit_events")
                     gate_state = self._gate_snapshot()
@@ -871,8 +933,7 @@ class HttpClient:
                     "archived_origin_status": bool(archived_memento and status >= 400),
                 }
             except ServiceStatusResponse as exc:
-                self.host_gate.finish_request(permit, recovered=False)
-                rate_attempt = self._handle_early_service_status(exc, rate_attempt)
+                rate_attempt = self._handle_early_service_status(exc, rate_attempt, permit)
                 continue
             except BackendsCoolingDown as exc:
                 self.host_gate.finish_request(permit, recovered=False)
@@ -969,8 +1030,7 @@ class HttpClient:
         if not getattr(self._permit_local, "scheduled_replay", False):
             self.retry_wait(failed_attempt - 1, reason, retry_after)
             return
-        base = max(float(retry_after or 0), min(120.0, 2 ** (failed_attempt - 1)))
-        wait_seconds = base * random.uniform(1.0, 1.2)
+        wait_seconds = self._retry_delay(failed_attempt - 1, retry_after)
         self._metric_add("retry_waits")
         self._metric_add("scheduled_retry_seconds", wait_seconds)
         if self.retry_callback:
@@ -1327,11 +1387,14 @@ class HttpClient:
             splittable=any(exc.splittable for _, exc in failures),
         ) from (failures[-1][1] if failures else None)
 
+    @staticmethod
+    def _retry_delay(attempt: int, retry_after: float | None) -> float:
+        if retry_after is not None:
+            return max(0.0, float(retry_after))
+        return min(120.0, (2 ** min(max(0, attempt), 7)) * random.uniform(1.0, 1.2))
+
     def retry_wait(self, attempt: int, reason: str, retry_after: float | None = None) -> None:
-        base = max(float(retry_after or 0), min(120.0, 2**attempt))
-        # Never schedule before a server-supplied Retry-After deadline.  Jitter
-        # is positive-only so multiple clients spread out after that minimum.
-        wait_seconds = base * random.uniform(1.0, 1.2)
+        wait_seconds = self._retry_delay(attempt, retry_after)
         self._metric_add("retry_waits")
         self._metric_add("retry_wait_seconds", wait_seconds)
         if self.retry_callback:

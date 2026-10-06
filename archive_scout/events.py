@@ -12,6 +12,12 @@ class ConnectivityPaused(RuntimeError):
     """A recoverable network pause with the exact queue safely persisted."""
 
 
+class IndexResponsePaused(ConnectivityPaused):
+    """Retry saved CDX work without declaring the whole archive host offline."""
+
+    scope = "query"
+
+
 @dataclass(slots=True)
 class ProgressEvent:
     stage: str

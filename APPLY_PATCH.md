@@ -1,15 +1,22 @@
-# Archive Scout v1.0.6 patch files
+# Apply Archive Scout v1.0.7
 
-Apply these files over the v1.0.5 repository prepared in the preceding release. This is a patch-file package, not the complete repository or an executable distribution.
+This ZIP contains replacement patch files, not a complete repository. Apply it over the prepared v1.0.6 source, with or without the separate Windows test-fixture fix. Do not apply it to an older release or to an unrelated later development tree.
 
-1. Extract the ZIP.
-2. Copy the changed files to the matching relative paths in your v1.0.5 repository, replacing the existing copies. Include `.github/workflows/tests.yml`.
-3. For GitHub browser upload, open each matching repository folder and upload that folder's changed files. The entire package is below 100 files. Do not upload the outer extraction folder as a new repository folder.
-4. `APPLY_PATCH.md` and `PATCH_MANIFEST.json` are delivery instructions/verification metadata; they do not need to be committed.
-5. Run the existing test/build workflows, then create the v1.0.6 release/tag when ready. No GitHub publication or native builds were performed here.
+1. Close Archive Scout and keep a copy of your current source checkout.
+2. Extract this ZIP into that checkout's root, preserving the relative paths and replacing the corresponding files. No source files need deletion. Existing project databases and capture folders do not need changes.
+3. Make sure `.github/workflows/tests.yml` retains its leading period. This is the actual GitHub test workflow. The `github/workflows/tests.yml` copy is synchronized for convenience.
+4. Commit the replacement files. Wait for the GitHub Tests matrix to pass on your commit before creating the `v1.0.7` release tag. The existing build workflow builds GUI and CLI packages for all three platforms. Tagged Windows builds retain the existing Artifact Signing configuration requirement.
 
-Existing projects remain schema 12. Keep your project database and captures. No file deletions or new runtime dependencies are required. A source installation may need its normal package reinstall to update installed version metadata.
+For a local source check on Python 3.11 or newer:
 
-Validation: 411 tests, 410 passed, one native-display skip; compilation passed; 100,000-row offline benchmark completed with four database transactions, zero duplicate work and zero unchanged-row writes. Network regression tests use only mocks and loopback fixtures; live Wayback throughput has not been benchmarked.
+```bash
+python -m pip install .
+python -m compileall -q archive_scout tests scripts
+python -m unittest discover -s tests -p "test_*.py" -v
+```
 
-The patch improves pooled fallback recovery, received-prefix retention, early curl throttle/redirect handling and bounded text retry scheduling. It preserves current scanner/classifier and request ceilings. See docs/RELEASE_1_0_6.md and docs/NETWORK_PERFORMANCE.md for scope and details.
+`PATCH_MANIFEST.json` lists the replacement files and before/after SHA-256 values. `SHA256SUMS.txt` covers the repository patch files. The `_patch_meta` folder contains local validation evidence. These metadata files may be kept outside your checkout if preferred.
+
+Local verification: 439 tests, zero failures, one native-display skip; 28 new regressions; source compilation; installed package version/import/CLI checks; workflow YAML parsing; and a 100,000-row offline indexing benchmark. All patch source files were compared after overlay on both v1.0.6 variants. Windows/macOS GitHub jobs and installer builds were not run in this Linux environment, so their success must be confirmed on GitHub.
+
+Normal pacing stays at 2.5 s for CDX and 0.125 s for replay starts. Existing conservative no-header defaults remain 60/600 s, while chosen shorter fallback settings are now honored. Valid server Retry-After deadlines are preserved. Full CDX/body/Range validation and text/media differentiation remain intact. See `docs/RELEASE_1_0_7.md` for the changes.

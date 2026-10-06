@@ -40,8 +40,8 @@ class KeywordSetConfigTests(unittest.TestCase):
             self.assertIn(".mp4", loaded.media.include_extensions)
             self.assertIn(".gif", loaded.media.exclude_extensions)
             self.assertEqual(loaded.retry_media_capture_ids, [7, 9])
-            self.assertEqual(loaded.rate_limit_base_pause, 60.0)
-            self.assertEqual(loaded.rate_limit_max_pause, 600.0)
+            self.assertEqual(loaded.rate_limit_base_pause, 45.0)
+            self.assertEqual(loaded.rate_limit_max_pause, 240.0)
             self.assertEqual(loaded.rate_limit_max_wait, 900)
             self.assertEqual(loaded.rate_limit_attempts, 10)
 

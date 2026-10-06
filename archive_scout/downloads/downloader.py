@@ -1237,6 +1237,8 @@ def _acquire_archive(
         config.user_agent, worker_stop, retry_callback=on_retry,
         connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
         pool_size=config.workers, host_gate=host_gate,
+        rate_limit_base_pause=config.rate_limit_base_pause,
+        rate_limit_max_pause=config.rate_limit_max_pause,
         rate_limit_attempts=config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
         network_backend=config.network.normalized().backend,
@@ -1392,13 +1394,14 @@ def _acquire_archive(
         error_buffer.clear()
         last_flush = now_mono
 
-    def stage_candidates() -> None:
+    def stage_candidates(fresh_reserve: bool = False) -> None:
         nonlocal rows_exhausted
-        if rows_exhausted or len(ready_downloads) + len(delayed_retries) >= stage_limit:
+        buffer_limit = stage_limit + (inflight_limit if fresh_reserve else 0)
+        if rows_exhausted or len(ready_downloads) + len(delayed_retries) >= buffer_limit:
             return
         staged: list[tuple[dict[str, object], Path]] = []
         reserved_paths: set[str] = set()
-        while len(ready_downloads) + len(delayed_retries) + len(staged) < stage_limit:
+        while len(ready_downloads) + len(delayed_retries) + len(staged) < buffer_limit:
             try:
                 row = next(row_iter)
             except StopIteration:
@@ -1570,7 +1573,7 @@ def _acquire_archive(
             f"{label}: wire request starts {starts:,} ({starts/elapsed:.1f}/s); "
             f"responses {completions:,}; transport failures {request_failures:,}; "
             f"saved {downloaded:,} ({downloaded/elapsed:.1f}/s); retries {retries:,}; "
-            f"worker waits {worker_wait_seconds:.1f}s; scheduled rate pauses {scheduled_rate_pause:.1f}s; "
+            f"worker waits {worker_wait_seconds:.1f} worker-s; service gate {float(metrics.get('service_gate_wall_seconds', 0.0)):.1f} wall-s; "
             f"delayed retries {len(delayed_retries):,}; "
             f"skipped {skipped + metadata_skipped + url_skipped:,}; errors {failures:,}; {settled:,}/{total:,}" + discard_detail,
             min(settled, total), total,
@@ -1587,6 +1590,8 @@ def _acquire_archive(
                 "transport_failures": request_failures,
                 "worker_wait_seconds": worker_wait_seconds,
                 "scheduled_rate_pause_seconds": scheduled_rate_pause,
+                "service_gate_wall_seconds": float(metrics.get("service_gate_wall_seconds", 0.0)),
+                "wait_counter_units": "worker_seconds_except_service_gate_wall_seconds",
                 "network_seconds": network_seconds,
                 "network_bytes": network_bytes,
                 "downloaded": downloaded,
@@ -1650,8 +1655,11 @@ def _acquire_archive(
                         f"(free disk {disk_free / (1024*1024):.1f} MiB); pausing new replay admissions while scanners catch up.",
                     ))
 
-            if deferred_error is None and not backpressure_active and len(ready_downloads) < max(config.workers, inflight_limit):
-                stage_candidates()
+            fresh_hidden = bool(ready_downloads or delayed_retries) and not any(
+                int(item.get("retry_attempt", 1)) == 1 for item, _path in ready_downloads
+            ) and not rows_exhausted
+            if deferred_error is None and not backpressure_active and (fresh_hidden or len(ready_downloads) < inflight_limit):
+                stage_candidates(fresh_reserve=fresh_hidden)
 
             slots = 0 if backpressure_active else inflight_limit - len(futures)
             reserved_bytes = sum(discard_reservation(item) for item in futures.values()) if discard_mode else 0

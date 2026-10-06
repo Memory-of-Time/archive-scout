@@ -331,7 +331,13 @@ def run_project(
         _reset_transient_inflight()
         gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
         now_epoch = time.time()
-        if isinstance(exc, RateLimitDeferred):
+        query_pause = getattr(exc, "scope", "host") == "query"
+        if query_pause:
+            wait_seconds = max(0.01, min(float(config.network.retry_base_seconds), float(config.network.retry_max_seconds)))
+            eligible_at = now_epoch + wait_seconds
+            reason = "index_response"
+            detail = {"reason_code": "index_response_retry", "eligible_at_epoch": eligible_at}
+        elif isinstance(exc, RateLimitDeferred):
             eligible_at = float(exc.eligible_at_epoch or 0.0)
             wait_seconds = max(0.0, eligible_at - now_epoch) if eligible_at else max(
                 float(config.rate_limit_base_pause), float(config.network.retry_base_seconds)
@@ -356,7 +362,7 @@ def run_project(
         until_text = datetime.fromtimestamp(eligible_at).strftime("%H:%M:%S") if eligible_at else "the next probe"
         emit(callback, ProgressEvent(
             "rate_limit_waiting" if reason == "rate_limit" else "network_waiting",
-            f"Waiting for Internet Archive — {exc}. Next check at {until_text}. Progress is saved; this run will continue automatically.",
+            f"Waiting to retry {'saved CDX work' if query_pause else 'Internet Archive'} — {exc}. Next check at {until_text}. Progress is saved; this run will continue automatically.",
             detail=detail,
         ))
         deadline = time.monotonic() + wait_seconds
@@ -368,7 +374,8 @@ def run_project(
                 break
             if stop_event.wait(min(1.0, remaining)):
                 raise Stopped
-        gate.renew_recovery_cycle(getattr(exc, "incident_id", None))
+        if not query_pause:
+            gate.renew_recovery_cycle(getattr(exc, "incident_id", None))
         emit(callback, ProgressEvent(
             "network",
             f"Recovery wait finished; continuing saved {stage} work…",

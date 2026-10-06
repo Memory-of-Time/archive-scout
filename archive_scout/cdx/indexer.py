@@ -13,7 +13,7 @@ from typing import Callable
 from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_recovery_event, record_site_issue, upsert_captures
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_INDEX_RATE_KEY, shared_host_gate)
-from ..events import ConnectivityPaused, ProgressEvent, Stopped
+from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
 from .client import (
@@ -446,7 +446,7 @@ def _defer_transient_window(
 
     threshold = network.failure_pause_threshold
     if plan.pending and all(item.failures >= threshold for item in plan.pending):
-        raise ConnectivityPaused(
+        raise IndexResponsePaused(
             "Wayback could not answer any remaining CDX work after multiple independent connection methods. "
             "Archive Scout saved the exact queue and paused cleanly; Resume will continue from this point."
         ) from exc
@@ -464,7 +464,7 @@ def _defer_transient_window(
         return error_id
 
     if current.failures >= threshold:
-        raise ConnectivityPaused(
+        raise IndexResponsePaused(
             f"Wayback remained unreachable for {window_label(current.start, current.end)} after {current.failures} recovery cycles. "
             "The queue was saved without marking the project failed."
         ) from exc
@@ -537,6 +537,8 @@ def _client_for_config(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=network.cdx_workers,
         host_gate=host_gate,
+        rate_limit_base_pause=config.rate_limit_base_pause,
+        rate_limit_max_pause=config.rate_limit_max_pause,
         rate_limit_attempts=config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
         network_backend=network.backend,
@@ -1022,7 +1024,7 @@ def index_archive(
                                     details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                                 )
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            raise ConnectivityPaused(
+                            raise IndexResponsePaused(
                                 f"{len(current.retry_pages)} Timemap page(s) remained unavailable after "
                                 f"{highest_page_failures} attempts. Successful pages were preserved and only the exact "
                                 "failed page queue was saved for Resume."
@@ -1193,7 +1195,7 @@ def index_archive(
                                 {"streak": transient_failure_streak, "target": target, "window": label},
                             )
                             persist_task_state(encode_plan(plan), False, seen, error_id)
-                        raise ConnectivityPaused(
+                        raise IndexResponsePaused(
                             f"Wayback returned no usable CDX response after {transient_failure_streak} consecutive recovery attempts. "
                             "Archive Scout saved the exact queue and paused instead of looping indefinitely."
                         ) from exc

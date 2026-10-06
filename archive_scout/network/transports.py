@@ -308,7 +308,7 @@ def _validate_range_size(status: int, headers, total: int) -> None:
             raise InvalidRangeResponse("incomplete replay range body; restarting complete file")
 
 
-def _read_limited(chunks: Iterable[bytes], max_bytes: int, stop_event: threading.Event) -> bytearray:
+def _read_limited(chunks: Iterable[bytes], max_bytes: int, stop_event: threading.Event, progress=None) -> bytearray:
     data = bytearray()
     for chunk in chunks:
         if stop_event.is_set():
@@ -318,6 +318,8 @@ def _read_limited(chunks: Iterable[bytes], max_bytes: int, stop_event: threading
         data.extend(chunk)
         if len(data) > max_bytes:
             raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
+        if progress is not None and len(data) - len(chunk) < 64 * 1024:
+            progress(bytes(data[:8192]))
     # Returning the bytearray avoids a full-size bytes copy at the exact moment
     # the response buffer is largest. Consumers only require the bytes-like API.
     return data
@@ -336,6 +338,7 @@ def _write_limited(
     compute_hash: bool = True,
     preview_validator: Callable[[dict[str, str], bytes], str | None] | None = None,
     response_headers: dict[str, str] | None = None,
+    progress=None,
 ) -> tuple[int, str, bytes]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256() if compute_hash else None
@@ -377,6 +380,9 @@ def _write_limited(
                     preview_checked = True
                     if rejected:
                         raise PreviewRejected(str(rejected))
+                if progress is not None and (preview_checked or preview_validator is None):
+                    progress(bytes(preview))
+                    progress = None
             if preview_validator is not None and not preview_checked:
                 rejected = preview_validator(headers, bytes(preview))
                 if rejected:
@@ -410,8 +416,17 @@ def _copy_headers(items: Iterable[tuple[object, object]]) -> dict[str, str]:
 def _origin_attempt(factory, url: str):
     """Attribute a redirected wire failure to the host actually contacted."""
     try:
-        with (factory() if factory is not None else contextlib.nullcontext()):
-            yield
+        if factory is None:
+            context = contextlib.nullcontext()
+        else:
+            try:
+                context = factory(url=url)
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                context = factory()
+        with context as progress:
+            yield progress if callable(progress) else (lambda *args: None)
     except Exception as exc:
         exc.request_url = url
         raise
@@ -464,11 +479,12 @@ class HttpxBackend:
         for _ in range(11):
             if stop_event.is_set():
                 raise Stopped
-            with _origin_attempt(attempt_context_factory, current_url):
+            with _origin_attempt(attempt_context_factory, current_url) as progress:
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
                     copied_headers = _copy_headers(response.headers.items())
                     _raise_live_service_status(status, copied_headers, str(response.url), self.name)
+                    progress(status, copied_headers, str(response.url))
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
@@ -477,7 +493,7 @@ class HttpxBackend:
                     announced = response.headers.get("Content-Length")
                     if announced and announced.isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-                    data = _read_limited(response.iter_bytes(1024 * 1024), max_bytes, stop_event)
+                    data = _read_limited(response.iter_bytes(), max_bytes, stop_event, lambda prefix: progress(status, copied_headers, str(response.url), prefix))
                     return TransportResponse(
                         status=status,
                         headers=copied_headers,
@@ -507,11 +523,12 @@ class HttpxBackend:
         for _ in range(11):
             if stop_event.is_set():
                 raise Stopped
-            with _origin_attempt(attempt_context_factory, current_url):
+            with _origin_attempt(attempt_context_factory, current_url) as progress:
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
                     copied_headers = _copy_headers(response.headers.items())
                     _raise_live_service_status(status, copied_headers, str(response.url), self.name)
+                    progress(status, copied_headers, str(response.url))
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
@@ -529,6 +546,7 @@ class HttpxBackend:
                         preview_bytes=(64 * 1024 if preview_validator is not None else 20000),
                         append=append, compute_hash=compute_hash,
                         preview_validator=preview_validator, response_headers=copied_headers,
+                        progress=lambda prefix: progress(status, copied_headers, current_url, prefix),
                     )
                     _validate_range_size(status, response.headers, total)
                     return TransportFileResponse(
@@ -618,7 +636,7 @@ class Urllib3Backend:
             try:
                 if stop_event.is_set():
                     raise Stopped
-                with _origin_attempt(attempt_context_factory, current_url):
+                with _origin_attempt(attempt_context_factory, current_url) as progress:
                     response = self._pool_for(current_url).request(
                         "GET", current_url, headers=headers, preload_content=False,
                         redirect=False, retries=False, timeout=self.timeout,
@@ -627,6 +645,7 @@ class Urllib3Backend:
                     status = int(response.status)
                     copied_headers = _copy_headers(response.headers.items())
                     _raise_live_service_status(status, copied_headers, current_url, self.name)
+                    progress(status, copied_headers, current_url)
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
@@ -637,7 +656,7 @@ class Urllib3Backend:
                     announced = response.headers.get("Content-Length")
                     if announced and str(announced).isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-                    data = _read_limited(response.stream(amt=1024 * 1024, decode_content=True), max_bytes, stop_event)
+                    data = _read_limited(iter(lambda: response.read1(64 * 1024, decode_content=True), b""), max_bytes, stop_event, lambda prefix: progress(status, copied_headers, current_url, prefix))
                     result = TransportResponse(
                         status=status, headers=copied_headers,
                         final_url=current_url, data=data, backend=self.name,
@@ -666,7 +685,7 @@ class Urllib3Backend:
             try:
                 if stop_event.is_set():
                     raise Stopped
-                with _origin_attempt(attempt_context_factory, current_url):
+                with _origin_attempt(attempt_context_factory, current_url) as progress:
                     response = self._pool_for(current_url).request(
                         "GET", current_url, headers=headers, preload_content=False,
                         redirect=False, retries=False, timeout=self.timeout,
@@ -675,6 +694,7 @@ class Urllib3Backend:
                     status = int(response.status)
                     copied_headers = _copy_headers(response.headers.items())
                     _raise_live_service_status(status, copied_headers, current_url, self.name)
+                    progress(status, copied_headers, current_url)
                     if status in {301, 302, 303, 307, 308}:
                         location = response.headers.get("Location")
                         if location:
@@ -704,6 +724,7 @@ class Urllib3Backend:
                         preview_bytes=(64 * 1024 if preview_validator is not None else 20000),
                         append=append, compute_hash=compute_hash,
                         preview_validator=preview_validator, response_headers=copied_headers,
+                        progress=lambda prefix: progress(status, copied_headers, current_url, prefix),
                     )
                     _validate_range_size(status, response.headers, total)
                     result = TransportFileResponse(
@@ -803,7 +824,7 @@ class CurlBackend:
             command.extend(["--header", f"{key}: {value}"])
         command.extend(["--", url])
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        with _origin_attempt(attempt_context_factory, url):
+        with _origin_attempt(attempt_context_factory, url) as progress:
             if stop_event.is_set():
                 raise Stopped
             proc = subprocess.Popen(
@@ -811,6 +832,7 @@ class CurlBackend:
                 creationflags=creationflags, env=self._environment(),
             )
             preview_checked = False
+            progress_checked = False
             try:
                 while True:
                     if stop_event.is_set():
@@ -819,6 +841,7 @@ class CurlBackend:
                     if origin is not None:
                         status, response_headers = origin
                         _raise_live_service_status(status, response_headers, url, self.name)
+                        progress(status, response_headers, url)
                         if status in {301, 302, 303, 307, 308} and response_headers.get("location"):
                             self._stop_process(proc)
                             return status, response_headers, url
@@ -830,6 +853,12 @@ class CurlBackend:
                             preview_checked = True
                             if rejected:
                                 raise PreviewRejected(str(rejected))
+                        if (not progress_checked and status == 200 and body_path.exists()
+                                and body_path.stat().st_size >= 8192
+                                and (preview_validator is None or preview_checked)):
+                            with body_path.open("rb") as handle:
+                                progress(status, response_headers, url, handle.read(8192))
+                            progress_checked = True
                     if proc.poll() is not None:
                         break
                     stop_event.wait(0.05)

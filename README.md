@@ -1,21 +1,25 @@
 # Archive Scout
 
-**Archive Scout 1.0.6** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **12**.
+**Archive Scout 1.0.7** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **12**.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.6/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.6/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.6/ArchiveScout-macOS-Universal.zip)
+- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
-## 1.0.6 highlights
+## 1.0.7 highlights
 
-- Pooled connections recover their preference after temporary fallback; isolated body stalls do not disable the entire HTTP stack.
-- All backends preserve useful small replay prefixes for validated resumption. Curl reacts to live throttle and redirect headers before waiting on their bodies.
-- Text-acquisition retry backoff releases worker capacity so fresh captures can proceed. The delayed queue stays bounded and Pause & save retains pending work.
-- Failed external redirect destinations do not trigger a common Wayback connection-outage pause. Local pool/file pressure is distinguished from remote failure.
+- One shared cooldown deadline survives duplicate failures. Later server deadlines remain authoritative, and only a fresh failed probe escalates fallback waiting.
+- Active projects register and release their recovery policy. A closed slow project no longer leaves its pause or pacing baseline behind.
+- Healthy service responses restore the requested pace after a short sustained sample. HTTP 503 retains service recovery without also applying the HTTP 429 quota pacing penalty.
+- Both text and media retries yield worker capacity to ready URLs. Media recovery preserves the user's stop flag, completed files and exact pending queue.
+- Trustworthy response progress releases the service probe while its body continues. Complete-body, CDX, media and Range checks still determine whether a payload can be accepted.
+- Acquisition progress distinguishes summed worker waits from elapsed shared service-gate time.
+
+The connection and partial-file improvements from 1.0.6 remain included.
 
 The following improvements from 1.0.5 remain included:
 
@@ -27,7 +31,7 @@ The following improvements from 1.0.5 remain included:
 - Hitlist resumes preserve unchanged results and revisit bodies that arrived or changed after a checkpoint. Schema **12** adds small coverage records and body revisions; it does not duplicate capture contents.
 - Whole project operations and database restores use a crash-released OS lock. GUI restore runs in the background after existing view reads finish.
 
-The current CDX strategies, request-rate settings, text/media byte classifier and deterministic scanner are preserved. v1.0.6 improves transport selection, partial-file retention and text retry scheduling. See [release notes](docs/RELEASE_1_0_6.md).
+The current CDX strategies, request-rate settings, text/media byte classifier and deterministic scanner are preserved. v1.0.7 removes redundant recovery waits and extends worker-yielding retries to media. See [release notes](docs/RELEASE_1_0_7.md).
 
 The source still recognizes serialized project identifiers from pre-release development builds so existing project folders can be migrated safely. Those compatibility identifiers are not separate public releases.
 
