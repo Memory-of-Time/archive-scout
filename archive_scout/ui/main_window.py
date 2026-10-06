@@ -1155,6 +1155,8 @@ class ArchiveScoutApp(tk.Tk):
                 "Customize generated text-scan, index, media and archive-analysis reports. "
                 "These settings never change which pages are acquired or matched, and never erase saved scan evidence. "
                 "Use Regenerate reports in Scan history to apply them without downloading again. "
+                "Index reports are written when indexing finishes or is paused. Match reports require a scan; "
+                "use All indexed URLs for an index-only inventory. "
                 "Hitlist, AI and manual export formats are separate operation outputs."
             ),
             wraplength=1080,
@@ -1179,7 +1181,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(controls, text="Unchecked: future scans omit unused enrichment; enabling it later requires a local rescan. Download-only is lean in either mode.", wraplength=1000, style="Muted.TLabel").grid(row=4, column=0, columnspan=6, sticky="w")
         presets = ttk.Frame(controls)
         presets.grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
-        for label, preset in (("All files and fields", "all"), ("Matched URLs only", "urls"), ("No generated reports", "none")):
+        for label, preset in (("All files and fields", "all"), ("Matched URLs only", "urls"), ("Indexed URLs only", "index_urls"), ("No generated reports", "none")):
             ttk.Button(presets, text=label, command=lambda value=preset: self.set_report_preset(value)).pack(side="left", padx=(0, 8))
 
         book = ttk.Notebook(tab)
@@ -1268,9 +1270,13 @@ class ArchiveScoutApp(tk.Tk):
 
     def set_report_preset(self, preset: str) -> None:
         for name, variable in self.report_output_vars.items():
-            variable.set(preset == "all" or (preset == "urls" and name == "matched_urls"))
+            variable.set(preset == "all" or (preset == "urls" and name == "matched_urls")
+                         or (preset == "index_urls" and name == "all_indexed_urls"))
             if preset in {"all", "urls"}:
                 self.set_report_fields(name, True)
+            elif preset == "index_urls" and name == "all_indexed_urls":
+                for field_name, field_variable in self.report_field_vars.get(name, {}).items():
+                    field_variable.set(field_name == "original_url")
 
     def create_analysis_tab(self) -> None:
         page = ScrollablePage(self.notebook, padding=10)
@@ -2096,9 +2102,11 @@ class ArchiveScoutApp(tk.Tk):
         except (ValueError, KeyError) as exc:
             raise ValueError(f"Check the numeric settings, keyword rules, and target lines: {exc}") from exc
         mode = selected_mode
+        if config.download_scope == "index_only" and mode in {"all", "external_media_after_scan"}:
+            mode = "index"
         if mode in {"all", "external_media_after_scan", "index", "download_only"} and not config.targets:
             raise ValueError("Add at least one site or path.")
-        if require_keywords and mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
+        if require_keywords and mode in {"all", "external_media_after_scan", "download", "rescan", "retry_errors"} and not config.selected_keyword_sets():
             raise ValueError("Select at least one non-empty keyword set.")
         if mode == "download_only" and config.text_retention == "discard_after_scan":
             raise ValueError("Download-only requires Keep downloaded text files because no scan completion exists.")

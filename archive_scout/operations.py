@@ -170,6 +170,8 @@ def run_project(
     callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     config = config.normalized()
+    if config.download_scope == "index_only" and mode in {"all", "external_media_after_scan"}:
+        mode = "index"
     if mode == "external_media_after_scan":
         config.media = replace(
             config.media.normalized(),
@@ -215,7 +217,7 @@ def run_project(
         if previous is not None:
             previous_mode = str(previous["mode"] or "")
             if previous_mode in {
-                "all", "external_media_after_scan", "download_only", "download", "rescan",
+                "all", "external_media_after_scan", "index", "download_only", "download", "rescan",
                 "retry_errors", "retry_download_errors", "media_all", "media_index",
                 "media_download", "media_retry", "analysis", "research_index",
                 "forum_rebuild", "hitlist",
@@ -265,6 +267,8 @@ def run_project(
     # Resume restores the original operation contract before validating it. A
     # download-only resume must not suddenly require keyword sets, while a full
     # scan still must have the keyword sets frozen in its saved snapshot.
+    if config.download_scope == "index_only" and mode in {"all", "external_media_after_scan"}:
+        mode = "index"
     if mode in {"all", "external_media_after_scan", "download", "rescan", "retry_errors"} and not config.selected_keyword_sets():
         database.close()
         raise ValueError("select at least one keyword set")
@@ -396,6 +400,40 @@ def run_project(
                 # determines the remaining work; no new operation or scan lineage is
                 # created here.
                 emit(callback, ProgressEvent("network", f"Automatic archive recovery cycle {cycle:,}: resuming {stage}."))
+
+    def _index_reports(*, complete: bool = True) -> dict[str, Path]:
+        paths = (generate_index_reports(config, database) if complete
+                 else generate_index_reports(config, database, index_complete=False))
+        detail = {
+            "report_files": [str(path) for path in paths.values()],
+            "index_complete": complete,
+            "reason_code": "reports_written" if paths else "index_reports_disabled",
+        }
+        if paths:
+            names = ", ".join(path.name for path in paths.values())
+            message = f"{'Index' if complete else 'Partial index'} reports written to {config.output_dir / 'reports'}: {names}"
+        else:
+            message = (
+                "No compatible index report files are enabled. In Reports, enable All indexed URLs, "
+                "Summary, Errors or Site-specific issues. Match reports require a scan."
+            )
+        # Notify the GUI/CLI without replacing the last indexing counts or a
+        # saved service deadline with a report event that has no counters.
+        emit(original_callback, ProgressEvent("report", message, detail=detail))
+        return paths
+
+    def _partial_index_reports() -> None:
+        if mode != "index":
+            return
+        try:
+            _index_reports(complete=False)
+        except Exception as report_error:
+            # An optional inventory snapshot must never replace the original
+            # stop/pause exception or erase its durable operation status.
+            emit(original_callback, ProgressEvent(
+                "report", f"Index progress is saved, but partial reports could not be written: {report_error}",
+                detail={"reason_code": "index_report_write_failed", "index_complete": False},
+            ))
 
     try:
         save_project_config(config)
@@ -583,21 +621,30 @@ def run_project(
             return paths
         if mode == "index":
             _recovering_call("text indexing", lambda: index_archive(config, database, stop_event, callback))
-            paths = generate_index_reports(config, database)
+            paths = _index_reports()
             paths["project"] = config.output_dir / "project.json"
             finish_operation_run(database, operation_run_id, "complete", "Index complete")
             database.commit()
             return paths
         if mode == "report":
             existing = latest_scan_run(database)
-            if existing is None:
-                if database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]:
-                    paths = generate_index_reports(config, database)
+            last_text_run = database.execute(
+                """SELECT mode,status FROM operation_runs WHERE id<>?
+                   AND mode IN ('index','all','external_media_after_scan','download','resume','rescan','retry_errors')
+                   ORDER BY id DESC LIMIT 1""",
+                (operation_run_id,),
+            ).fetchone()
+            if last_text_run is not None and last_text_run["mode"] == "index":
+                paths = _index_reports(complete=last_text_run["status"] == "complete")
+            elif existing is None:
+                if database.execute("SELECT 1 FROM captures LIMIT 1").fetchone():
+                    paths = _index_reports()
                 else:
                     raise RuntimeError("this project does not contain indexed captures or a completed scan run")
             else:
                 paths = generate_reports(config, database, existing)
-            emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
+            if paths:
+                emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
             finish_operation_run(database, operation_run_id, "complete", "Reports regenerated")
             database.commit()
             return paths
@@ -753,6 +800,7 @@ def run_project(
             finish_jobs(database, jobs, "interrupted")
         finish_operation_run(database, operation_run_id, "paused", str(exc))
         database.commit()
+        _partial_index_reports()
         emit(callback, ProgressEvent("network_paused", str(exc)))
         raise
     except RateLimitDeferred as exc:
@@ -771,6 +819,7 @@ def run_project(
         )
         finish_operation_run(database, operation_run_id, "paused", str(exc))
         database.commit()
+        _partial_index_reports()
         emit(
             callback,
             ProgressEvent(
@@ -788,6 +837,7 @@ def run_project(
             finish_jobs(database, jobs, "interrupted")
         finish_operation_run(database, operation_run_id, "interrupted", "Stopped by user")
         database.commit()
+        _partial_index_reports()
         emit(callback, ProgressEvent("stopped", "Stopped. Progress was saved and can be resumed."))
         raise
     except Exception as exc:

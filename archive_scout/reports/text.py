@@ -181,7 +181,12 @@ def _site_issue_lines(database: sqlite3.Connection, fields: list[str]) -> Iterat
         )
 
 
-def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) -> dict[str, Path]:
+def generate_index_reports(
+    config: ProjectConfig,
+    database: sqlite3.Connection,
+    *,
+    index_complete: bool = True,
+) -> dict[str, Path]:
     """Write the user-selected reports for a CDX-only project."""
     report = config.report.normalized()
     root_reports = config.output_dir / "reports"
@@ -227,10 +232,10 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) 
             "heading": "Archive Scout",
             "generated": f"Generated: {utc_now()}",
             "output_directory": f"Output directory: {config.output_dir}",
-            "operation": "Operation: Index URLs only",
+            "operation": "Operation: Index URLs only" + (" (partial; indexing remains unfinished)" if not index_complete else ""),
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
-            "indexed_captures": f"Indexed captures: {capture_count:,} (URL inventory; bodies searched are reported separately)",
+            "indexed_captures": f"Indexed captures: {capture_count:,} (" + ("partial URL inventory; Resume continues indexing" if not index_complete else "URL inventory; bodies searched are reported separately") + ")",
             "bodies_searched": "Bodies searched: 0 (index-only operation; no replay bodies were checked)",
             "unresolved_errors": f"Unresolved errors: {error_count:,}",
             "site_issues": f"Open site-specific issues: {issue_count:,}",
