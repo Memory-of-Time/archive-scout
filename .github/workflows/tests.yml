@@ -52,17 +52,20 @@ jobs:
           python -m pip check
 
       - name: Compile source and benchmark runner
-        run: python -m compileall -q archive_scout tests scripts/benchmark_offline.py
+        run: python -m compileall -q archive_scout tests scripts
 
       - name: Verify imports and package metadata
         run: >-
           python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.0.7';
+          assert importlib.metadata.version('archive-scout') == '1.0.8';
           print('Archive Scout native accelerator imports and metadata checks passed')"
 
       - name: Run tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Verify release identity and workflow placement
+        run: python scripts/verify_release.py
 
       - name: Run offline benchmark smoke test
         if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.12'
