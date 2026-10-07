@@ -6,40 +6,14 @@ from pathlib import Path
 from typing import Callable
 
 from ..classification import RESOURCE_CLASSIFIER_REVISION, classify_capture_inventory
-from ..document_store import document_body
+from ..database.full_text_index import rebuild_document_index
 from ..events import ProgressEvent
 from ..projects.backups import create_project_backup
 from ..utils import atomic_write_text, utc_now
 
 
-def rebuild_full_text_index(database: sqlite3.Connection, batch_size: int = 500) -> int:
-    enabled = database.execute("SELECT value FROM project_meta WHERE key='fts5'").fetchone()
-    if not enabled or enabled[0] != "1":
-        return 0
-    database.execute("DROP TABLE IF EXISTS documents_fts")
-    database.execute("CREATE VIRTUAL TABLE documents_fts USING fts5(title,body_text,original_url,content='documents',content_rowid='id')")
-    cursor = database.execute(
-        """
-        SELECT d.*,c.original_url AS capture_original_url,c.payload_availability AS capture_payload_availability
-        FROM documents d JOIN captures c ON c.id=d.capture_id
-        WHERE COALESCE(c.payload_availability,'retained')!='discarded'
-        ORDER BY d.id
-        """
-    )
-    rebuilt = 0
-    while True:
-        rows = cursor.fetchmany(max(1, int(batch_size)))
-        if not rows:
-            break
-        database.executemany(
-            "INSERT INTO documents_fts(rowid,title,body_text,original_url) VALUES(?,?,?,?)",
-            (
-                (row["id"], row["title"] or "", document_body(row), row["capture_original_url"] or "")
-                for row in rows
-            ),
-        )
-        rebuilt += len(rows)
-    return rebuilt
+def rebuild_full_text_index(database: sqlite3.Connection, batch_size: int = 500, callback=None) -> int:
+    return rebuild_document_index(database, batch_size, callback)
 
 
 def repair_project(
@@ -124,7 +98,7 @@ def repair_project(
 
         # Rebuild the contentless/external-content FTS representation wholesale;
         # never issue unsupported per-row DELETE statements against FTS5.
-        rebuilt = rebuild_full_text_index(database)
+        rebuilt = rebuild_full_text_index(database, callback=callback)
         database.execute(
             "INSERT INTO repair_actions(action,details,created_at) VALUES(?,?,?)",
             ("repair", f"capture_reset={capture_reset}; media_reset={media_reset}; missing={missing_retained}; reclassified={reclassified}; fts={rebuilt}", utc_now()),

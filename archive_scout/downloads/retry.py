@@ -12,6 +12,22 @@ from ..scanning.rescanner import rescan_documents, rescan_keyword_sets
 from .downloader import download_archive, download_archive_only
 
 
+class _RetryCaptureIds:
+    """Reiterable SQLite selection; no project-sized Python ID list."""
+
+    def __init__(self, database: sqlite3.Connection, count: int):
+        self.database = database
+        self.count = count
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        return (int(row[0]) for row in self.database.execute(
+            "SELECT id FROM archive_scout_download_retry_work ORDER BY id"
+        ))
+
+
 def retry_error_urls(
     config: ProjectConfig,
     database: sqlite3.Connection,
@@ -96,14 +112,19 @@ def retry_error_downloads(
         clauses.append("e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")")
         params.extend(config.retry_error_categories)
     if config.retry_capture_ids:
-        ids = [int(value) for value in config.retry_capture_ids]
-        clauses.append("e.capture_id IN (" + ",".join("?" for _ in ids) + ")")
-        params.extend(ids)
-    rows = database.execute(
-        "SELECT DISTINCT e.capture_id FROM errors e WHERE " + " AND ".join(clauses) + " ORDER BY e.capture_id",
-        params,
-    ).fetchall()
-    capture_ids = [int(row[0]) for row in rows]
+        database.execute("DROP TABLE IF EXISTS temp.archive_scout_download_retry_filter")
+        database.execute("CREATE TEMP TABLE archive_scout_download_retry_filter(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+        database.executemany("INSERT OR IGNORE INTO archive_scout_download_retry_filter(id) VALUES(?)",
+                             ((int(value),) for value in config.retry_capture_ids))
+        clauses.append("EXISTS (SELECT 1 FROM archive_scout_download_retry_filter s WHERE s.id=e.capture_id)")
+    database.execute("DROP TABLE IF EXISTS temp.archive_scout_download_retry_work")
+    database.execute("CREATE TEMP TABLE archive_scout_download_retry_work(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+    database.execute(
+        "INSERT INTO archive_scout_download_retry_work(id) SELECT DISTINCT e.capture_id FROM errors e WHERE "
+        + " AND ".join(clauses), params,
+    )
+    count = int(database.execute("SELECT COUNT(*) FROM archive_scout_download_retry_work").fetchone()[0])
+    capture_ids = _RetryCaptureIds(database, count)
     if callback:
         callback(ProgressEvent("download_retry", f"Retrying {len(capture_ids):,} retryable text acquisition error(s) without scanning."))
     if not capture_ids:
@@ -111,11 +132,10 @@ def retry_error_downloads(
     # Retry selection is explicit.  Restore only these capture rows to pending;
     # permanent/ignored errors remain untouched and automatic retry loops do not
     # reinterpret redirect-policy failures.
-    placeholders = ",".join("?" for _ in capture_ids)
     with database:
         database.execute(
-            f"UPDATE captures SET state='pending',updated_at=datetime('now') WHERE id IN ({placeholders})",
-            capture_ids,
+            "UPDATE captures SET state='pending',updated_at=datetime('now') "
+            "WHERE id IN (SELECT id FROM archive_scout_download_retry_work)",
         )
     acquisition_config = config.normalized()
     if acquisition_config.text_retention == "discard_after_scan":

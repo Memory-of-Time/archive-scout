@@ -267,7 +267,7 @@ class V105StabilityTests(unittest.TestCase):
         for column in ('coverage_version','capture_limit'): self.db.execute(f'ALTER TABLE quick_search_runs DROP COLUMN {column}')
         self.db.execute('UPDATE schema_info SET version=11'); self.db.commit(); self.db.close()
         self.db=open_database(self.root,migrate=True)
-        self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],12)
+        self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],13)
         self.assertEqual(self.db.execute('SELECT text FROM notes WHERE capture_id=?',(cid,)).fetchone()[0],'human evidence')
         self.assertEqual(path.read_text(),'retained evidence')
         self.assertEqual(self.db.execute('SELECT local_path FROM captures WHERE id=?',(cid,)).fetchone()[0],str(path))

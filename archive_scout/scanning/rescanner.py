@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -15,6 +16,7 @@ from ..events import ProgressEvent, Stopped
 from ..document_store import decompress_text, document_links
 from ..utils import hash_text
 from .jobs import ScanJob
+from .batches import BoundedResultWriter
 from .scoring import analyze_content, prepare_analysis_fields
 
 
@@ -27,6 +29,7 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob], report_
     try:
         data = path.read_bytes()
         content_hash = hashlib.sha256(data).hexdigest()
+        size_bytes = len(data)
         document_changed = content_hash != str(row.get("content_hash") or "")
         content_type = str(row.get("mimetype") or "")
         if row.get("detected_encoding"):
@@ -79,7 +82,7 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob], report_
                 if document_changed
                 else str(row.get("normalized_hash") or hash_text(prepared_normalized_fields["body"]))
             ),
-            "size_bytes": path.stat().st_size,
+            "size_bytes": size_bytes,
             "document_changed": document_changed,
             "analyses": analyses,
         }
@@ -185,112 +188,113 @@ def rescan_keyword_sets(
     max_inflight = max(worker_count, worker_count * 3)
     rows = _document_rows(database, clauses, params)
     completed = 0
+    last_emit = 0.0
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=worker_count, thread_name_prefix="archive-rescan"
-    ) as pool:
-        futures: dict[concurrent.futures.Future[dict[str, object]], dict[str, object]] = {}
-
-        def submit_available() -> None:
-            while len(futures) < max_inflight:
-                if stop_event.is_set():
-                    raise Stopped
-                try:
-                    row = next(rows)
-                except StopIteration:
-                    return
-                futures[pool.submit(_analyze_saved_document, row, jobs, report_config)] = row
-
-        submit_available()
-        while futures:
-            if stop_event.is_set():
-                for pending in futures:
-                    pending.cancel()
-                raise Stopped
-            done, _pending = concurrent.futures.wait(
-                futures, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            results: list[dict[str, object]] = []
-            for future in done:
-                futures.pop(future, None)
-                results.append(future.result())
-
-            # SQLite remains owned by this thread. Every completed worker group is
-            # persisted in one transaction instead of one transaction per file.
-            with database:
-                for result in results:
-                    row = result["row"]
-                    assert isinstance(row, dict)
-                    capture_id = int(row["capture_id"])
-                    document_id = int(row.get("id") or 0)
-                    kind = str(result["kind"])
-                    if kind == "discarded":
-                        # Explicitly unavailable by retention policy; this is
-                        # coverage information, not a retryable acquisition error.
-                        pass
-                    elif kind == "missing":
-                        path = Path(result["path"])
-                        record_error(
+    def persist_results(results: list[dict[str, object]]) -> None:
+        nonlocal completed, last_emit
+        with database:
+            for result in results:
+                row = result["row"]
+                assert isinstance(row, dict)
+                capture_id = int(row["capture_id"])
+                document_id = int(row.get("id") or 0)
+                kind = str(result["kind"])
+                if kind == "discarded":
+                    # Explicitly unavailable by retention policy; this is
+                    # coverage information, not a retryable acquisition error.
+                    pass
+                elif kind == "missing":
+                    path = Path(result["path"])
+                    record_error(
+                        database,
+                        "scan",
+                        "missing_local_file",
+                        f"saved file is missing: {path}",
+                        capture_id=capture_id,
+                        document_id=(document_id or None),
+                        retryable=True,
+                    )
+                    database.execute(
+                        """UPDATE captures SET state='pending',payload_availability='not_acquired',
+                                  local_path=NULL WHERE id=?""", (capture_id,)
+                    )
+                elif kind == "error":
+                    record_error(
+                        database,
+                        "scan",
+                        "scan_failure",
+                        str(result["error"]),
+                        capture_id=capture_id,
+                        document_id=document_id,
+                        retryable=True,
+                    )
+                else:
+                    if document_id == 0 or bool(result.get("document_changed")):
+                        saved_document_id = upsert_document(
                             database,
-                            "scan",
-                            "missing_local_file",
-                            f"saved file is missing: {path}",
-                            capture_id=capture_id,
-                            document_id=(document_id or None),
-                            retryable=True,
-                        )
-                        database.execute(
-                            """UPDATE captures SET state='pending',payload_availability='not_acquired',
-                                      local_path=NULL WHERE id=?""", (capture_id,)
-                        )
-                    elif kind == "error":
-                        record_error(
-                            database,
-                            "scan",
-                            "scan_failure",
-                            str(result["error"]),
-                            capture_id=capture_id,
-                            document_id=document_id,
-                            retryable=True,
+                            capture_id,
+                            Path(result["path"]),
+                            str(result["title"]),
+                            str(result["visible"]),
+                            list(result["links"]),
+                            str(result["content_hash"]),
+                            str(result["normalized_hash"]),
+                            int(result["size_bytes"]),
                         )
                     else:
-                        if document_id == 0 or bool(result.get("document_changed")):
-                            saved_document_id = upsert_document(
-                                database,
-                                capture_id,
-                                Path(result["path"]),
-                                str(result["title"]),
-                                str(result["visible"]),
-                                list(result["links"]),
-                                str(result["content_hash"]),
-                                str(result["normalized_hash"]),
-                                int(result["size_bytes"]),
-                            )
-                        else:
-                            saved_document_id = document_id
-                        for scan_run_id, analysis in result["analyses"]:
-                            save_match(database, int(scan_run_id), saved_document_id, analysis, report_config)
-                        resolve_errors(
-                            database,
-                            capture_id=capture_id,
-                            document_id=saved_document_id,
-                            operations=("scan", "parse"),
-                        )
-
-            for result in results:
-                completed += 1
-                if callback:
-                    prefix = "Unavailable local file" if result["kind"] == "missing" else ("Skipped discarded body" if result["kind"] == "discarded" else "Scanned")
-                    callback(
-                        ProgressEvent(
-                            "rescan",
-                            f"{prefix} {completed:,}/{total:,} against {len(jobs):,} keyword set(s)",
-                            completed,
-                            total,
-                            {"workers": worker_count},
-                        )
+                        saved_document_id = document_id
+                    for scan_run_id, analysis in result["analyses"]:
+                        save_match(database, int(scan_run_id), saved_document_id, analysis, report_config)
+                    resolve_errors(
+                        database,
+                        capture_id=capture_id,
+                        document_id=saved_document_id,
+                        operations=("scan", "parse"),
                     )
+
+        completed += len(results)
+        now = time.monotonic()
+        if callback and (completed >= total or now - last_emit >= 0.5):
+            last_emit = now
+            callback(ProgressEvent(
+                "rescan", f"Rescanned {completed:,}/{total:,} against {len(jobs):,} keyword set(s)",
+                completed, total, {"workers": worker_count},
+            ))
+
+    writer = BoundedResultWriter(persist_results)
+    futures: dict[concurrent.futures.Future[dict[str, object]], dict[str, object]] = {}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="archive-rescan"
+        ) as pool:
+            def submit_available() -> None:
+                while len(futures) < max_inflight:
+                    if stop_event.is_set():
+                        raise Stopped
+                    try:
+                        row = next(rows)
+                    except StopIteration:
+                        return
+                    futures[pool.submit(_analyze_saved_document, row, jobs, report_config)] = row
+
             submit_available()
+            while futures:
+                if stop_event.is_set():
+                    raise Stopped
+                done, _pending = concurrent.futures.wait(
+                    futures, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    futures.pop(future, None)
+                    writer.add(future.result())
+                writer.flush_if_due()
+                submit_available()
+            writer.flush()
+    except Stopped:
+        for pending in futures:
+            pending.cancel()
+        writer.flush()
+        raise
 
 
 def rescan_documents(

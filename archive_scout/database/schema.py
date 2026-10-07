@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS documents(
 );
 CREATE INDEX IF NOT EXISTS documents_hash_idx ON documents(content_hash);
 CREATE INDEX IF NOT EXISTS documents_normalized_hash_idx ON documents(normalized_hash);
+CREATE TABLE IF NOT EXISTS document_fts_versions(
+    fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL UNIQUE,
+    signature BLOB NOT NULL DEFAULT X'',
+    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS keyword_sets(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -263,6 +269,7 @@ CREATE TABLE IF NOT EXISTS quick_search_coverage(
     capture_id INTEGER NOT NULL,
     body_revision INTEGER NOT NULL,
     coverage_mask INTEGER NOT NULL,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(run_id,capture_id),
     FOREIGN KEY(run_id) REFERENCES quick_search_runs(id) ON DELETE CASCADE,
     FOREIGN KEY(capture_id) REFERENCES captures(id) ON DELETE CASCADE
@@ -425,7 +432,7 @@ CREATE TABLE IF NOT EXISTS media_captures(
 CREATE INDEX IF NOT EXISTS media_captures_state_idx ON media_captures(state,download_attempts,timestamp);
 CREATE INDEX IF NOT EXISTS media_captures_url_idx ON media_captures(original_url,timestamp);
 CREATE INDEX IF NOT EXISTS media_captures_signature_idx ON media_captures(query_signature,state,download_attempts,id);
-CREATE INDEX IF NOT EXISTS media_captures_download_length_idx ON media_captures(query_signature,state,download_attempts,length,id);
+CREATE INDEX IF NOT EXISTS media_captures_download_length_idx ON media_captures(query_signature,state,length,id,download_attempts);
 CREATE TABLE IF NOT EXISTS media_index_state(
     target_id INTEGER NOT NULL,
     extension TEXT NOT NULL,
@@ -876,6 +883,19 @@ def migrate_v11_to_v12(database: sqlite3.Connection) -> None:
     database.execute("UPDATE schema_info SET version=12")
 
 
+def migrate_v12_to_v13(database: sqlite3.Connection) -> None:
+    add_column_if_missing(database, "quick_search_coverage", "content_fingerprint TEXT NOT NULL DEFAULT ''")
+    database.executescript(BASE_SCHEMA_SQL)
+    database.execute("UPDATE schema_info SET version=13")
+
+
+def _ensure_index(database: sqlite3.Connection, name: str, table: str, columns: tuple[str, ...]) -> None:
+    existing = tuple(row[2] for row in database.execute(f"PRAGMA index_info({name})"))
+    if existing and existing != columns:
+        database.execute(f"DROP INDEX {name}")
+    database.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({','.join(columns)})")
+
+
 def initialize_schema(database: sqlite3.Connection) -> None:
     database.execute("PRAGMA foreign_keys=ON")
     has_schema = database.execute(
@@ -944,12 +964,16 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v10_to_v11(database)
         elif version == 11:
             migrate_v11_to_v12(database)
+        elif version == 12:
+            migrate_v12_to_v13(database)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
         else:
             database.executescript(BASE_SCHEMA_SQL)
     if int(database.execute("SELECT version FROM schema_info LIMIT 1").fetchone()[0]) == 11:
         migrate_v11_to_v12(database)
+    if int(database.execute("SELECT version FROM schema_info LIMIT 1").fetchone()[0]) == 12:
+        migrate_v12_to_v13(database)
     database.executescript("""
 CREATE TRIGGER IF NOT EXISTS captures_body_revision_update
 AFTER UPDATE OF local_path,content_hash,bytes_saved,payload_availability,detected_encoding,mimetype,resource_class ON captures
@@ -973,11 +997,10 @@ END;
         "CREATE INDEX IF NOT EXISTS captures_acquisition_order_idx "
         "ON captures(query_signature,state,length,id,download_attempts)"
     )
-    database.execute("DROP INDEX IF EXISTS captures_classification_idx")
-    database.execute(
-        "CREATE INDEX IF NOT EXISTS captures_classification_idx "
-        "ON captures(query_signature,id,resource_classifier_revision)"
-    )
+    _ensure_index(database, "captures_classification_idx", "captures",
+                  ("query_signature", "id", "resource_classifier_revision"))
+    _ensure_index(database, "media_captures_download_length_idx", "media_captures",
+                  ("query_signature", "state", "length", "id", "download_attempts"))
     database.execute(
         "CREATE INDEX IF NOT EXISTS captures_payload_idx "
         "ON captures(payload_availability,state,id)"
@@ -992,6 +1015,8 @@ END;
         recreate_fts = bool(fts_sql and "content=''" not in str(fts_sql[0] or ""))
         if recreate_fts:
             database.execute("DROP TABLE documents_fts")
+            database.execute("DELETE FROM document_fts_versions")
+            database.execute("DELETE FROM project_meta WHERE key='fts_current_mapping'")
         database.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(title,body_text,original_url,content='')"
         )
@@ -1011,5 +1036,11 @@ END;
                 "INSERT INTO documents_fts(rowid,title,body_text,original_url) VALUES(?,?,?,?)",
                 ((int(row[0]), str(row[1] or ''), str(row[2] or ''), str(row[3] or row[4] or '')) for row in rows),
             )
+        if not database.execute("SELECT 1 FROM project_meta WHERE key='fts_current_mapping'").fetchone():
+            # Preserve the previous index and all evidence during migration.
+            # Later replacements allocate fresh token IDs; repair/compact can
+            # explicitly rebuild pre-existing stale postings from local bodies.
+            database.execute("INSERT OR IGNORE INTO document_fts_versions(fts_rowid,document_id) SELECT id,id FROM documents")
+            database.execute("INSERT INTO project_meta(key,value) VALUES('fts_current_mapping','1')")
     except Exception:
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('fts5','0')")

@@ -11,6 +11,7 @@ from ..classification import RESOURCE_CLASSIFIER_REVISION, classify_indexed_reso
 from ..document_store import compress_text, document_body
 from ..scanning.keywords import keyword_rules_to_lines, parse_keyword_rules, serialize_keyword_rules
 from ..utils import utc_now
+from .full_text_index import replace_document_index
 
 
 def get_or_create_target(database: sqlite3.Connection, pattern: str, settings: dict | None = None) -> int:
@@ -270,26 +271,7 @@ def _fts_replace_document(
 ) -> None:
     if not _fts_enabled(database):
         return
-    # External-content FTS stores only the inverted index.  Deleting an indexed
-    # row requires the old token stream, so recover it from the compact body
-    # cache when an existing document changes.
-    if old_row is not None:
-        old_title = str(old_row["title"] or "")
-        old_original = str(old_row["original_url"] or original_url)
-        old_body = document_body(old_row)
-        try:
-            database.execute(
-                "INSERT INTO documents_fts(documents_fts,rowid,title,body_text,original_url) VALUES('delete',?,?,?,?)",
-                (document_id, old_title, old_body, old_original),
-            )
-        except sqlite3.OperationalError:
-            # Older SQLite builds may not support the delete command on the
-            # exact external-content shape. Rebuild-on-repair remains safe.
-            pass
-    database.execute(
-        "INSERT INTO documents_fts(rowid,title,body_text,original_url) VALUES(?,?,?,?)",
-        (document_id, title, body_text, original_url),
-    )
+    replace_document_index(database, document_id, title, body_text, original_url)
 
 
 def upsert_document(
@@ -328,6 +310,7 @@ def upsert_document(
             (
                 str(row["path"] or "") != str(path),
                 str(row["title"] or "") != title,
+                str(row["original_url"] or "") != original,
                 str(row["links_json"] or "") != links_json,
                 str(row["content_hash"] or "") != content_hash,
                 str(row["normalized_hash"] or "") != normalized_hash,
@@ -360,22 +343,15 @@ def upsert_document(
         (document_id, str(path), content_hash, size_bytes, now, capture_id,
          document_id, str(path), content_hash, int(size_bytes)),
     )
-    if document_changed and index_full_text:
-        _fts_replace_document(database, document_id, title, body_text, original, row)
-    elif not index_full_text and _fts_enabled(database):
-        # Discard-after-scan keeps report evidence but must not quietly retain a
-        # second full-body corpus in FTS after the canonical payload is deleted.
-        old_row = row
-        if old_row is not None:
-            try:
-                database.execute(
-                    "INSERT INTO documents_fts(documents_fts,rowid,title,body_text,original_url) "
-                    "VALUES('delete',?,?,?,?)",
-                    (document_id, str(old_row["title"] or ""), document_body(old_row),
-                     str(old_row["original_url"] or original)),
-                )
-            except sqlite3.OperationalError:
-                pass
+    if index_full_text and _fts_enabled(database):
+        if document_changed or not database.execute(
+            "SELECT 1 FROM document_fts_versions WHERE document_id=?", (document_id,)
+        ).fetchone():
+            _fts_replace_document(database, document_id, title, body_text, original, row)
+    elif not index_full_text:
+        # No current mapping means no body hits, including after a prior retained
+        # scan. Explicit compaction also removes superseded token postings.
+        database.execute("DELETE FROM document_fts_versions WHERE document_id=?", (document_id,))
     return document_id
 
 def save_match(
@@ -719,7 +695,7 @@ def _result_filters(
         clauses.append("COALESCE(r.status,'unreviewed')=?")
         params.append(review_status)
     if search.strip():
-        clauses.append("(LOWER(c.original_url) LIKE ? OR LOWER(d.title) LIKE ? OR d.id IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?))")
+        clauses.append("(LOWER(c.original_url) LIKE ? OR LOWER(d.title) LIKE ? OR d.id IN (SELECT v.document_id FROM documents_fts JOIN document_fts_versions v ON v.fts_rowid=documents_fts.rowid WHERE documents_fts MATCH ?))")
         value = "%" + search.casefold() + "%"
         phrase = '"' + search.replace('"', '""') + '"'
         params.extend([value, value, phrase])

@@ -27,7 +27,7 @@ class V6ToV7MigrationTests(unittest.TestCase):
             database.close()
 
             modern = open_database(root)
-            self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 12)
+            self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 13)
             for table in (
                 "research_vectors", "research_vector_bands", "research_entities", "research_document_entities",
                 "research_edges", "research_queries", "research_query_results", "research_ai_runs", "research_ai_claims",

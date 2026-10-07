@@ -108,10 +108,10 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str) 
         finish_scan_run(database, job.scan_run_id, status)
 
 
-def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob]) -> dict[str, Path]:
+def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob], callback=None) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for index, job in enumerate(jobs, 1):
-        generated = generate_reports(config, database, job.scan_run_id)
+        generated = generate_reports(config, database, job.scan_run_id, **({"progress_callback": callback} if config.dashboard_eta_enabled else {}))
         if index == 1:
             paths.update(generated)
         paths[f"scan_{job.scan_run_id}_folder"] = generated["scan_folder"]
@@ -290,7 +290,9 @@ def run_project(
 
     def operation_callback(event: ProgressEvent) -> None:
         nonlocal last_progress_write, last_progress_stage
-        if threading.get_ident() == owner_thread_id:
+        if config.dashboard_eta_enabled:
+            event.detail = {**(event.detail or {}), "operation_run_id": operation_run_id}
+        if threading.get_ident() == owner_thread_id and event.stage not in {"backup_copy", "backup_compress", "full_text_rebuild"}:
             now = time.monotonic()
             completed_boundary = (
                 event.current is not None
@@ -402,8 +404,9 @@ def run_project(
                 emit(callback, ProgressEvent("network", f"Automatic archive recovery cycle {cycle:,}: resuming {stage}."))
 
     def _index_reports(*, complete: bool = True) -> dict[str, Path]:
-        paths = (generate_index_reports(config, database) if complete
-                 else generate_index_reports(config, database, index_complete=False))
+        progress = {"progress_callback": original_callback} if config.dashboard_eta_enabled else {}
+        paths = (generate_index_reports(config, database, **progress) if complete
+                 else generate_index_reports(config, database, index_complete=False, **progress))
         detail = {
             "report_files": [str(path) for path in paths.values()],
             "index_complete": complete,
@@ -455,7 +458,8 @@ def run_project(
                 "saved service cooldown",
             )
         if mode == "backup":
-            path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep, max_mb=config.backup_max_mb)
+            path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep, max_mb=config.backup_max_mb,
+                                         **({"callback": original_callback} if config.dashboard_eta_enabled else {}))
             emit(callback, ProgressEvent("backup", f"Backup written to {path}"))
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
@@ -642,7 +646,7 @@ def run_project(
                 else:
                     raise RuntimeError("this project does not contain indexed captures or a completed scan run")
             else:
-                paths = generate_reports(config, database, existing)
+                paths = generate_reports(config, database, existing, **({"progress_callback": callback} if config.dashboard_eta_enabled else {}))
             if paths:
                 emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
             finish_operation_run(database, operation_run_id, "complete", "Reports regenerated")
@@ -756,7 +760,7 @@ def run_project(
         if jobs:
             finish_jobs(database, jobs, "interrupted" if scan_incomplete else "complete")
             database.commit()
-            paths = generate_job_reports(config, database, jobs)
+            paths = generate_job_reports(config, database, jobs, **({"callback": callback} if config.dashboard_eta_enabled else {}))
         else:
             paths = {}
             existing = latest_scan_run(database)

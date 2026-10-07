@@ -79,7 +79,7 @@ def _candidate_ids(database: sqlite3.Connection, query: str, query_vector: tuple
         if fts:
             try:
                 rows = database.execute(
-                    "SELECT rowid,bm25(documents_fts) AS rank FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?",
+                    "SELECT v.document_id,bm25(documents_fts) AS rank FROM documents_fts JOIN document_fts_versions v ON v.fts_rowid=documents_fts.rowid WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?",
                     (fts, max(100, min(limit, 10000))),
                 ).fetchall()
                 for rank_index, row in enumerate(rows):

@@ -67,7 +67,7 @@ class V9ToV10MigrationTests(unittest.TestCase):
 
             modern = open_database(root)
             try:
-                self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 12)
+                self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 13)
                 row = modern.execute(
                     "SELECT resource_class,payload_availability,cleanup_pending,document_id FROM captures WHERE id=?",
                     (capture_id,),

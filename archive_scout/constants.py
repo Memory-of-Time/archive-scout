@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-VERSION = "1.0.7"
-SCHEMA_VERSION = 12
+VERSION = "1.0.8"
+SCHEMA_VERSION = 13
 
 # Shared September 2026 Wayback operating profile. These values describe
 # actual request-start ceilings, not completed-job throughput.

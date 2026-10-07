@@ -1,14 +1,22 @@
 # Archive Scout
 
-**Archive Scout 1.0.7** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **12**.
+**Archive Scout 1.0.8** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.7/ArchiveScout-macOS-Universal.zip)
+The v1.0.8 patch contains replacement source files for the supplied v1.0.7 tree. See [apply instructions](APPLY_PATCH.md). It can be run from source on Python 3.11+. Tagged releases are built by the existing cross-platform GitHub Actions workflow; installer downloads become available after that release workflow succeeds.
 
-The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
+## 1.0.8 highlights
+
+- Retained scans and rescans use small, bounded write batches. Cancellation and failed writes leave durable work available to resume; discard-after-scan keeps its existing commit-before-delete protocol.
+- Literal prefilters share identical native matchers. Database mapping is limited to 64 MiB, matching classification indexes are reused on reopen, and media paging follows the indexed key order.
+- Full-text searches use only the current document token version. Replacements no longer depend on rereading an overwritten payload. Repair and Compact reclaim superseded postings.
+- Hitlist resume verifies the bytes behind its checkpoint, including external edits with unchanged file size and modification time. Existing capture limits, results and human review data are preserved.
+- Acquisition-only retry selection stays in SQLite and works beyond the database's bound-variable limit.
+- Dashboard **Show estimated time remaining** is optional and off by default. It uses measured completed work for the current phase; unknown totals show **Estimating**. Known recovery waits are included once.
+- Schema 12 projects are backed up before migration to schema 13. The existing report output and field settings remain authoritative, including indexed-URL inventory after an index-only run.
+
+See [v1.0.8 release notes](docs/RELEASE_1_0_8.md) for measured results, limits and migration details.
 
 ## 1.0.7 highlights
 
@@ -31,7 +39,7 @@ The following improvements from 1.0.5 remain included:
 - Hitlist resumes preserve unchanged results and revisit bodies that arrived or changed after a checkpoint. Schema **12** adds small coverage records and body revisions; it does not duplicate capture contents.
 - Whole project operations and database restores use a crash-released OS lock. GUI restore runs in the background after existing view reads finish.
 
-The current CDX strategies, request-rate settings, text/media byte classifier and deterministic scanner are preserved. v1.0.7 removes redundant recovery waits and extends worker-yielding retries to media. See [release notes](docs/RELEASE_1_0_7.md).
+The current CDX strategies, request-rate settings, text/media byte classifier and deterministic rule semantics are preserved. The connection recovery improvements from v1.0.7 remain included. See [v1.0.7 release notes](docs/RELEASE_1_0_7.md).
 
 The source still recognizes serialized project identifiers from pre-release development builds so existing project folders can be migrated safely. Those compatibility identifiers are not separate public releases.
 

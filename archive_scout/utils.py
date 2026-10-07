@@ -39,7 +39,7 @@ def utc_now() -> str:
 
 
 def clean_space(value: str) -> str:
-    return SPACE_PATTERN.sub(" ", value or "").strip()
+    return " ".join((value or "").split())
 
 
 def normalize_search(value: str) -> str:

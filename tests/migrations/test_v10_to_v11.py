@@ -62,7 +62,7 @@ class V10ToV11MigrationTests(unittest.TestCase):
 
             modern = open_database(root)
             try:
-                self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 12)
+                self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 13)
                 retained = modern.execute(
                     "SELECT urlkey,payload_origin,payload_retention,local_path FROM captures WHERE id=?",
                     (retained_id,),

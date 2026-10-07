@@ -104,6 +104,7 @@ def cluster_duplicates(database: sqlite3.Connection, threshold: float = 0.90) ->
     # Body text can dominate project memory. Compute each SimHash while its row
     # is current and retain only the 64-bit result and compact bucket IDs.
     hashes: dict[int, int] = {}
+    simhash_representatives: dict[int, int] = {}
     buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
     for row in database.execute(
         "SELECT * FROM documents ORDER BY id"
@@ -111,6 +112,12 @@ def cluster_duplicates(database: sqlite3.Connection, threshold: float = 0.90) ->
         document_id = int(row["id"])
         value = simhash64(document_body(row))
         hashes[document_id] = value
+        representative = simhash_representatives.get(value)
+        if representative is not None:
+            union.union(representative, document_id)
+            method_for_pair.setdefault((representative, document_id), ("near", 1.0))
+            continue
+        simhash_representatives[value] = document_id
         for band in range(4):
             buckets[(band, (value >> (band * 16)) & 0xFFFF)].append(document_id)
 

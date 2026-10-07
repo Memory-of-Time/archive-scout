@@ -287,7 +287,9 @@ def compile_prefilter(patterns: list[CompiledRule]) -> KeywordPrefilter:
             sorted(set(positive_literals), key=lambda value: (-len(value), value))
         )
     candidate_automaton = None
-    if all_literals:
+    if set(all_literals) == set(positive_literals):
+        candidate_automaton = positive_automaton
+    elif all_literals:
         candidate_automaton = LiteralAutomaton(
             sorted(set(all_literals), key=lambda value: (-len(value), value))
         )

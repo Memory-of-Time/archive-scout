@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.8
+
+- Bound retained-scan/rescan write batches by count, memory and elapsed time; commit before progress and flush received work on cancellation. Preserve discard-after-scan durability.
+- Share identical literal automatons, reduce SQLite mapping to 64 MiB, reuse matching classification indexes and align media keysets with the acquisition index.
+- Replace contentless FTS updates with transactionally versioned current postings; use the same portable rebuild in Repair, Compact and Merge.
+- Verify actual saved bytes and content identity during Hitlist resume, including external same-size/same-mtime edits, and reconcile changed coverage without expanding the saved corpus boundary.
+- Select acquisition-only error retries through SQLite temporary tables instead of giant bound-variable lists.
+- Collapse repeated equal SimHash comparisons while retaining cluster membership and transitive near groups.
+- Add optional, bounded Dashboard estimated time remaining for measured current phases, including known network waits, backup, report and FTS-rebuild progress. Keep it disabled by default and tag AI worker events with their project identity.
+- Migrate to schema 13 with a pre-migration backup; preserve capture files, notes, reviews, scores and existing report settings.
+- Add release/workflow-placement verification and an integrity-checked replacement-file apply helper. No new runtime dependencies or higher request ceilings.
+
 ## 1.0.6
 
 - Requalify pooled Python transports after temporary fallback, one real request at a time. Late curl completions cannot demote a recovered primary.

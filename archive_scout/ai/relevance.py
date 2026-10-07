@@ -93,7 +93,8 @@ def _fts_match_ids(database: sqlite3.Connection, scan_run_id: int, prompt: str, 
                 """
                 SELECT m.id
                 FROM documents_fts f
-                JOIN document_matches m ON m.document_id=f.rowid
+                JOIN document_fts_versions v ON v.fts_rowid=f.rowid
+                JOIN document_matches m ON m.document_id=v.document_id
                 WHERE documents_fts MATCH ? AND m.scan_run_id=? AND m.excluded=0 AND m.required_missing=0
                 ORDER BY bm25(documents_fts),m.score DESC,m.id
                 LIMIT ?

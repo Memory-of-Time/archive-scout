@@ -113,7 +113,7 @@ def database_version(path: Path) -> int | None:
 
 
 def is_modern_database(path: Path) -> bool:
-    return database_version(path) in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION}
+    return database_version(path) in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, SCHEMA_VERSION}
 
 
 def open_database_readonly(root: Path, *, timeout: float = 0.5) -> sqlite3.Connection:
@@ -158,11 +158,11 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
     version = database_version(path) if path.exists() else None
     if version is not None and version > SCHEMA_VERSION:
         raise RuntimeError(f"Project schema {version} is newer than supported schema {SCHEMA_VERSION}; update Archive Scout before opening it")
-    if migrate and path.exists() and version not in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION}:
+    if migrate and path.exists() and version not in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, SCHEMA_VERSION}:
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
         version = database_version(path)
-    if migrate and version in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
+    if migrate and version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
         try:
             from ..projects.backups import create_project_backup
             create_project_backup(root, reason=f"before_schema_{SCHEMA_VERSION}", keep=5)
@@ -176,7 +176,9 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         database.execute("PRAGMA foreign_keys=ON")
         database.execute("PRAGMA temp_store=MEMORY")
         database.execute("PRAGMA cache_size=-65536")
-        database.execute("PRAGMA mmap_size=268435456")
+        # Bound mapped working sets on long runs while retaining the 64 MiB page
+        # cache that protects write-heavy scans from unnecessary disk churn.
+        database.execute("PRAGMA mmap_size=67108864")
         database.execute("PRAGMA wal_autocheckpoint=10000")
         database.execute("PRAGMA journal_size_limit=67108864")
         database.execute("PRAGMA busy_timeout=60000")

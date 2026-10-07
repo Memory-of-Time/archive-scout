@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+from ..database.full_text_index import rebuild_document_index
 from ..document_store import compress_text, document_body
 from ..events import ProgressEvent, Stopped
 from ..storage import deduplicate_exact_file, sha256_file
@@ -138,22 +139,9 @@ def compact_project_storage(
             )]
             dedupe_saved += _dedupe_group(paths)
 
-    # Rebuild the lean external-content FTS index from canonical compressed text.
-    fts = database.execute("SELECT value FROM project_meta WHERE key='fts5'").fetchone()
-    if fts and fts['value'] == '1':
-        database.execute("DROP TABLE IF EXISTS documents_fts")
-        database.execute(
-            "CREATE VIRTUAL TABLE documents_fts USING fts5(title,body_text,original_url,content='documents',content_rowid='id')"
-        )
-        for row in database.execute(
-            """SELECT d.*,c.original_url AS capture_original_url FROM documents d JOIN captures c ON c.id=d.capture_id ORDER BY d.id"""
-        ):
-            body = document_body(row)
-            database.execute(
-                "INSERT INTO documents_fts(rowid,title,body_text,original_url) VALUES(?,?,?,?)",
-                (int(row['id']), str(row['title'] or ''), body, str(row['capture_original_url'] or '')),
-            )
-        database.commit()
+    # Reclaim superseded token versions without storing a second body corpus.
+    rebuild_document_index(database, callback=callback)
+    database.commit()
 
     database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     database.commit()

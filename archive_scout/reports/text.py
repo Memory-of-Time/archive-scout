@@ -4,9 +4,12 @@ import json
 import os
 import shutil
 import sqlite3
+import time
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Callable
+
+from ..events import ProgressEvent
 
 from ..config import ProjectConfig
 from ..classification import capture_body_coverage, capture_routing_decision
@@ -114,14 +117,33 @@ def _summary_lines(values: dict[str, str], fields: list[str]) -> Iterator[str]:
             yield value
 
 
-def _indexed_url_lines(database: sqlite3.Connection, fields: list[str]) -> Iterator[str]:
+def _progress_rows(rows, callback, total: int, stage: str):
+    if callback is None:
+        yield from rows
+        return
+    callback(ProgressEvent(stage, "Writing report rows", 0, total))
+    last_emit = time.monotonic()
+    current = 0
+    for current, row in enumerate(rows, 1):
+        yield row
+        now = time.monotonic()
+        if current >= total or now - last_emit >= 0.5:
+            callback(ProgressEvent(stage, "Writing report rows", current, total))
+            last_emit = now
+    if current == 0:
+        callback(ProgressEvent(stage, "Report contains no rows", 0, 0))
+
+
+def _indexed_url_lines(database: sqlite3.Connection, fields: list[str], progress_callback=None) -> Iterator[str]:
     if not fields:
         return
-    for row in database.execute(
+    rows = database.execute(
         """SELECT timestamp,mimetype,resource_class,classification_reason,state,skip_reason,
                   payload_availability,original_url
            FROM captures ORDER BY original_url,timestamp"""
-    ):
+    )
+    total = int(database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]) if progress_callback else 0
+    for row in _progress_rows(rows, progress_callback, total, "report_index"):
         yield _tab_line(
             {
                 "timestamp": row["timestamp"],
@@ -186,6 +208,7 @@ def generate_index_reports(
     database: sqlite3.Connection,
     *,
     index_complete: bool = True,
+    progress_callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     """Write the user-selected reports for a CDX-only project."""
     report = config.report.normalized()
@@ -200,7 +223,7 @@ def generate_index_reports(
         path = _write_report(
             root_reports,
             "all_indexed_urls",
-            _indexed_url_lines(database, report.fields_for("all_indexed_urls")),
+            _indexed_url_lines(database, report.fields_for("all_indexed_urls"), progress_callback),
         )
         paths["all_indexed_urls"] = path
     else:
@@ -255,6 +278,7 @@ def generate_reports(
     config: ProjectConfig,
     database: sqlite3.Connection,
     scan_run_id: int,
+    *, progress_callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     report = config.report.normalized()
     run = database.execute(
@@ -307,7 +331,7 @@ def generate_reports(
     ranked_fields = report.fields_for("matches_ranked")
 
     def consume_match_rows(write_ranked: bool) -> Iterator[str]:
-        for rank, row in enumerate(database.execute(ranked_query, selection), 1):
+        for rank, row in enumerate(_progress_rows(database.execute(ranked_query, selection), progress_callback, match_count, "report_matches"), 1):
             hits = json_value(row["hits_json"], {}) if (need_keyword_counts or "keyword_hits" in ranked_fields) else {}
             fields = json_value(row["fields_json"], {}) if "keyword_hits" in ranked_fields else {}
             snippets = json_value(row["snippets_json"], []) if "snippets" in ranked_fields else []
@@ -378,7 +402,7 @@ def generate_reports(
             if not fields:
                 return
             seen: set[str] = set()
-            for row in database.execute(url_query, selection):
+            for row in _progress_rows(database.execute(url_query, selection), progress_callback, match_count, "report_urls"):
                 value = str(row["original_url"])
                 if value not in seen:
                     seen.add(value)
@@ -396,7 +420,7 @@ def generate_reports(
             if not fields:
                 return
             seen: set[str] = set()
-            for row in database.execute(url_query, selection):
+            for row in _progress_rows(database.execute(url_query, selection), progress_callback, match_count, "report_urls"):
                 value = replay_url(str(row["timestamp"]), str(row["original_url"]))
                 if value not in seen:
                     seen.add(value)
@@ -447,7 +471,7 @@ def generate_reports(
         path = _write_report(
             root_reports,
             "all_indexed_urls",
-            _indexed_url_lines(database, report.fields_for("all_indexed_urls")),
+            _indexed_url_lines(database, report.fields_for("all_indexed_urls"), progress_callback),
             run_dir=run_dir,
         )
         paths["all_indexed_urls"] = path

@@ -48,6 +48,7 @@ from .recovery import wait_for_archive
 from ..parsing.embeds import extract_embed_candidates_fast
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..scanning.jobs import ScanJob
+from ..scanning.batches import BoundedResultWriter
 from ..scanning.keywords import compile_prefilter
 from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..storage import capture_path as url_capture_path, sha256_file
@@ -770,7 +771,8 @@ def _scan_saved_capture(
         content_type += "; charset=" + str(row["detected_encoding"])
     if not looks_textual_bytes(data[:16384], content_type):
         return {"kind": "non_text", "capture_id": int(row["id"]), "path": path}
-    content_hash = str(row.get("content_hash") or "") or hashlib.sha256(data).hexdigest()
+    content_hash = hashlib.sha256(data).hexdigest()
+    bytes_saved = len(data)
     raw, encoding = decode_bytes_with_encoding(data, content_type)
     # The decoded source is the canonical scan input from this point onward.
     # Releasing the byte buffer before DOM/normalization work avoids keeping
@@ -807,7 +809,7 @@ def _scan_saved_capture(
         "title": title, "visible": visible, "links": links,
         "analyses": analyses, "content_hash": content_hash,
         "normalized_hash": hash_text(prepared_normalized_fields["body"]),
-        "bytes_saved": path.stat().st_size, "encoding": encoding,
+        "bytes_saved": bytes_saved, "encoding": encoding,
         "embedded_candidates": embedded_candidates,
     }
 
@@ -1937,17 +1939,20 @@ def _scan_pending_captures(
     submitted = scanned = matched = skipped = failures = 0
     started = time.monotonic()
     last_emit = 0.0
+    last_emitted_completed = 0
 
     def emit_progress(force: bool = False) -> None:
-        nonlocal last_emit
+        nonlocal last_emit, last_emitted_completed
         if not callback:
             return
         now = time.monotonic()
-        if not force and now - last_emit < 0.5:
+        settled = scanned + skipped + failures
+        first_completion = settled > 0 and last_emitted_completed == 0
+        if not force and not first_completion and now - last_emit < 0.5:
             return
         last_emit = now
+        last_emitted_completed = settled
         elapsed = max(0.001, now - started)
-        settled = scanned + skipped + failures
         callback(ProgressEvent(
             "scan",
             f"Scanning saved captures: {settled:,}/{total:,}; scanned {scanned:,} ({scanned/elapsed:.1f}/s); "
@@ -1963,6 +1968,54 @@ def _scan_pending_captures(
                 "scan_workers": scan_workers,
             },
         ))
+
+    def persist_results(results: list[tuple[dict[str, object], dict | BaseException]]) -> None:
+        nonlocal scanned, matched, skipped, failures
+        batch_scanned = batch_matched = batch_skipped = batch_failures = 0
+        successful: list[dict] = []
+        with database:
+            for item, outcome in results:
+                capture_id = int(item["id"])
+                if isinstance(outcome, BaseException):
+                    batch_failures += 1
+                    record_error(
+                        database, "scan", "scan_failure", repr(outcome),
+                        capture_id=capture_id, retryable=True,
+                    )
+                    database.execute(
+                        "UPDATE captures SET state='downloaded_unscanned',updated_at=? WHERE id=?",
+                        (utc_now(), capture_id),
+                    )
+                    continue
+                if outcome.get("kind") == "non_text":
+                    mark_capture_skipped(
+                        database, capture_id, "sniffed_non_text", CLASSIFIER_REVISION
+                    )
+                    batch_skipped += 1
+                    continue
+                if not discard_mode:
+                    document_id = save_success(database, outcome, config.report, retain_payload=True)
+                    _persist_embedded_candidates(database, config, document_id, outcome)
+                else:
+                    successful.append(outcome)
+                batch_scanned += 1
+                batch_matched += int(any(
+                    int(analysis.get("score") or 0) >= config.minimum_score
+                    and not analysis.get("excluded") and not analysis.get("required_missing")
+                    for analysis in outcome["analyses"].values()
+                ))
+        if discard_mode and successful:
+            cleanup = _commit_discard_evidence(database, config, successful)
+            _finish_discard_cleanup(database, config, cleanup)
+
+        scanned += batch_scanned
+        matched += batch_matched
+        skipped += batch_skipped
+        failures += batch_failures
+
+    # Destructive discard evidence still follows the separate FULL commit and
+    # cleanup protocol. Only retained results use this small batching buffer.
+    writer = None if discard_mode else BoundedResultWriter(persist_results)
 
     try:
         with concurrent.futures.ThreadPoolExecutor(
@@ -1995,6 +2048,8 @@ def _scan_pending_captures(
 
                 if not futures:
                     if exhausted:
+                        if writer is not None:
+                            writer.flush()
                         break
                     continue
 
@@ -2003,6 +2058,8 @@ def _scan_pending_captures(
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 if not done:
+                    if writer is not None:
+                        writer.flush_if_due()
                     emit_progress()
                     continue
 
@@ -2012,43 +2069,15 @@ def _scan_pending_captures(
                     try:
                         results.append((item, future.result()))
                     except Exception as exc:
-                        results.append((item, exc))
+                        results.append((item, RuntimeError(str(exc))))
 
-                successful: list[dict] = []
-                with database:
-                    for item, outcome in results:
-                        capture_id = int(item["id"])
-                        if isinstance(outcome, BaseException):
-                            failures += 1
-                            record_error(
-                                database, "scan", "scan_failure", repr(outcome),
-                                capture_id=capture_id, retryable=True,
-                            )
-                            database.execute(
-                                "UPDATE captures SET state='downloaded_unscanned',updated_at=? WHERE id=?",
-                                (utc_now(), capture_id),
-                            )
-                            continue
-                        if outcome.get("kind") == "non_text":
-                            mark_capture_skipped(
-                                database, capture_id, "sniffed_non_text", CLASSIFIER_REVISION
-                            )
-                            skipped += 1
-                            continue
-                        if not discard_mode:
-                            document_id = save_success(database, outcome, config.report, retain_payload=True)
-                            _persist_embedded_candidates(database, config, document_id, outcome)
-                        else:
-                            successful.append(outcome)
-                        scanned += 1
-                        matched += int(any(
-                            int(analysis.get("score") or 0) >= config.minimum_score
-                            and not analysis.get("excluded") and not analysis.get("required_missing")
-                            for analysis in outcome["analyses"].values()
-                        ))
-                if discard_mode and successful:
-                    cleanup = _commit_discard_evidence(database, config, successful)
-                    _finish_discard_cleanup(database, config, cleanup)
+                if writer is None:
+                    persist_results(results)
+                else:
+                    for result in results:
+                        writer.add(result)
+                if writer is not None:
+                    writer.flush_if_due()
                 emit_progress()
 
         emit_progress(force=True)
@@ -2061,6 +2090,8 @@ def _scan_pending_captures(
             "elapsed": time.monotonic() - started,
         }
     except Stopped:
+        if writer is not None:
+            writer.flush()
         for future in futures:
             future.cancel()
         with database:

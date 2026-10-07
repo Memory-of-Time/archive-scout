@@ -57,14 +57,14 @@ def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> 
     now = utc_now()
     if row:
         run_id = int(row["id"])
-        if int(row["coverage_version"] or 0) != 1:
-            # One safe recheck for pre-v1.0.5 checkpoints that had no revision
-            # coverage. Subsequent resumes preserve unchanged results/cursors.
+        if int(row["coverage_version"] or 0) != 2:
+            # Older checkpoints did not prove the identity of on-disk bytes.
+            # Recheck them once, preserving an existing corpus boundary.
             database.execute("DELETE FROM quick_search_hits WHERE run_id=?", (run_id,))
             database.execute("DELETE FROM quick_search_coverage WHERE run_id=?", (run_id,))
             database.execute("""UPDATE quick_search_runs SET status='running',last_capture_id=0,indexed_checked=0,
                 local_checked=0,unavailable_count=0,discarded_count=0,missing_count=0,non_text_count=0,
-                incomplete_count=0,match_count=0,coverage_version=1,capture_limit=(SELECT COALESCE(MAX(id),0) FROM captures),updated_at=? WHERE id=?""", (now,run_id))
+                incomplete_count=0,match_count=0,capture_limit=CASE WHEN coverage_version>0 THEN capture_limit ELSE (SELECT COALESCE(MAX(id),0) FROM captures) END,coverage_version=2,updated_at=? WHERE id=?""", (now,run_id))
             return run_id,0,0
         database.execute(
             "UPDATE quick_search_runs SET status='running',updated_at=? WHERE id=?", (now, run_id)
@@ -72,10 +72,90 @@ def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> 
         return run_id, int(row["last_capture_id"] or 0), int(row["match_count"] or 0)
     cursor = database.execute(
         """INSERT INTO quick_search_runs(fingerprint,keywords_json,status,started_at,updated_at,coverage_version,capture_limit)
-           VALUES(?,?,'running',?,?,1,(SELECT COALESCE(MAX(id),0) FROM captures))""",
+           VALUES(?,?,'running',?,?,2,(SELECT COALESCE(MAX(id),0) FROM captures))""",
         (fingerprint, json.dumps(keywords, ensure_ascii=False), now, now),
     )
     return int(cursor.lastrowid), 0, 0
+
+
+def _payload_source(row: sqlite3.Row, root: Path) -> tuple[Path | None, str]:
+    local = str(row["local_path"] or row["document_path"] or "")
+    path = Path(local) if local else None
+    availability = str(row["payload_availability"] or "not_acquired")
+    if availability == "discarded":
+        return path, "discarded"
+    if availability == "partial":
+        return path, "partial"
+    if str(row["resource_class"] or "unknown") in {"image", "video", "audio", "other_binary"}:
+        return path, "non_text"
+    try:
+        if path and path.resolve().is_relative_to(root) and path.is_file():
+            return path, ""
+    except OSError:
+        pass
+    return path, "missing"
+
+
+def _coverage_fingerprint(row: sqlite3.Row, body_identity: str) -> str:
+    metadata = [str(row[name] or "") for name in (
+        "original_url", "timestamp", "local_path", "document_path", "mimetype",
+        "detected_encoding", "resource_class", "payload_availability",
+    )]
+    metadata.append(body_identity)
+    return hashlib.sha256(json.dumps(metadata, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _verify_covered_prefix(database: sqlite3.Connection, run_id: int, last_id: int,
+                           root: Path, stop_event: threading.Event,
+                           callback: Callable[[ProgressEvent], None] | None,
+                           batch_size: int) -> None:
+    """Verify exact bytes once per resume; size/mtime are insufficient evidence.
+
+    Hash streams are bounded to 1 MiB. Scoring/parsing only repeat for changed
+    coverage, and no new captures are added to the saved corpus boundary.
+    """
+    cursor_id = checked = 0
+    total = int(database.execute(
+        "SELECT COUNT(*) FROM quick_search_coverage WHERE run_id=? AND capture_id<=?", (run_id, last_id)
+    ).fetchone()[0])
+    while True:
+        if stop_event.is_set():
+            raise Stopped
+        rows = database.execute(
+            """SELECT c.*,d.path AS document_path,q.content_fingerprint
+               FROM quick_search_coverage q JOIN captures c ON c.id=q.capture_id
+               LEFT JOIN documents d ON d.id=c.document_id
+               WHERE q.run_id=? AND c.id>? AND c.id<=? ORDER BY c.id LIMIT ?""",
+            (run_id, cursor_id, last_id, max(1, int(batch_size))),
+        ).fetchall()
+        if not rows:
+            return
+        changed = []
+        for row in rows:
+            if stop_event.is_set():
+                raise Stopped
+            path, identity = _payload_source(row, root)
+            if not identity:
+                digest = hashlib.sha256()
+                try:
+                    with path.open("rb") as handle:
+                        while chunk := handle.read(1024 * 1024):
+                            if stop_event.is_set():
+                                raise Stopped
+                            digest.update(chunk)
+                    identity = digest.hexdigest()
+                except OSError:
+                    identity = "missing"
+            if _coverage_fingerprint(row, identity) != str(row["content_fingerprint"] or ""):
+                changed.append((run_id, int(row["id"])))
+        with database:
+            database.executemany(
+                "UPDATE quick_search_coverage SET body_revision=-1 WHERE run_id=? AND capture_id=?", changed
+            )
+        checked += len(rows)
+        cursor_id = int(rows[-1]["id"])
+        if callback:
+            callback(ProgressEvent("hitlist_verify", "Verifying saved Hitlist coverage", checked, total))
 
 
 def _needs_rendered_fallback(
@@ -142,6 +222,7 @@ def search_with_hitlist(
     *,
     batch_size: int = 250,
 ) -> dict[str, object]:
+    root = Path(root).resolve()
     keywords = _normalized_keywords(keywords)
     if not keywords:
         raise ValueError("Search with Hitlist requires at least one keyword")
@@ -155,6 +236,8 @@ def search_with_hitlist(
     discarded = missing = non_text = incomplete = 0
 
     try:
+        if last_id:
+            _verify_covered_prefix(database, run_id, last_id, root, stop_event, callback, batch_size)
         while True:
             if stop_event.is_set():
                 raise Stopped
@@ -218,27 +301,24 @@ def search_with_hitlist(
                     counts_by_pattern[pattern] += count
                     fields_by_pattern[pattern].add("url")
 
-                local = str(row["local_path"] or row["document_path"] or "")
-                path = Path(local) if local else None
-                availability = str(row["payload_availability"] or "not_acquired")
-                resource_class = str(row["resource_class"] or "unknown")
+                path, body_identity = _payload_source(row, root)
                 data = None
-                if availability == "discarded":
+                if body_identity == "discarded":
                     discarded += 1
-                elif availability == "partial":
+                elif body_identity == "partial":
                     incomplete += 1
-                elif resource_class in {"image", "video", "audio", "other_binary"}:
+                elif body_identity == "non_text":
                     non_text += 1
-                elif path:
-                    try:
-                        if path.resolve().is_relative_to(Path(root).resolve()) and path.is_file():
-                            data = path.read_bytes()
-                        else:
-                            missing += 1
-                    except OSError:
-                        missing += 1
-                else:
+                elif body_identity == "missing":
                     missing += 1
+                else:
+                    try:
+                        data = path.read_bytes()
+                        body_identity = hashlib.sha256(data).hexdigest()
+                    except OSError:
+                        body_identity = "missing"
+                        missing += 1
+                content_fingerprint = _coverage_fingerprint(row, body_identity)
                 content_type = str(row["mimetype"] or "")
                 if row["detected_encoding"]:
                     content_type += "; charset=" + str(row["detected_encoding"])
@@ -272,7 +352,7 @@ def search_with_hitlist(
 
                 after_counts = (local_checked,unavailable,discarded,missing,non_text,incomplete)
                 mask = sum((1 << index) for index,(before,after) in enumerate(zip(before_counts,after_counts)) if after>before)
-                coverage_rows.append((run_id,capture_id,int(row['body_revision']),mask))
+                coverage_rows.append((run_id,capture_id,int(row['body_revision']),mask,content_fingerprint))
                 for pattern, count in counts_by_pattern.items():
                     display = normalized_to_display.get(pattern, pattern)
                     hit_rows.append(
@@ -284,7 +364,7 @@ def search_with_hitlist(
             with database:
                 if revisiting:
                     database.execute(f"DELETE FROM quick_search_hits WHERE run_id=? AND capture_id IN ({marks})",(run_id,*ids))
-                database.executemany("INSERT OR REPLACE INTO quick_search_coverage(run_id,capture_id,body_revision,coverage_mask) VALUES(?,?,?,?)",coverage_rows)
+                database.executemany("INSERT OR REPLACE INTO quick_search_coverage(run_id,capture_id,body_revision,coverage_mask,content_fingerprint) VALUES(?,?,?,?,?)",coverage_rows)
                 if hit_rows:
                     database.executemany(
                         """INSERT INTO quick_search_hits(run_id,capture_id,keyword,fields,count)

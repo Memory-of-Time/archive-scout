@@ -10,6 +10,7 @@ from typing import Callable
 
 from ..database.connection import DATABASE_NAME
 from ..database.repositories import get_or_create_media_target, get_or_create_target, upsert_document
+from ..database.full_text_index import rebuild_document_index
 from ..document_store import decompress_text, document_body
 from ..events import ProgressEvent, Stopped
 from ..media.downloader import media_path
@@ -87,20 +88,7 @@ def _source_body(row: sqlite3.Row) -> str:
 
 
 def _rebuild_fts(database: sqlite3.Connection) -> None:
-    enabled = database.execute("SELECT value FROM project_meta WHERE key='fts5'").fetchone()
-    if not enabled or str(enabled["value"]) != "1":
-        return
-    database.execute("DROP TABLE IF EXISTS documents_fts")
-    database.execute(
-        "CREATE VIRTUAL TABLE documents_fts USING fts5(title,body_text,original_url,content='')"
-    )
-    for row in database.execute(
-        "SELECT d.*,c.original_url AS capture_original_url FROM documents d JOIN captures c ON c.id=d.capture_id ORDER BY d.id"
-    ):
-        database.execute(
-            "INSERT INTO documents_fts(rowid,title,body_text,original_url) VALUES(?,?,?,?)",
-            (int(row["id"]), str(row["title"] or ""), document_body(row), str(row["capture_original_url"] or "")),
-        )
+    rebuild_document_index(database)
 
 
 def merge_projects(

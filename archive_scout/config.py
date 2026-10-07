@@ -435,6 +435,7 @@ class ProjectConfig:
     discard_spool_mb: float = 512.0
     dashboard_refresh_mode: str = "auto"
     dashboard_refresh_seconds: int = 10
+    dashboard_eta_enabled: bool = False
     minimum_score: int = 1
     report: ReportConfig | dict = field(default_factory=ReportConfig)
     max_file_mb: float = 25.0
@@ -567,6 +568,7 @@ class ProjectConfig:
             discard_spool_mb=max(32.0, float(self.discard_spool_mb)),
             dashboard_refresh_mode=refresh_mode,
             dashboard_refresh_seconds=min(3600, max(5, int(self.dashboard_refresh_seconds))),
+            dashboard_eta_enabled=bool(self.dashboard_eta_enabled),
             minimum_score=max(1, int(self.minimum_score)),
             report=report,
             max_file_mb=max(0.1, float(self.max_file_mb)),
@@ -785,6 +787,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         discard_spool_mb=float(payload.get("discard_spool_mb", 512.0)),
         dashboard_refresh_mode=str(payload.get("dashboard_refresh_mode", "auto")),
         dashboard_refresh_seconds=int(payload.get("dashboard_refresh_seconds", 10)),
+        dashboard_eta_enabled=bool(payload.get("dashboard_eta_enabled", False)),
         minimum_score=int(payload.get("minimum_score", 1)),
         report=ReportConfig(
             retain_scan_details=bool(report_payload.get("retain_scan_details", True)),

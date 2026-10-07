@@ -75,6 +75,7 @@ from ..utils import normalize_cdx_date
 from ..projects.backups import list_project_backups, restore_project_backup
 from .dashboard import format_media_policy_summary, format_progress_message, read_classification_rows, read_dashboard_counts
 from .dashboard_refresh import DashboardRefreshController
+from .eta import OperationEtaTracker
 from .event_queue import CoalescingEventQueue
 from .theme import apply_text_theme, apply_theme, enable_windows_dpi_awareness, review_colors_for
 from .widgets import ScrollablePage, ScrollableTree, ToolTip
@@ -192,6 +193,8 @@ class ArchiveScoutApp(tk.Tk):
         self.result_page_size = 500
         self.dashboard_refresh_job: str | None = None
         self.dashboard_refresh = DashboardRefreshController()
+        self._eta_tracker = OperationEtaTracker()
+        self._eta_last_display = 0.0
         self.active_operation_media_policy = None
         self.dashboard_refresh_generation = 0
         self.ui_query_generation: dict[str, int] = {}
@@ -331,6 +334,8 @@ class ArchiveScoutApp(tk.Tk):
         self.dashboard_media_policy_var = tk.StringVar(value="Supplemental media is disabled for text/download-only runs.")
         self.dashboard_refresh_mode_var = tk.StringVar(value="auto")
         self.dashboard_refresh_seconds_var = tk.StringVar(value="10")
+        self.dashboard_eta_enabled_var = tk.BooleanVar(value=False)
+        self.dashboard_eta_var = tk.StringVar(value="Estimated time remaining: off")
         self.dashboard_last_refresh_var = tk.StringVar(value="Not refreshed yet")
         self.dashboard_failure_summary_var = tk.StringVar(value="Failures: not refreshed")
         self.text_retention_var = tk.StringVar(value="Keep downloaded text files")
@@ -574,6 +579,14 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(quick, text=quick_text, justify="left", wraplength=430).pack(anchor="nw")
         ttk.Button(quick, text="Go to Sites and paths", command=lambda: self.show_page("Sites and paths")).pack(anchor="w", pady=(14, 4))
         ttk.Button(quick, text="Go to Network settings", command=lambda: self.show_page("Settings")).pack(anchor="w", pady=4)
+        eta_frame = ttk.LabelFrame(tab, text="Estimated time remaining", padding=10)
+        eta_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        ttk.Checkbutton(eta_frame, text="Show estimated time remaining for operations",
+                        variable=self.dashboard_eta_enabled_var,
+                        command=self._eta_settings_changed).pack(anchor="w")
+        ttk.Label(eta_frame, textvariable=self.dashboard_eta_var, wraplength=1080).pack(anchor="w", pady=(6, 0))
+        ttk.Label(eta_frame, text="Uses recent completed work for the current phase. Unknown totals and later phases remain Estimating.",
+                  style="Muted.TLabel", wraplength=1080).pack(anchor="w", pady=(4, 0))
         self.dashboard_tab = tab
 
     def bind_shortcuts(self) -> None:
@@ -686,6 +699,10 @@ class ArchiveScoutApp(tk.Tk):
             self._invalidate_project_views()
         self.dashboard_refresh_generation = self.dashboard_refresh.switch_project()
         self.dashboard_project_var.set(str(root))
+        tracker = self.__dict__.get("_eta_tracker")
+        if tracker is not None:
+            tracker.reset()
+            self._refresh_eta_display(force=True)
         for variable in (
             self.dashboard_captures_var, self.dashboard_documents_var, self.dashboard_matches_var,
             self.dashboard_errors_var, self.dashboard_recovery_var, self.dashboard_skipped_non_text_var,
@@ -764,7 +781,25 @@ class ArchiveScoutApp(tk.Tk):
         payloads are phase/current-run counters and must not replace a card whose
         meaning is project-wide backlog or open-error state.
         """
-        return
+        tracker = self.__dict__.get("_eta_tracker")
+        if tracker is not None:
+            tracker.observe(event)
+            ArchiveScoutApp._refresh_eta_display(self)
+
+    def _eta_settings_changed(self) -> None:
+        self._eta_tracker.set_enabled(self.dashboard_eta_enabled_var.get())
+        self._refresh_eta_display(force=True)
+        self.save_app_state()
+
+    def _refresh_eta_display(self, force: bool = False) -> None:
+        tracker = self.__dict__.get("_eta_tracker")
+        variable = self.__dict__.get("dashboard_eta_var")
+        if tracker is None or variable is None:
+            return
+        now = time.monotonic()
+        if force or now - self.__dict__.get("_eta_last_display", 0.0) >= 0.5:
+            variable.set(tracker.label(now))
+            self._eta_last_display = now
 
     def refresh_dashboard(self, manual: bool = True) -> None:
         if self.__dict__.get("project_restore_identity") == self.project_identity():
@@ -2077,6 +2112,8 @@ class ArchiveScoutApp(tk.Tk):
                 ),
                 dashboard_refresh_mode=self.dashboard_refresh_mode_var.get(),
                 dashboard_refresh_seconds=int(self.dashboard_refresh_seconds_var.get()),
+                dashboard_eta_enabled=(bool(self.__dict__["dashboard_eta_enabled_var"].get())
+                                       if "dashboard_eta_enabled_var" in self.__dict__ else False),
                 hitlist_keywords=self.lines_from(self.hitlist_text),
                 hitlist_file=self.hitlist_file_var.get(),
                 import_source=self.import_source_var.get(),
@@ -2197,6 +2234,11 @@ class ArchiveScoutApp(tk.Tk):
         self.active_operation_media_policy = config.media.normalized()
         self.active_operation_project_identity = self.project_identity(config.output_dir)
         self.active_operation_mode = mode
+        tracker = self.__dict__.get("_eta_tracker")
+        if tracker is not None:
+            tracker.set_enabled(config.dashboard_eta_enabled)
+            tracker.reset("Estimating")
+            self._refresh_eta_display(force=True)
         self._refresh_dashboard_media_policy_summary(self.active_operation_media_policy)
         self.log(f"Starting {mode} in {config.output_dir}")
         self.worker_thread = threading.Thread(target=self.run_worker, args=(config, mode), daemon=True)
@@ -2309,6 +2351,10 @@ class ArchiveScoutApp(tk.Tk):
                     same_project = identity == self.project_identity()
                     self.status_var.set("Complete" if same_project else f"Complete — {project_label(identity)}")
                     self.log(f"Complete for {identity}. Reports are ready.")
+                    tracker = self.__dict__.get("_eta_tracker")
+                    if tracker is not None and identity == self.project_identity():
+                        tracker.finish({"stopped": "Stopped", "rate_deferred": "Paused", "network_deferred": "Paused", "error": "Failed"}.get(kind, "Complete"))
+                        ArchiveScoutApp._refresh_eta_display(self, force=True)
                     self.finish_run()
                     if same_project:
                         self.refresh_dashboard(manual=False)
@@ -2326,6 +2372,10 @@ class ArchiveScoutApp(tk.Tk):
                     same_project = identity == self.project_identity()
                     self.status_var.set("AI relevance review complete" if same_project else f"AI review complete — {project_label(identity)}")
                     self.log(f"AI relevance review {run_id} complete for {identity}.")
+                    tracker = self.__dict__.get("_eta_tracker")
+                    if tracker is not None and identity == self.project_identity():
+                        tracker.finish({"stopped": "Stopped", "rate_deferred": "Paused", "network_deferred": "Paused", "error": "Failed"}.get(kind, "Complete"))
+                        ArchiveScoutApp._refresh_eta_display(self, force=True)
                     self.finish_run()
                     if same_project:
                         self.refresh_ai_runs(select_run_id=run_id)
@@ -2338,6 +2388,10 @@ class ArchiveScoutApp(tk.Tk):
                     if identity == self.project_identity():
                         self.populate_research_results(rows)
                     self.status_var.set(f"Research search complete: {len(rows):,} results — {project_label(identity)}")
+                    tracker = self.__dict__.get("_eta_tracker")
+                    if tracker is not None and identity == self.project_identity():
+                        tracker.finish({"stopped": "Stopped", "rate_deferred": "Paused", "network_deferred": "Paused", "error": "Failed"}.get(kind, "Complete"))
+                        ArchiveScoutApp._refresh_eta_display(self, force=True)
                     self.finish_run()
                 elif kind == "research_ai_complete":
                     identity, data = tagged(payload)
@@ -2348,6 +2402,10 @@ class ArchiveScoutApp(tk.Tk):
                         self.populate_research_results(data.get("evidence") or [])
                         self.show_research_answer(data)
                     self.status_var.set(f"Grounded AI review complete — {project_label(identity)}")
+                    tracker = self.__dict__.get("_eta_tracker")
+                    if tracker is not None and identity == self.project_identity():
+                        tracker.finish({"stopped": "Stopped", "rate_deferred": "Paused", "network_deferred": "Paused", "error": "Failed"}.get(kind, "Complete"))
+                        ArchiveScoutApp._refresh_eta_display(self, force=True)
                     self.finish_run()
                 elif kind in {"stopped", "rate_deferred", "network_deferred", "error"}:
                     identity, value = tagged(payload)
@@ -2363,6 +2421,10 @@ class ArchiveScoutApp(tk.Tk):
                         message = f"Operation error in {identity}:\n{value}"
                     self.status_var.set(message.splitlines()[0])
                     self.log(message)
+                    tracker = self.__dict__.get("_eta_tracker")
+                    if tracker is not None and identity == self.project_identity():
+                        tracker.finish({"stopped": "Stopped", "rate_deferred": "Paused", "network_deferred": "Paused", "error": "Failed"}.get(kind, "Complete"))
+                        ArchiveScoutApp._refresh_eta_display(self, force=True)
                     self.finish_run()
                     if same_project:
                         self.refresh_dashboard(manual=False)
@@ -2372,6 +2434,7 @@ class ArchiveScoutApp(tk.Tk):
                         messagebox.showinfo(APP_NAME, message)
         except queue.Empty:
             pass
+        ArchiveScoutApp._refresh_eta_display(self)
         self.after(10 if processed >= 500 else 100, self.process_events)
 
     def finish_run(self) -> None:
@@ -2995,6 +3058,13 @@ class ArchiveScoutApp(tk.Tk):
         self.stop_event.clear()
         self.progress_var.set(0)
         self.status_var.set("Starting AI relevance review…")
+        self.active_operation_project_identity = self.project_identity(config.output_dir)
+        self.active_operation_mode = "ai_review"
+        tracker = self.__dict__.get("_eta_tracker")
+        if tracker is not None:
+            tracker.set_enabled(config.dashboard_eta_enabled)
+            tracker.reset("Estimating")
+            self._refresh_eta_display(force=True)
         self.start_button.configure(state="disabled")
         self.ai_start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -3008,21 +3078,26 @@ class ArchiveScoutApp(tk.Tk):
 
     def run_ai_worker(self, config: ProjectConfig, scan_id: int, prompt: str, api_key: str) -> None:
         database = None
+        identity = self.project_identity(config.output_dir)
+
+        def tagged_progress(event: ProgressEvent) -> None:
+            self.events.put_progress((identity, event))
+
         try:
             database = open_database(config.output_dir, migrate=True)
             ai_run_id = run_ai_review(
-                config, database, scan_id, prompt, api_key, self.stop_event, self.on_engine_event
+                config, database, scan_id, prompt, api_key, self.stop_event, tagged_progress
             )
             paths = generate_ai_reports(
                 config.output_dir, database, ai_run_id, config.ai.normalized().minimum_relevance
             )
-            self.events.put(("ai_complete", {"run_id": ai_run_id, "paths": paths}))
+            self.events.put(("ai_complete", (identity, {"run_id": ai_run_id, "paths": paths})))
         except Stopped:
-            self.events.put(("stopped", None))
+            self.events.put(("stopped", (identity, None)))
         except (AIReviewError, FrozenBundleError) as exc:
-            self.events.put(("error", str(exc)))
+            self.events.put(("error", (identity, str(exc))))
         except Exception:
-            self.events.put(("error", traceback.format_exc()))
+            self.events.put(("error", (identity, traceback.format_exc())))
         finally:
             if database is not None:
                 database.close()
@@ -3575,6 +3650,10 @@ class ArchiveScoutApp(tk.Tk):
         )
         self.dashboard_refresh_mode_var.set(config.dashboard_refresh_mode)
         self.dashboard_refresh_seconds_var.set(str(config.dashboard_refresh_seconds))
+        self.dashboard_eta_enabled_var.set(config.dashboard_eta_enabled)
+        self._eta_tracker.set_enabled(config.dashboard_eta_enabled)
+        self._eta_tracker.reset()
+        self._refresh_eta_display(force=True)
         self.dashboard_refresh.configure(config.dashboard_refresh_mode, config.dashboard_refresh_seconds)
         if hasattr(self, "hitlist_text"):
             self.replace_text(self.hitlist_text, config.hitlist_keywords)

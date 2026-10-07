@@ -14,8 +14,8 @@ from archive_scout.ui.main_window import enforce_active_keyword_set_selection
 
 class V108ReleaseTests(unittest.TestCase):
     def test_public_release_identity_and_schema(self):
-        self.assertEqual(VERSION, "1.0.7")
-        self.assertEqual(SCHEMA_VERSION, 12)
+        self.assertEqual(VERSION, "1.0.8")
+        self.assertEqual(SCHEMA_VERSION, 13)
 
 
     def test_gui_next_scan_keyword_selection_is_exclusive(self):

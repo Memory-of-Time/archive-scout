@@ -60,7 +60,8 @@ def search_documents(
         """
         SELECT d.*,c.original_url AS capture_original_url,c.timestamp,c.mimetype,bm25(documents_fts) AS rank
         FROM documents_fts
-        JOIN documents d ON d.id=documents_fts.rowid
+        JOIN document_fts_versions v ON v.fts_rowid=documents_fts.rowid
+        JOIN documents d ON d.id=v.document_id
         JOIN captures c ON c.id=d.capture_id
         WHERE """ + " AND ".join(clauses) + " ORDER BY rank LIMIT ?",
         params,

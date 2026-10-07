@@ -268,12 +268,12 @@ def iter_media_download_rows(
 
     def rows():
         last_length = 0
-        last_id = 0
+        last_id = (1 << 63) - 1
         while True:
             batch = database.execute(
                 "SELECT * FROM media_captures WHERE " + where
-                + " AND COALESCE(length,0)>0 AND (COALESCE(length,0),id)>(?,?)"
-                + " ORDER BY COALESCE(length,0),id LIMIT ?",
+                + " AND (length,id)>(?,?)"
+                + " ORDER BY length,id LIMIT ?",
                 [*params, last_length, last_id, max(1, int(batch_size))],
             ).fetchall()
             if not batch:

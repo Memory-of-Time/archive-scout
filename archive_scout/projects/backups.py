@@ -6,19 +6,21 @@ from ..database.connection import live_project_writer_pids
 import gzip
 import shutil
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..database.connection import DATABASE_NAME
 from ..constants import SCHEMA_VERSION
 from ..utils import utc_now
+from ..events import ProgressEvent
 
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
 
-def create_project_backup(root: Path, reason: str = "manual", keep: int = 5, max_mb: float = 1024.0) -> Path:
+def create_project_backup(root: Path, reason: str = "manual", keep: int = 5, max_mb: float = 1024.0, *, callback=None) -> Path:
     """Create a compressed SQLite backup without copying capture/media payloads."""
     root = Path(root)
     source = root / DATABASE_NAME
@@ -31,13 +33,35 @@ def create_project_backup(root: Path, reason: str = "manual", keep: int = 5, max
     destination = backup_dir / f"{stem}.sqlite3.gz"
     source_db = sqlite3.connect(source)
     destination_db = sqlite3.connect(raw)
+    last_emit = 0.0
+
+    def report(stage: str, current: int, total: int) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if callback and (current >= total or now - last_emit >= 0.5):
+            last_emit = now
+            callback(ProgressEvent(stage, "Creating project backup", current, total))
+
     try:
-        source_db.backup(destination_db)
+        if callback:
+            source_db.backup(destination_db, pages=256,
+                             progress=lambda status, remaining, total: report("backup_copy", total - remaining, total))
+        else:
+            source_db.backup(destination_db)
     finally:
         destination_db.close()
         source_db.close()
     with raw.open("rb") as src, gzip.open(destination, "wb", compresslevel=6) as dst:
-        shutil.copyfileobj(src, dst, length=1024 * 1024)
+        if callback:
+            size = raw.stat().st_size
+            current = 0
+            last_emit = 0.0
+            while chunk := src.read(1024 * 1024):
+                dst.write(chunk)
+                current += len(chunk)
+                report("backup_compress", current, size)
+        else:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
     raw.unlink(missing_ok=True)
     _record_backup(root, destination, reason)
     prune_backups(root, keep, max_mb=max_mb)

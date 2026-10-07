@@ -1,15 +1,28 @@
-ARCHIVE SCOUT 1.0.3 REPOSITORY CHECKLIST
+ARCHIVE SCOUT v1.0.8 PATCH / RELEASE CHECKLIST
 
-1. Confirm archive_scout/constants.py and pyproject.toml report version 1.0.3.
-2. Confirm schema version remains 11.
-3. Run: python -m unittest discover -s tests -p "test_*.py"
-4. Confirm the complete unit/integration suite passes with only the expected environment/display skips.
-5. Confirm default index pacing is 2.5 seconds and replay pacing is 0.125 seconds.
-6. Confirm a missing Retry-After produces at least a 60-second first cooldown.
-7. Confirm .github/workflows/tests.yml expects package version 1.0.3.
-8. Confirm packaging/windows/version_info.txt uses 1.0.3 / filevers=(1, 0, 3, 0).
-9. Confirm packaging/windows/ArchiveScout.manifest is included by scripts/build_windows.ps1.
-10. Build Windows, Linux, and macOS packages on their native runners.
-11. Smoke-test startup, project creation/opening, navigation, scrolling, DPI/theme changes, indexing preview, resume, and local search on native packages.
-12. Verify release archives contain no __pycache__, .pyc, local project databases, API keys, or temporary files.
-13. Tag the v1.0.3 release only after the release workflow is green.
+1. Apply to the supplied v1.0.7/schema-12 source, using APPLY_PATCH.md.
+2. Extract one patch archive. Upload its contents, preserving relative paths;
+   do not upload the archive container or an enclosing patch folder.
+3. Keep .github/workflows/tests.yml in that exact hidden directory. Reveal
+   hidden files in Finder with Command+Shift+Period if necessary.
+4. The plain github/workflows mirror does not activate GitHub Actions.
+   Do not flatten workflow files into the repository root.
+5. Confirm runtime, pyproject and Windows versions are 1.0.8, schema 13.
+   Run python scripts/verify_release.py after installing the package.
+6. Run pip check, source compilation, unittest discovery and the offline
+   benchmark smoke test using the commands in APPLY_PATCH.md.
+7. Confirm optional Dashboard remaining-time estimates default to off;
+   unknown work plans show Estimating rather than a fabricated deadline.
+8. Confirm existing Reports settings select the inventory/fields you need.
+9. Keep automatic pre-schema-13 backups. Downgrades require restoring an
+   older database backup; schema 13 is not readable by v1.0.7.
+10. Run the GitHub Tests matrix on the actual commit. Local Linux validation
+    does not establish Windows/macOS CI or native installer success.
+11. Create the v1.0.8 tag only after Tests succeeds. Keep the existing Windows
+    signing setup and verify both GUI and CLI in each native release archive.
+12. Smoke-test startup, optional ETA, stop/resume, local search, report
+    regeneration and migration on native packages before publishing.
+
+Default request ceilings, TLS, Retry-After, response/Range validation, and
+text/media classification remain in effect. Completeness takes priority over
+unattainable throughput when a service or workload requires waiting.

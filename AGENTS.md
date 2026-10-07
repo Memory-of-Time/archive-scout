@@ -16,7 +16,7 @@ Archive Scout is a cross-platform research workspace for public Wayback Machine 
 - `archive_scout/scanning/`: deterministic keyword/rule search.
 - `archive_scout/research/`: local Research Intelligence vectors, entities, duplicate relationships, evidence graph, hybrid retrieval and grounded AI synthesis.
 - `archive_scout/ai/`: provider-neutral AI request models and OpenAI/OpenRouter adapters.
-- `archive_scout/database/`: SQLite schema/migrations/repositories. Current schema is 12.
+- `archive_scout/database/`: SQLite schema/migrations/repositories. Current schema is 13.
 - `archive_scout/operations.py`: shared operation orchestration used by GUI and CLI.
 - `archive_scout/cli.py`: stable bot/automation contract. Machine-readable stdout must stay clean.
 
