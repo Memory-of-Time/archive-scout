@@ -6,7 +6,7 @@
 
 - [Download for Windows](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Windows-x64.zip)
 - [Download for macOS](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-macOS-Universal.zip)
-= [Download for Linux](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Linux-x64.zip)
+- [Download for Linux](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Linux-x64.zip)
 
 ## 1.0.8 highlights
 
