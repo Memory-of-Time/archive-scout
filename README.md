@@ -2,9 +2,11 @@
 
 **Archive Scout 1.0.8** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
 
-## Downloads
+## Installation
 
-The v1.0.8 patch contains replacement source files for the supplied v1.0.7 tree. See [apply instructions](APPLY_PATCH.md). It can be run from source on Python 3.11+. Tagged releases are built by the existing cross-platform GitHub Actions workflow; installer downloads become available after that release workflow succeeds.
+- [Download for Windows](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Windows-x64.zip)
+- [Download for macOS](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-macOS-Universal.zip)
+= [Download for Linux](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Linux-x64.zip)
 
 ## 1.0.8 highlights
 
