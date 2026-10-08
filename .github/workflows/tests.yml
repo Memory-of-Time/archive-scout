@@ -58,7 +58,7 @@ jobs:
         run: >-
           python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.0.8';
+          assert importlib.metadata.version('archive-scout') == '1.0.9';
           print('Archive Scout native accelerator imports and metadata checks passed')"
 
       - name: Run tests
@@ -66,6 +66,9 @@ jobs:
 
       - name: Verify release identity and workflow placement
         run: python scripts/verify_release.py
+
+      - name: Verify complete CLI import and spawned scans
+        run: python scripts/verify_packaged_scan.py --encoding-stress --output validation/cli-spawn-smoke.json
 
       - name: Run offline benchmark smoke test
         if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.12'
