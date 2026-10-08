@@ -22,7 +22,9 @@ import httpx
 import urllib3
 
 from ..events import Stopped
+from ..text_encoding import TextDecodingError
 from ..runtime import ensure_frozen_bundle_available
+from .cancellation import SocketCancellation, install_httpx, install_urllib3
 
 try:
     import truststore
@@ -44,6 +46,19 @@ class RequestAdmissionRejected(RuntimeError):
 
 class InvalidRangeResponse(RuntimeError):
     """Replay cannot safely be appended; retry the complete representation."""
+
+
+class PayloadValidationError(RuntimeError):
+    """A response validator failed; keep the healthy transport eligible."""
+
+
+def _validate_preview(validator, headers, data):
+    try:
+        return validator(headers, data)
+    except (TextDecodingError, PreviewRejected):
+        raise
+    except Exception as exc:
+        raise PayloadValidationError(f"Payload validator failed ({type(exc).__name__})") from exc
 
 
 class PreviewRejected(RuntimeError):
@@ -376,7 +391,7 @@ def _write_limited(
                 if len(preview) < preview_bytes:
                     preview.extend(chunk[: preview_bytes - len(preview)])
                 if preview_validator is not None and not preview_checked and len(preview) >= min(preview_bytes, 8192):
-                    rejected = preview_validator(headers, bytes(preview))
+                    rejected = _validate_preview(preview_validator, headers, bytes(preview))
                     preview_checked = True
                     if rejected:
                         raise PreviewRejected(str(rejected))
@@ -384,7 +399,7 @@ def _write_limited(
                     progress(bytes(preview))
                     progress = None
             if preview_validator is not None and not preview_checked:
-                rejected = preview_validator(headers, bytes(preview))
+                rejected = _validate_preview(preview_validator, headers, bytes(preview))
                 if rejected:
                     raise PreviewRejected(str(rejected))
         return total, digest.hexdigest() if digest is not None else "", bytes(preview)
@@ -432,12 +447,23 @@ def _origin_attempt(factory, url: str):
         raise
 
 
+def _cancel_scope(backend, stop_event):
+    cancellation = getattr(backend, 'cancellation', None)
+    return cancellation.scope(stop_event) if cancellation is not None else contextlib.nullcontext()
+
+
+def _cancel_io(backend, getter):
+    cancellation = getattr(backend, 'cancellation', None)
+    return cancellation.io(getter) if cancellation is not None else contextlib.nullcontext()
+
+
 class HttpxBackend:
     name = "httpx"
 
     def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float, trust_env: bool = True) -> None:
         self.connect_timeout = max(1.0, float(connect_timeout))
         self.read_timeout = max(1.0, float(read_timeout))
+        self.cancellation = SocketCancellation()
         self.client = httpx.Client(
             verify=_ssl_context(trust_env),
             follow_redirects=False,
@@ -456,8 +482,13 @@ class HttpxBackend:
             ),
         )
 
+        install_httpx(self.client, self.cancellation)
+
     def close(self) -> None:
         self.client.close()
+        cancellation = getattr(self, "cancellation", None)
+        if cancellation is not None:
+            cancellation.close()
 
     @staticmethod
     def _attempt(factory):
@@ -479,7 +510,7 @@ class HttpxBackend:
         for _ in range(11):
             if stop_event.is_set():
                 raise Stopped
-            with _origin_attempt(attempt_context_factory, current_url) as progress:
+            with _cancel_scope(self, stop_event), _origin_attempt(attempt_context_factory, current_url) as progress:
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
                     copied_headers = _copy_headers(response.headers.items())
@@ -523,7 +554,7 @@ class HttpxBackend:
         for _ in range(11):
             if stop_event.is_set():
                 raise Stopped
-            with _origin_attempt(attempt_context_factory, current_url) as progress:
+            with _cancel_scope(self, stop_event), _origin_attempt(attempt_context_factory, current_url) as progress:
                 with self.client.stream("GET", current_url, headers=headers, follow_redirects=False) as response:
                     status = int(response.status_code)
                     copied_headers = _copy_headers(response.headers.items())
@@ -567,6 +598,7 @@ class Urllib3Backend:
     name = "urllib3"
 
     def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float, trust_env: bool = True) -> None:
+        self.cancellation = SocketCancellation()
         self.timeout = urllib3.Timeout(connect=max(1.0, connect_timeout), read=max(1.0, read_timeout))
         self.pool_options = dict(
             num_pools=4,
@@ -576,6 +608,7 @@ class Urllib3Backend:
             retries=False,
         )
         self.pool = urllib3.PoolManager(**self.pool_options)
+        install_urllib3(self.pool, self.cancellation)
         self.proxies = urllib.request.getproxies() if trust_env else {}
         self.proxy_pools: dict[str, object] = {}
         self.proxy_lock = threading.Lock()
@@ -599,12 +632,16 @@ class Urllib3Backend:
                     ))
                 proxy_address = urllib.parse.urlunsplit(parsed_proxy._replace(netloc=parsed_proxy.netloc.rsplit("@", 1)[-1]))
                 self.proxy_pools[proxy] = urllib3.ProxyManager(proxy_address, proxy_headers=credentials, **self.pool_options)
+                install_urllib3(self.proxy_pools[proxy], self.cancellation)
             return self.proxy_pools[proxy]
 
     def close(self) -> None:
         self.pool.clear()
         for pool in self.proxy_pools.values():
             pool.clear()
+        cancellation = getattr(self, "cancellation", None)
+        if cancellation is not None:
+            cancellation.close()
 
     @staticmethod
     def _discard(response) -> None:
@@ -636,7 +673,7 @@ class Urllib3Backend:
             try:
                 if stop_event.is_set():
                     raise Stopped
-                with _origin_attempt(attempt_context_factory, current_url) as progress:
+                with _cancel_scope(self, stop_event), _origin_attempt(attempt_context_factory, current_url) as progress:
                     response = self._pool_for(current_url).request(
                         "GET", current_url, headers=headers, preload_content=False,
                         redirect=False, retries=False, timeout=self.timeout,
@@ -656,7 +693,14 @@ class Urllib3Backend:
                     announced = response.headers.get("Content-Length")
                     if announced and str(announced).isdigit() and int(announced) > max_bytes:
                         raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-                    data = _read_limited(iter(lambda: response.read1(64 * 1024, decode_content=True), b""), max_bytes, stop_event, lambda prefix: progress(status, copied_headers, current_url, prefix))
+                    def chunks():
+                        while True:
+                            with _cancel_io(self, lambda: response.connection.sock if response.connection else None):
+                                chunk = response.read1(64 * 1024, decode_content=True)
+                            if not chunk:
+                                return
+                            yield chunk
+                    data = _read_limited(chunks(), max_bytes, stop_event, lambda prefix: progress(status, copied_headers, current_url, prefix))
                     result = TransportResponse(
                         status=status, headers=copied_headers,
                         final_url=current_url, data=data, backend=self.name,
@@ -685,7 +729,7 @@ class Urllib3Backend:
             try:
                 if stop_event.is_set():
                     raise Stopped
-                with _origin_attempt(attempt_context_factory, current_url) as progress:
+                with _cancel_scope(self, stop_event), _origin_attempt(attempt_context_factory, current_url) as progress:
                     response = self._pool_for(current_url).request(
                         "GET", current_url, headers=headers, preload_content=False,
                         redirect=False, retries=False, timeout=self.timeout,
@@ -714,7 +758,8 @@ class Urllib3Backend:
                         # to fill a large application chunk. Small prefixes must
                         # reach disk before a later EOF/read timeout is raised.
                         while True:
-                            chunk = response.read1(64 * 1024, decode_content=True)
+                            with _cancel_io(self, lambda: response.connection.sock if response.connection else None):
+                                chunk = response.read1(64 * 1024, decode_content=True)
                             if not chunk:
                                 break
                             yield chunk
@@ -811,7 +856,7 @@ class CurlBackend:
         preview_validator=None,
     ) -> tuple[int, dict[str, str], str]:
         command = [
-            self.executable, "--disable", "--http1.1", "--silent", "--show-error",
+            self.executable, "--disable", "--http1.1", "--silent", "--show-error", "--no-buffer",
             "--connect-timeout", str(int(self.connect_timeout)),
             "--max-time", str(int(self.connect_timeout + self.read_timeout)),
             "--max-filesize", str(int(max_bytes)), "--dump-header", str(header_path),
@@ -849,7 +894,7 @@ class CurlBackend:
                                 and status == 200 and body_path.exists()
                                 and body_path.stat().st_size >= 8192):
                             with body_path.open("rb") as handle:
-                                rejected = preview_validator(response_headers, handle.read(64 * 1024))
+                                rejected = _validate_preview(preview_validator, response_headers, handle.read(64 * 1024))
                             preview_checked = True
                             if rejected:
                                 raise PreviewRejected(str(rejected))
@@ -1029,6 +1074,11 @@ class ResilientTransport:
             "urllib3": lambda: Urllib3Backend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
             "curl": lambda: CurlBackend(connect_timeout, read_timeout, trust_env=trust_env),
         }
+        self._factories = factories
+        self._active = {}
+        self._renew_pending = set()
+        self._failure_streak = {}
+        self._generations = {}
         self.backends: dict[str, object] = {}
         # A broken optional backend must not prevent the selected one starting.
         # In auto mode an unavailable SOCKS extra, for example, need not prevent
@@ -1107,11 +1157,38 @@ class ResilientTransport:
                 return False
             if name in state.cooldown_until:
                 state.probing.add(name)
+            if hasattr(self, "_active"):
+                self._active[name] = self._active.get(name, 0) + 1
             return True
 
     def _release_backend(self, url: str, name: str) -> None:
+        retired = None
         with self.lock:
             self._health_locked(url).probing.discard(name)
+            if hasattr(self, '_active'):
+                self._active[name] = max(0, self._active.get(name, 1) - 1)
+                if name in self._renew_pending and self._active[name] == 0:
+                    # No older request may still own a response or .part path.
+                    # Keep origin/service cooldowns unchanged when renewing pools.
+                    try:
+                        replacement = self._factories[name]()
+                    except Exception:
+                        replacement = None
+                    if replacement is not None:
+                        retired, self.backends[name] = self.backends[name], replacement
+                        self._generations[name] = self._generations.get(name, 0) + 1
+                    self._renew_pending.discard(name)
+                    self._failure_streak[name] = 0
+        if retired is not None:
+            retired.close()
+            if self.callback:
+                self.callback(f'Network backend {name}: renewed drained connection pool')
+
+    def metrics_snapshot(self):
+        with self.lock:
+            return {'pool_renewals': sum(getattr(self, '_generations', {}).values()),
+                    'backend_generations': dict(getattr(self, '_generations', {})),
+                    'active_backend_requests': sum(getattr(self, '_active', {}).values())}
 
     def _backend_succeeded(self, url: str, name: str) -> None:
         with self.lock:
@@ -1122,6 +1199,9 @@ class ResilientTransport:
                 state.last_success = name
             changed = previous != state.last_success
             state.cooldown_until.pop(name, None)
+            if hasattr(self, "_failure_streak"):
+                self._failure_streak[name] = 0
+                self._renew_pending.discard(name)
             self.last_success = state.last_success  # Legacy diagnostic surface.
         if changed and self.callback:
             self.callback(f"Network backend: {self.last_success}")
@@ -1134,6 +1214,10 @@ class ResilientTransport:
                 state.cooldown_until.pop(name, None)
             else:
                 state.cooldown_until[name] = time.monotonic() + 30.0
+            if hasattr(self, "_failure_streak") and (is_transport_connection_failure(exc) or isinstance(exc, httpx.RemoteProtocolError)):
+                self._failure_streak[name] = self._failure_streak.get(name, 0) + 1
+                if self._failure_streak[name] >= 2:
+                    self._renew_pending.add(name)
 
     def _ordered_names(self, url: str = "") -> list[str]:
         now = time.monotonic()
@@ -1180,7 +1264,7 @@ class ResilientTransport:
                 return response
             except Stopped:
                 raise
-            except (ServiceStatusResponse, RedirectPolicyError, BackendsCoolingDown):
+            except (ServiceStatusResponse, RedirectPolicyError, BackendsCoolingDown, TextDecodingError, PayloadValidationError):
                 raise
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
@@ -1250,7 +1334,7 @@ class ResilientTransport:
                 return response
             except Stopped:
                 raise
-            except (ServiceStatusResponse, RedirectPolicyError, BackendsCoolingDown):
+            except (ServiceStatusResponse, RedirectPolicyError, BackendsCoolingDown, TextDecodingError, PayloadValidationError):
                 raise
             except RuntimeError as exc:
                 if isinstance(exc, (InvalidRangeResponse, PreviewRejected, RequestAdmissionRejected)) or str(exc).startswith("response exceeds") or "too many redirects" in str(exc):

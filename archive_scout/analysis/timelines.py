@@ -3,7 +3,8 @@ from __future__ import annotations
 import sqlite3
 
 
-def build_timeline(database: sqlite3.Connection) -> list[dict]:
+def build_timeline(database: sqlite3.Connection):
+    """Stream every provenance edge; callers can materialize deliberately."""
     rows = database.execute(
         """
         SELECT pe.id,pe.method,pe.similarity,pe.source_timestamp,pe.mirror_timestamp,
@@ -15,5 +16,6 @@ def build_timeline(database: sqlite3.Connection) -> list[dict]:
         JOIN captures cm ON cm.id=dm.capture_id
         ORDER BY pe.source_timestamp,pe.mirror_timestamp,pe.id
         """
-    ).fetchall()
-    return [dict(row) for row in rows]
+    )
+    for row in rows:
+        yield dict(row)

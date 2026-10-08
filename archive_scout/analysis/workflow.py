@@ -349,7 +349,7 @@ def run_analysis(
                 database.execute("DELETE FROM legacy_assets")
         rows = database.execute(
             """
-            SELECT d.*,d.id AS document_id,c.id AS capture_id,c.original_url,c.timestamp
+            SELECT d.*,d.id AS document_id,c.id AS capture_id,c.original_url,c.timestamp,c.mimetype,c.detected_encoding
             FROM documents d JOIN captures c ON c.id=d.capture_id
             ORDER BY d.id
             """
@@ -468,12 +468,12 @@ def run_analysis(
             summary["extractions"] = int(database.execute("SELECT COUNT(*) FROM extractions").fetchone()[0])
             summary["legacy_assets"] = int(database.execute("SELECT COUNT(*) FROM legacy_assets").fetchone()[0])
             summary["external_assets_found"] = _lookup_external_assets(config, database, stop_event, callback)
-            duplicate_summary = cluster_duplicates(database, analysis.duplicate_threshold)
+            duplicate_summary = cluster_duplicates(database, analysis.duplicate_threshold, stop_event=stop_event, callback=callback)
             summary["exact_duplicate_groups"] = duplicate_summary.exact_groups
             summary["near_duplicate_groups"] = duplicate_summary.near_groups
             summary["grouped_documents"] = duplicate_summary.grouped_documents
             if analysis.compare_snapshots:
-                diff_summary = compare_snapshots(database)
+                diff_summary = compare_snapshots(database, stop_event=stop_event, callback=callback)
                 summary["snapshot_pairs"] = diff_summary.compared_pairs
                 summary["changed_snapshot_pairs"] = diff_summary.changed_pairs
                 extracted_values = [str(row[0]) for row in database.execute("SELECT DISTINCT value FROM extractions WHERE LENGTH(value)>=3 LIMIT 5000")]

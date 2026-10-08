@@ -244,7 +244,7 @@ def build_research_index(
     desired_backend_tag = f"{research.vector_backend}|cfg:{config_fingerprint}"
     rows = database.execute(
         """
-        SELECT d.*,c.original_url,c.timestamp,
+        SELECT d.*,c.original_url,c.timestamp,c.mimetype,c.detected_encoding,
                rv.content_hash AS research_content_hash,rv.backend AS research_backend,rv.dimensions AS research_dimensions
         FROM documents d
         JOIN captures c ON c.id=d.capture_id
@@ -351,8 +351,11 @@ def build_research_index(
     document_fingerprint = _document_fingerprint(database)
     previous_duplicate_fingerprint = _meta(database, "research_duplicate_fingerprint")
     if research.duplicate_clustering and (summary.indexed or summary.removed or previous_duplicate_fingerprint != document_fingerprint):
-        _emit(callback, ProgressEvent("research_index", "Clustering exact and near-duplicate documents…", processed, total))
-        duplicate_summary = cluster_duplicates(database)
+        _emit(callback, ProgressEvent("research_duplicates", "Clustering exact and near-duplicate documents…", 0, total))
+        def duplicate_progress(event):
+            event.stage = 'research_duplicates_publish' if event.stage == 'duplicates_publish' else 'research_duplicates'
+            _emit(callback, event)
+        duplicate_summary = cluster_duplicates(database, stop_event=stop_event, callback=duplicate_progress)
         summary.duplicate_groups = duplicate_summary.exact_groups + duplicate_summary.near_groups
         with database:
             database.execute(
@@ -367,7 +370,7 @@ def build_research_index(
     if graph_is_current and not summary.indexed and not summary.removed:
         summary.edges = int(database.execute("SELECT COUNT(*) FROM research_edges").fetchone()[0])
     else:
-        _emit(callback, ProgressEvent("research_index", "Building evidence relationships…", processed, total))
+        _emit(callback, ProgressEvent("research_graph", "Building evidence relationships…"))
         with database:
             summary.edges = _rebuild_graph(database, stop_event)
             database.execute(
@@ -379,7 +382,7 @@ def build_research_index(
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('research_index_version','2')")
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('research_indexed_at',?)", (utc_now(),))
     _emit(callback, ProgressEvent(
-        "research_index",
+        "research_complete",
         f"Research Intelligence ready: {total:,} documents, {summary.duplicate_groups:,} duplicate groups, {summary.edges:,} evidence edges.",
         total,
         total,

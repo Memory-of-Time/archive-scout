@@ -183,7 +183,7 @@ def search_research(
         placeholders = ",".join("?" for _ in chunk)
         rows = database.execute(
             f"""
-            SELECT rv.document_id,rv.vector_blob,rv.dimensions,d.*,c.original_url,c.timestamp,
+            SELECT rv.document_id,rv.vector_blob,rv.dimensions,d.*,c.original_url,c.timestamp,c.mimetype,c.detected_encoding,
                    COALESCE((SELECT MAX(score) FROM document_matches m WHERE m.document_id=d.id AND m.excluded=0 AND m.required_missing=0),0) AS archive_score,
                    (SELECT dm.group_id FROM duplicate_members dm WHERE dm.document_id=d.id LIMIT 1) AS duplicate_group_id
             FROM research_vectors rv

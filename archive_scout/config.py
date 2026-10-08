@@ -427,6 +427,9 @@ class ProjectConfig:
     cdx_extra_params: list[str] = field(default_factory=list)
     workers: int = 10
     scan_workers: int = 0
+    scan_backend: str = "auto"
+    scan_overlap: bool = True
+    scan_memory_mb: float = 256.0
     download_scope: str = "all_text"
     text_retention: str = "keep"
     download_external_redirects: bool = False
@@ -452,6 +455,7 @@ class ProjectConfig:
     max_attempts: int = 4
     user_agent: str = "ArchiveScout/1.0 public web archive research client"
     retry_error_categories: list[str] = field(default_factory=list)
+    retry_include_unavailable: bool = False
     retry_capture_ids: list[int] = field(default_factory=list)
     retry_media_capture_ids: list[int] = field(default_factory=list)
     media: MediaConfig | dict = field(default_factory=MediaConfig)
@@ -560,6 +564,9 @@ class ProjectConfig:
             cdx_extra_params=extra_params,
             workers=min(32, max(1, int(self.workers))),
             scan_workers=min(32, max(0, int(self.scan_workers))),
+            scan_overlap=bool(self.scan_overlap),
+            scan_backend=self.scan_backend if self.scan_backend in {"auto", "thread", "process"} else "auto",
+            scan_memory_mb=max(32.0, min(4096.0, float(self.scan_memory_mb))),
             download_scope=self.download_scope if self.download_scope in {"all_text", "keyword_urls", "index_only"} else "all_text",
             text_retention=retention,
             download_external_redirects=bool(self.download_external_redirects),
@@ -585,6 +592,7 @@ class ProjectConfig:
             max_attempts=min(20, max(1, int(self.max_attempts))),
             user_agent=self.user_agent.strip() or "ArchiveScout/1.0 public web archive research client",
             retry_error_categories=list(dict.fromkeys(value.strip() for value in self.retry_error_categories if value.strip())),
+            retry_include_unavailable=bool(self.retry_include_unavailable),
             retry_capture_ids=sorted({int(value) for value in self.retry_capture_ids if int(value) > 0}),
             retry_media_capture_ids=sorted({int(value) for value in self.retry_media_capture_ids if int(value) > 0}),
             media=media,
@@ -658,7 +666,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     research_payload = payload.get("research") or {}
     network_payload = payload.get("network") or {}
     saved_version = str(payload.get("version") or "")
-    loaded_text_collapse_scope = str(payload.get("text_collapse_scope") or ("range" if saved_version in {"1.0.7.1+audit3", "1.0.7.1+audit4", "1.0.7.1+audit5", "1.0.8", "1.0.8.1"} else "year"))
+    loaded_text_collapse_scope = str(payload.get("text_collapse_scope") or ("range" if saved_version in {"1.0.7.1+audit3", "1.0.7.1+audit4", "1.0.7.1+audit5", "1.0.8", "1.0.8.1", "1.0.9"} else "year"))
     loaded_page_size = int(payload.get("page_size", 100000))
     loaded_cdx_delay = float(payload.get("cdx_delay", WAYBACK_INDEX_MIN_INTERVAL))
     loaded_page_blocks = int(network_payload.get("page_blocks", 0))
@@ -710,7 +718,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     # in flight using the historical pageSize=9 grouping. Upgrade only the
     # untouched earlier automatic-indexing profile.
     if (
-        saved_version not in {"1.0.6.2", "1.0.6.3", "1.0.6.4", "1.0.6.5", "1.0.6.6", "1.0.7", "1.0.7.1", "1.0.7.1+audit1", "1.0.7.1+audit2", "1.0.7.1+audit3", "1.0.7.1+audit4", "1.0.7.1+audit5", "1.0.8", "1.0.8.1"}
+        saved_version not in {"1.0.6.2", "1.0.6.3", "1.0.6.4", "1.0.6.5", "1.0.6.6", "1.0.7", "1.0.7.1", "1.0.7.1+audit1", "1.0.7.1+audit2", "1.0.7.1+audit3", "1.0.7.1+audit4", "1.0.7.1+audit5", "1.0.8", "1.0.8.1", "1.0.9"}
         and loaded_page_size == 100000
         and loaded_cdx_delay == 0.75
         and loaded_page_blocks == 0
@@ -779,6 +787,9 @@ def load_project_config(path: Path) -> ProjectConfig:
         cdx_extra_params=list(payload.get("cdx_extra_params") or []),
         workers=loaded_workers,
         scan_workers=int(payload.get("scan_workers", 0)),
+        scan_backend=str(payload.get("scan_backend", "auto")),
+        scan_overlap=bool(payload.get("scan_overlap", True)),
+        scan_memory_mb=float(payload.get("scan_memory_mb", 256.0)),
         download_scope=str(payload.get("download_scope", "all_text")),
         text_retention=str(payload.get("text_retention", "keep")),
         download_external_redirects=bool(payload.get("download_external_redirects", False)),
@@ -820,6 +831,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         max_attempts=int(payload.get("max_attempts", 4)),
         user_agent=str(payload.get("user_agent", "ArchiveScout/1.0 public web archive research client")),
         retry_error_categories=list(payload.get("retry_error_categories") or []),
+        retry_include_unavailable=bool(payload.get("retry_include_unavailable", False)),
         retry_capture_ids=[int(value) for value in payload.get("retry_capture_ids") or []],
         retry_media_capture_ids=[int(value) for value in payload.get("retry_media_capture_ids") or []],
         media=MediaConfig(

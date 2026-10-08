@@ -8,7 +8,7 @@ from collections import deque
 from ..events import ProgressEvent
 
 
-_TELEMETRY = {"network", "retry", "site_issue", "warning", "log"}
+_TELEMETRY = {"network", "retry", "download_retry", "site_issue", "warning", "log"}
 _WAITING = {"network_waiting", "rate_limit_waiting", "rate_limit", "network_pause"}
 
 
@@ -29,9 +29,9 @@ def format_remaining(seconds: float) -> str:
 class OperationEtaTracker:
     """A recent wall-clock rate, with known recovery waits counted once.
 
-    Estimates are for the current phase. Future phases and growing/unknown work
-    plans are never presented as a precise whole-run deadline. No SQL, files,
-    worker threads, per-item persistence, or fixed 8/s assumption is involved.
+    Estimates use the current phase and, when supplied by the engine, measured
+    history for known future work. Growing/unknown work stays explicitly unknown.
+    This UI tracker performs no SQL, files, worker threads or item persistence.
     """
 
     def __init__(self, enabled: bool = False):
@@ -51,6 +51,7 @@ class OperationEtaTracker:
         self.wait_until: float | None = None
         self.waiting = False
         self.last_progress: float | None = None
+        self.plan: dict | None = None
 
     def set_enabled(self, enabled: bool) -> None:
         if bool(enabled) != self.enabled:
@@ -62,6 +63,7 @@ class OperationEtaTracker:
         self.stage = ""
         self.waiting = False
         self.samples.clear()
+        self.plan = None
 
     def _elapsed(self, now: float) -> float:
         if self.last_time is None:
@@ -87,6 +89,8 @@ class OperationEtaTracker:
             if self.run_id is not None and run_id != self.run_id:
                 self.reset("Estimating")
             self.run_id = run_id
+        if isinstance(detail.get("eta_plan"), dict):
+            self.plan = detail["eta_plan"]
         if event.stage in _WAITING:
             self.active_time = self._elapsed(now)
             self.last_time = now
@@ -165,14 +169,29 @@ class OperationEtaTracker:
         remaining = self.seconds_remaining(now)
         if self.waiting:
             if self.wait_until is None:
-                return f"{phase}: waiting for recovery; remaining time unknown"
+                return self._with_future(f"{phase}: waiting for recovery; remaining time unknown")
             wait = format_remaining(max(0.0, self.wait_until - now))
             estimate = f"~{format_remaining(remaining)}" if remaining is not None else "Estimating"
-            return f"{phase}: {estimate} remaining (current phase); retry check in {wait}"
+            return self._with_future(f"{phase}: {estimate} remaining (current phase); retry check in {wait}")
         if remaining == 0:
-            return f"{phase}: phase complete"
+            return self._with_future(f"{phase}: phase complete")
         if self.last_progress is not None and now - self.last_progress > 15.0:
-            return f"{phase}: Estimating — no recent completed work"
+            return self._with_future(f"{phase}: Estimating — no recent completed work")
         if remaining is None:
-            return f"{phase}: Estimating — waiting for a known total and measured progress"
-        return f"{phase}: ~{format_remaining(remaining)} remaining (current phase)"
+            return self._with_future(f"{phase}: Estimating — waiting for a known total and measured progress")
+        estimate = f"{phase}: ~{format_remaining(remaining)} remaining (current phase)"
+        if self.plan and self.plan.get("future_phases"):
+            future = self.plan.get("future_seconds")
+            if isinstance(future, (int, float)) and math.isfinite(future) and future >= 0:
+                return f"{phase}: ~{format_remaining(remaining + future)} remaining (operation estimate from measured progress/history)"
+            return self._with_future(estimate)
+        return estimate
+
+    def _with_future(self, value):
+        if self.plan and self.plan.get('future_phases'):
+            names = ', '.join(str(name).replace('_', ' ') for name in self.plan['future_phases'])
+            future = self.plan.get('future_seconds')
+            detail = (f'~{format_remaining(future)} from measured history' if isinstance(future,(int,float))
+                      and math.isfinite(future) and future >= 0 else 'time not yet known')
+            return value + f'; later phases: {names} ({detail})'
+        return value

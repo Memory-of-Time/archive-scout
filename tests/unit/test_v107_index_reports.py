@@ -61,7 +61,7 @@ class IndexReportTests(unittest.TestCase):
         self.assertTrue(reports[0].detail["index_complete"])
         self.assertEqual(len(reports[0].detail["report_files"]), 4)
         self.assertEqual(self.counts()["scans"], 0)
-        self.assertEqual(VERSION, "1.0.8")
+        self.assertEqual(VERSION, "1.0.9")
 
     def test_zero_capture_index_still_writes_a_summary(self):
         with mock.patch("archive_scout.operations.index_archive"):

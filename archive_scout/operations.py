@@ -34,6 +34,7 @@ from .projects.merge import merge_projects
 from .reports.text import generate_index_reports, generate_reports
 from .research.index import build_research_index
 from .scanning.jobs import ScanJob
+from .scanning.workers import scanner_options
 from .scanning.rescanner import rescan_keyword_sets
 from .scanning.hitlist import load_hitlist, search_with_hitlist
 
@@ -287,12 +288,18 @@ def run_project(
     last_progress_write = 0.0
     last_progress_stage = ""
     progress_persist_interval = 5.0 if mode == "download_only" else 0.75
+    from .eta import OperationForecast
+    forecast = OperationForecast(database, config, mode) if config.dashboard_eta_enabled else None
 
     def operation_callback(event: ProgressEvent) -> None:
         nonlocal last_progress_write, last_progress_stage
         if config.dashboard_eta_enabled:
             event.detail = {**(event.detail or {}), "operation_run_id": operation_run_id}
-        if threading.get_ident() == owner_thread_id and event.stage not in {"backup_copy", "backup_compress", "full_text_rebuild"}:
+            if threading.get_ident() == owner_thread_id:
+                plan = forecast.observe(event)
+                if plan is not None:
+                    event.detail["eta_plan"] = plan
+        if threading.get_ident() == owner_thread_id and event.stage not in {"backup_copy", "backup_compress", "backup_verify", "full_text_rebuild"}:
             now = time.monotonic()
             completed_boundary = (
                 event.current is not None
@@ -441,10 +448,15 @@ def run_project(
     try:
         save_project_config(config)
         network_modes = {
-            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_errors", "retry_download_errors",
-            "media_all", "media_index", "media_download", "media_retry", "analysis",
+            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_download_errors",
+            "media_all", "media_index", "media_download", "media_retry",
         }
         eligible_at = float(saved_rate_pause_detail.get("eligible_at_epoch") or 0.0)
+        if eligible_at > time.time():
+            # Restore the deadline at actual admission, including mixed retries
+            # whose local phase can run immediately.
+            shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause).pause_for_rate_limit(
+                eligible_at - time.time(), reason="saved service cooldown")
         if mode in network_modes and eligible_at > time.time():
             remaining = max(0.0, eligible_at - time.time())
             _wait_for_archive(
@@ -459,7 +471,8 @@ def run_project(
             )
         if mode == "backup":
             path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep, max_mb=config.backup_max_mb,
-                                         **({"callback": original_callback} if config.dashboard_eta_enabled else {}))
+                                         stop_event=stop_event,
+                                         **({"callback": callback} if config.dashboard_eta_enabled else {}))
             emit(callback, ProgressEvent("backup", f"Backup written to {path}"))
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
@@ -519,7 +532,7 @@ def run_project(
             database.commit()
             return {"storage_compaction": report}
         if mode == "integrity":
-            path = check_project_integrity(config.output_dir, database, callback)
+            path = check_project_integrity(config.output_dir, database, callback, stop_event=stop_event)
             emit(callback, ProgressEvent("integrity", f"Integrity report written to {path}"))
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
@@ -707,11 +720,12 @@ def run_project(
                 scan_stats = _recovering_call("text acquisition and scan", lambda: download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs))
                 scan_incomplete = bool(scan_stats and int(scan_stats.get("scan_errors", 0)))
             elif mode == "rescan":
-                rescan_keyword_sets(database, jobs, stop_event, callback, workers=(config.scan_workers or None), report_config=config.report)
+                rescan_keyword_sets(database, jobs, stop_event, callback, workers=(config.scan_workers or None), report_config=config.report, **scanner_options(config))
             elif mode == "retry_errors":
                 _recovering_call("text retry", lambda: retry_error_urls(config, database, primary_run_id, stop_event, callback, jobs))
                 media_error_count = database.execute(
-                    "SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0 AND retryable=1 AND media_capture_id IS NOT NULL"
+                    "SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0 AND "
+                    + ("1=1" if config.retry_include_unavailable else "retryable=1") + " AND media_capture_id IS NOT NULL"
                 ).fetchone()[0]
                 if media_error_count:
                     _recovering_call("media retry", lambda: retry_media_errors(
@@ -861,6 +875,8 @@ def run_project(
         # Once worker pools have drained, checkpoint WAL so a clean Pause & Save
         # or normal shutdown has a small, self-contained durable database.
         try:
+            if forecast is not None:
+                forecast.persist()
             database.commit()
             database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:

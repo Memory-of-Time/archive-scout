@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from ..document_store import document_body
 from ..utils import normalize_search, utc_now
+from ..events import Stopped
 
 TOKEN_PATTERN = re.compile(r"[\w'-]+", re.UNICODE)
 
@@ -28,11 +29,10 @@ def simhash64(text: str) -> int:
     tokens = _tokens(text)
     if not tokens:
         return 0
-    features: list[str] = []
     if len(tokens) < 4:
         features = tokens
     else:
-        features = [" ".join(tokens[index:index + 4]) for index in range(len(tokens) - 3)]
+        features = (" ".join(tokens[index:index + 4]) for index in range(len(tokens) - 3))
     vector = [0] * 64
     counts: dict[str, int] = defaultdict(int)
     for feature in features:
@@ -75,111 +75,148 @@ class _UnionFind:
             self.parent[max(a, b)] = min(a, b)
 
 
-def cluster_duplicates(database: sqlite3.Connection, threshold: float = 0.90) -> DuplicateSummary:
+class _DiskMetricTree:
+    """Exact Hamming-radius search. No band approximation or bucket cutoff."""
+    def __init__(self, database):
+        self.db = database
+        database.execute("DROP TABLE IF EXISTS temp.archive_scout_duplicate_tree")
+        database.execute("CREATE TEMP TABLE archive_scout_duplicate_tree(id INTEGER PRIMARY KEY,value TEXT UNIQUE,parent INTEGER,distance INTEGER)")
+        database.execute("CREATE INDEX temp.archive_scout_duplicate_child ON archive_scout_duplicate_tree(parent,distance)")
+        self.root = None
+
+    def matches(self, value, radius, stop_event=None):
+        if self.root is None:
+            return
+        pending = [self.root]
+        while pending:
+            if stop_event is not None and stop_event.is_set():
+                raise Stopped
+            node = pending.pop()
+            stored = self.db.execute("SELECT value FROM archive_scout_duplicate_tree WHERE id=?", (node,)).fetchone()[0]
+            distance = (int(stored, 16) ^ value).bit_count()
+            if distance <= radius:
+                yield node
+            pending.extend(int(row[0]) for row in self.db.execute(
+                "SELECT id FROM archive_scout_duplicate_tree WHERE parent=? AND distance BETWEEN ? AND ?",
+                (node, distance - radius, distance + radius)))
+
+    def insert(self, document_id, value):
+        node = self.root
+        parent = None
+        distance = 0
+        while node is not None:
+            stored = self.db.execute("SELECT value FROM archive_scout_duplicate_tree WHERE id=?", (node,)).fetchone()[0]
+            distance = (int(stored, 16) ^ value).bit_count()
+            if distance == 0:
+                return node
+            parent = node
+            child = self.db.execute("SELECT id FROM archive_scout_duplicate_tree WHERE parent=? AND distance=?", (node, distance)).fetchone()
+            node = int(child[0]) if child else None
+        self.db.execute("INSERT INTO archive_scout_duplicate_tree VALUES(?,?,?,?)", (document_id, f"{value:016x}", parent, distance))
+        if self.root is None:
+            self.root = document_id
+        return document_id
+
+
+def cluster_duplicates(database: sqlite3.Connection, threshold: float = 0.90, *, stop_event=None, callback=None) -> DuplicateSummary:
     threshold = min(1.0, max(0.5, float(threshold)))
-    document_ids: list[int] = []
-    exact: dict[str, list[int]] = defaultdict(list)
-    for row in database.execute(
-        """
-        SELECT id,content_hash,normalized_hash
-        FROM documents ORDER BY id
-        """
-    ):
-        document_id = int(row["id"])
-        document_ids.append(document_id)
-        key = str(row["normalized_hash"] or row["content_hash"] or "")
-        if key:
-            exact[key].append(document_id)
-
-    union = _UnionFind(document_ids)
-    method_for_pair: dict[tuple[int, int], tuple[str, float]] = {}
-    for ids in exact.values():
-        if len(ids) < 2:
-            continue
-        first = ids[0]
-        for other in ids[1:]:
-            union.union(first, other)
-            method_for_pair[(min(first, other), max(first, other))] = ("exact", 1.0)
-
-    # Body text can dominate project memory. Compute each SimHash while its row
-    # is current and retain only the 64-bit result and compact bucket IDs.
-    hashes: dict[int, int] = {}
-    simhash_representatives: dict[int, int] = {}
-    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for row in database.execute(
-        "SELECT * FROM documents ORDER BY id"
-    ):
-        document_id = int(row["id"])
-        value = simhash64(document_body(row))
-        hashes[document_id] = value
-        representative = simhash_representatives.get(value)
-        if representative is not None:
-            union.union(representative, document_id)
-            method_for_pair.setdefault((representative, document_id), ("near", 1.0))
-            continue
-        simhash_representatives[value] = document_id
-        for band in range(4):
-            buckets[(band, (value >> (band * 16)) & 0xFFFF)].append(document_id)
-
-    for (band, _chunk), ids in buckets.items():
-        if len(ids) < 2:
-            continue
-        # Avoid pathological buckets created by empty or boilerplate-only pages.
-        if len(ids) > 2000:
-            ids = ids[:2000]
-        for index, left in enumerate(ids):
-            for right in ids[index + 1:]:
-                # The same pair can share multiple 16-bit bands. Process it only
-                # in the lowest shared band instead of retaining a project-wide
-                # set containing every candidate pair.
-                if any(
-                    ((hashes[left] >> (prior * 16)) & 0xFFFF)
-                    == ((hashes[right] >> (prior * 16)) & 0xFFFF)
-                    for prior in range(band)
-                ):
-                    continue
-                pair = (min(left, right), max(left, right))
-                similarity = hamming_similarity(hashes[left], hashes[right])
-                if similarity >= threshold:
-                    union.union(left, right)
-                    method_for_pair.setdefault(pair, ("near", similarity))
-
-    grouped: dict[int, list[int]] = defaultdict(list)
-    for document_id in document_ids:
-        grouped[union.find(document_id)].append(document_id)
-    groups = [sorted(ids) for ids in grouped.values() if len(ids) > 1]
-
-    with database:
-        database.execute("DELETE FROM duplicate_members")
-        database.execute("DELETE FROM duplicate_groups")
-        summary = DuplicateSummary()
-        for ids in sorted(groups, key=lambda item: (item[0], len(item))):
-            representative = ids[0]
-            all_exact = True
-            similarities: dict[int, float] = {representative: 1.0}
-            for document_id in ids[1:]:
-                pair = (min(representative, document_id), max(representative, document_id))
-                method, similarity = method_for_pair.get(
-                    pair,
-                    ("near", hamming_similarity(hashes[representative], hashes[document_id])),
-                )
-                if method != "exact":
-                    all_exact = False
-                similarities[document_id] = similarity
-            method = "exact" if all_exact else "near"
-            cursor = database.execute(
-                "INSERT INTO duplicate_groups(method,representative_document_id,created_at) VALUES(?,?,?)",
-                (method, representative, utc_now()),
-            )
-            group_id = int(cursor.lastrowid)
-            database.executemany(
-                "INSERT INTO duplicate_members(group_id,document_id,similarity) VALUES(?,?,?)",
-                ((group_id, document_id, similarities.get(document_id, 1.0)) for document_id in ids),
-            )
-            if method == "exact":
-                summary.exact_groups += 1
+    radius = max(distance for distance in range(65) if 1 - distance / 64 >= threshold)
+    def stopped():
+        if stop_event is not None and stop_event.is_set():
+            raise Stopped
+    database.execute("DROP TABLE IF EXISTS temp.archive_scout_duplicate_work")
+    database.execute("CREATE TEMP TABLE archive_scout_duplicate_work(id INTEGER PRIMARY KEY,parent INTEGER,key TEXT,value TEXT,active INTEGER NOT NULL DEFAULT 0)")
+    database.execute("INSERT INTO archive_scout_duplicate_work(id,parent,key) SELECT id,id,COALESCE(NULLIF(normalized_hash,''),content_hash,'') FROM documents")
+    database.execute("CREATE INDEX temp.archive_scout_duplicate_exact ON archive_scout_duplicate_work(key,id)")
+    def find(value):
+        root = value
+        while True:
+            parent = int(database.execute("SELECT parent FROM archive_scout_duplicate_work WHERE id=?", (root,)).fetchone()[0])
+            if root == parent:
+                break
+            grandparent = int(database.execute("SELECT parent FROM archive_scout_duplicate_work WHERE id=?", (parent,)).fetchone()[0])
+            database.execute("UPDATE archive_scout_duplicate_work SET parent=? WHERE id=?", (grandparent, root))
+            root = parent
+        return root
+    active_components = 0
+    def union(left, right):
+        nonlocal active_components
+        a, b = find(left), find(right)
+        if a != b:
+            first, second = min(a,b), max(a,b)
+            if active_components:
+                first_active = database.execute("SELECT active FROM archive_scout_duplicate_work WHERE id=?", (first,)).fetchone()[0]
+                second_active = database.execute("SELECT active FROM archive_scout_duplicate_work WHERE id=?", (second,)).fetchone()[0]
+                if first_active and second_active:
+                    active_components -= 1
+                if second_active and not first_active:
+                    database.execute("UPDATE archive_scout_duplicate_work SET active=1 WHERE id=?", (first,))
+            database.execute("UPDATE archive_scout_duplicate_work SET parent=? WHERE id=?", (first, second))
+    tree = _DiskMetricTree(database)
+    try:
+        previous_key = None
+        representative = None
+        for row in database.execute("SELECT id,key FROM archive_scout_duplicate_work WHERE key<>'' ORDER BY key,id"):
+            stopped()
+            if row['key'] == previous_key:
+                union(representative, int(row['id']))
             else:
-                summary.near_groups += 1
-            summary.grouped_documents += len(ids)
-    return summary
-
+                previous_key, representative = row['key'], int(row['id'])
+        total = int(database.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+        for index, row in enumerate(database.execute("SELECT d.*,c.mimetype,c.detected_encoding FROM documents d JOIN captures c ON c.id=d.capture_id ORDER BY d.id"), 1):
+            stopped()
+            document_id = int(row['id'])
+            value = simhash64(document_body(row))
+            database.execute("UPDATE archive_scout_duplicate_work SET value=? WHERE id=?", (f"{value:016x}", document_id))
+            identical = database.execute("SELECT id FROM archive_scout_duplicate_tree WHERE value=?", (f"{value:016x}",)).fetchone()
+            if identical:
+                union(int(identical[0]), document_id)
+            else:
+                for other in tree.matches(value, radius, stop_event):
+                    union(document_id, other)
+                    # The published contract is complete connected groups. Once
+                    # every inserted fingerprint belongs to one component, any
+                    # further matching edges are redundant. Keep every distinct
+                    # fingerprint in the tree so later bridges remain discoverable.
+                    if active_components == 1:
+                        break
+                tree.insert(document_id, value)
+            root = find(document_id)
+            if not database.execute("SELECT active FROM archive_scout_duplicate_work WHERE id=?", (root,)).fetchone()[0]:
+                database.execute("UPDATE archive_scout_duplicate_work SET active=1 WHERE id=?", (root,))
+                active_components += 1
+            if callback and (index % 100 == 0 or index == total):
+                from ..events import ProgressEvent
+                callback(ProgressEvent('duplicates', f'Compared {index:,}/{total:,} document fingerprints', index, total))
+        for row in database.execute("SELECT id FROM archive_scout_duplicate_work ORDER BY id"):
+            stopped()
+            find(int(row[0]))
+        database.execute("CREATE INDEX temp.archive_scout_duplicate_groups ON archive_scout_duplicate_work(parent,id)")
+        summary = DuplicateSummary()
+        if callback:
+            from ..events import ProgressEvent
+            callback(ProgressEvent('duplicates_publish', 'Publishing complete duplicate groups'))
+        stopped()
+        with database:
+            database.execute("DELETE FROM duplicate_members")
+            database.execute("DELETE FROM duplicate_groups")
+            for group in database.execute("SELECT parent,COUNT(*) FROM archive_scout_duplicate_work GROUP BY parent HAVING COUNT(*)>1 ORDER BY parent"):
+                stopped()
+                representative, size = int(group[0]), int(group[1])
+                first = database.execute("SELECT key,value FROM archive_scout_duplicate_work WHERE id=?", (representative,)).fetchone()
+                all_exact = bool(first['key']) and not database.execute(
+                    "SELECT 1 FROM archive_scout_duplicate_work WHERE parent=? AND key<>? LIMIT 1", (representative, first['key'])).fetchone()
+                method = 'exact' if all_exact else 'near'
+                cursor = database.execute("INSERT INTO duplicate_groups(method,representative_document_id,created_at) VALUES(?,?,?)", (method, representative, utc_now()))
+                group_id = int(cursor.lastrowid)
+                for member in database.execute("SELECT id,value FROM archive_scout_duplicate_work WHERE parent=? ORDER BY id", (representative,)):
+                    stopped()
+                    similarity = 1.0 if all_exact else hamming_similarity(int(first['value'],16), int(member['value'],16))
+                    database.execute("INSERT INTO duplicate_members(group_id,document_id,similarity) VALUES(?,?,?)", (group_id, int(member['id']), similarity))
+                summary.exact_groups += int(all_exact)
+                summary.near_groups += int(not all_exact)
+                summary.grouped_documents += size
+        return summary
+    finally:
+        database.execute("DROP TABLE IF EXISTS temp.archive_scout_duplicate_work")
+        database.execute("DROP TABLE IF EXISTS temp.archive_scout_duplicate_tree")

@@ -145,7 +145,7 @@ def _candidate(database: sqlite3.Connection, match_id: int, excerpt_chars: int) 
     row = database.execute(
         """
         SELECT m.id,m.score,m.snippets_json,m.hits_json,d.*,
-               c.original_url,c.timestamp
+               c.original_url,c.timestamp,c.mimetype,c.detected_encoding
         FROM document_matches m
         JOIN documents d ON d.id=m.document_id
         JOIN captures c ON c.id=d.capture_id

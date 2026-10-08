@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover - fallback retained for source-only enviro
 from .constants import BINARY_EXTENSIONS, TEXT_EXTENSIONS
 from .resource_detection import structural_payload_class
 from .utils import clean_space
+from .text_encoding import decode_text, encoding_candidates, TextDecodingError
 
 URL_PATTERN = re.compile(r'''(?ix)\b(?:https?://|ftp://|www\.)[^\s<>"'()\[\]{}]+''')
 TITLE_PATTERN = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
@@ -37,9 +38,14 @@ class PageParser(HTMLParser):
         self.links: list[str] = []
         self.text: list[str] = []
         self.ignore_depth = 0
+        self.head_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         lowered = tag.lower()
+        if lowered == 'head':
+            self.head_depth += 1
+        elif lowered == 'body':
+            self.head_depth = 0
         if lowered in {"script", "style", "noscript", "svg"}:
             self.ignore_depth += 1
         for key, value in attrs:
@@ -48,11 +54,13 @@ class PageParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
+        if lowered == 'head' and self.head_depth:
+            self.head_depth -= 1
         if lowered in {"script", "style", "noscript", "svg"} and self.ignore_depth:
             self.ignore_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        if not self.ignore_depth and data:
+        if not self.ignore_depth and not self.head_depth and data:
             self.text.append(data)
 
 
@@ -83,50 +91,11 @@ def title_from_html(raw: str) -> str:
 
 
 def _encoding_candidates(data: bytes, content_type: str = "") -> list[str]:
-    if data.startswith(codecs.BOM_UTF8):
-        return ["utf-8-sig", "utf-8"]
-    if data.startswith(codecs.BOM_UTF32_LE):
-        return ["utf-32-le"]
-    if data.startswith(codecs.BOM_UTF32_BE):
-        return ["utf-32-be"]
-    if data.startswith(codecs.BOM_UTF16_LE):
-        return ["utf-16-le"]
-    if data.startswith(codecs.BOM_UTF16_BE):
-        return ["utf-16-be"]
-    candidates: list[str] = []
-    charset_match = CHARSET_PATTERN.search(content_type or "")
-    if charset_match:
-        candidates.append(charset_match.group(1))
-    head = data[:16384].decode("ascii", "ignore")
-    meta_match = CHARSET_PATTERN.search(head)
-    if meta_match:
-        candidates.append(meta_match.group(1))
-    xml_match = re.search(r"(?i)<\?xml[^>]+encoding\s*=\s*[\"']([^\"']+)[\"']", head)
-    if xml_match:
-        candidates.append(xml_match.group(1))
-    sample = data[:4096]
-    if len(sample) >= 8:
-        even_nuls = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
-        odd_nuls = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
-        halves = max(1, len(sample) // 2)
-        if odd_nuls / halves > 0.25 and even_nuls / halves < 0.05:
-            candidates.append("utf-16-le")
-        elif even_nuls / halves > 0.25 and odd_nuls / halves < 0.05:
-            candidates.append("utf-16-be")
-    candidates.extend(["utf-8", "windows-1252", "latin-1"])
-    return list(dict.fromkeys(value.casefold() for value in candidates if value))
+    return encoding_candidates(data, content_type)
 
 
 def decode_bytes_with_encoding(data: bytes, content_type: str = "") -> tuple[str, str]:
-    """Decode once, retaining both the source and its actual encoding label."""
-    candidates = _encoding_candidates(data, content_type)
-    for encoding in candidates:
-        try:
-            return data.decode(encoding), encoding
-        except (LookupError, UnicodeDecodeError):
-            continue
-    encoding = candidates[0] if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)) else "utf-8"
-    return data.decode(encoding, "replace"), encoding
+    return decode_text(data, content_type)
 
 
 def detect_encoding(data: bytes, content_type: str = "") -> str:
@@ -142,6 +111,10 @@ def has_binary_signature(data: bytes, content_type: str = "") -> bool:
     return kind in {"image", "video", "audio", "other_binary"}
 
 
+def _wide_encoding_hint(data: bytes, content_type: str) -> bool:
+    return data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)) or bool(re.search(r"utf[-_]?16|utf[-_]?32", content_type or "", re.I))
+
+
 def looks_textual_bytes(data: bytes, content_type: str = "") -> bool:
     structural, _reason = structural_payload_class(data[:16384], content_type)
     if structural == "text":
@@ -150,14 +123,20 @@ def looks_textual_bytes(data: bytes, content_type: str = "") -> bool:
         return False
     if not data:
         return True
-    for encoding in _encoding_candidates(data[:16384], content_type):
+    try:
+        candidates = (_encoding_candidates(data[:16384], content_type)
+                      if b"\x00" in data[:16384] or _wide_encoding_hint(data, content_type) else [])
+    except TextDecodingError:
+        # Preserve ambiguous text for a visible decoding error during full scan.
+        return (content_type or "").casefold().startswith("text/")
+    for encoding in candidates:
         if not encoding.startswith(("utf-16", "utf-32")):
             continue
         try:
             decoded = codecs.getincrementaldecoder(encoding)("strict").decode(data[:16384], final=False)
             if decoded and sum(ch.isprintable() or ch.isspace() for ch in decoded) / max(1, len(decoded)) > 0.85:
                 return True
-        except (LookupError, UnicodeDecodeError):
+        except (LookupError, UnicodeError):
             pass
     sample = data[:8192]
     if b"\x00" in sample:

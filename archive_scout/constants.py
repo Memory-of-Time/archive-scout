@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 SCHEMA_VERSION = 13
 
 # Shared September 2026 Wayback operating profile. These values describe

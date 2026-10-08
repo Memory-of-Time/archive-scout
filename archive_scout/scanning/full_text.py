@@ -58,7 +58,7 @@ def search_documents(
     params.append(max(1, min(int(limit), 10000)))
     rows = database.execute(
         """
-        SELECT d.*,c.original_url AS capture_original_url,c.timestamp,c.mimetype,bm25(documents_fts) AS rank
+        SELECT d.*,c.original_url AS capture_original_url,c.timestamp,c.mimetype,c.detected_encoding,bm25(documents_fts) AS rank
         FROM documents_fts
         JOIN document_fts_versions v ON v.fts_rowid=documents_fts.rowid
         JOIN documents d ON d.id=v.document_id

@@ -7,7 +7,8 @@ import urllib.error
 import httpx
 import urllib3
 
-from ..network.transports import is_local_storage_error, is_transport_connection_failure, is_transport_read_timeout, is_transport_timeout
+from ..network.transports import PayloadValidationError, is_local_storage_error, is_transport_connection_failure, is_transport_read_timeout, is_transport_timeout
+from ..text_encoding import TextDecodingError
 
 
 def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
@@ -25,6 +26,11 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     explicit_category = str(getattr(exc, "category", "") or "").strip()
     message = str(exc)
     folded = message.casefold()
+
+    if isinstance(exc, PayloadValidationError):
+        return "payload_validation", status, True
+    if isinstance(exc, TextDecodingError):
+        return "content_encoding", status, True
 
     if explicit_category:
         permanent = {

@@ -49,11 +49,13 @@ def _record_startup_error() -> Path:
     return path
 
 
-try:
-    from archive_scout.app import main
-
-    main()
-except BaseException:
-    startup_log = _record_startup_error()
-    _show_macos_startup_alert(startup_log)
-    raise
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    try:
+        from archive_scout.app import main
+        main()
+    except BaseException:
+        startup_log = _record_startup_error()
+        _show_macos_startup_alert(startup_log)
+        raise

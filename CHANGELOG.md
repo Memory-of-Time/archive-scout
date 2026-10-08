@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.9
+
+- Count fresh, validated, manifest-committed saves separately from retries and adoption, with bounded rolling throughput and typed failure counters.
+- Interrupt stalled request-owned sockets, preserve curl prefixes and renew unhealthy pools only after active owners drain, retaining service cooldowns and pacing.
+- Share strict full-body/preview decoding and propagate the recorded encoding through local scanning, research, analysis and excerpts.
+- Overlap retained scanning with acquisition; use bounded spawn workers for large/regex scans, consistent worker controls and complete oversize-file handling.
+- Run saved-body retries before network admission, offer explicit manual unavailable-capture rechecks and keep retry selections in SQLite.
+- Preserve imported source versions with hash-addressed files; stream Integrity and maintenance work; validate and atomically publish backups before pruning.
+- Restore through SQLite with committed source WAL, validated safety snapshots and preserved active readers; roll back interrupted copies instead of replacing live project files.
+- Replace incomplete near-duplicate candidate cutoffs with exact Hamming-radius search and use a named linear snapshot-difference measure with complete change counts.
+- Keep future ETA phases explicit, bound measured history, propagate analysis cancellation and use UTF-8 structured CLI output.
+- Disable writer mapping to reduce mapping exposure, retain schema 13 and add source/frozen CLI completeness checks to the platform workflows; the excluded conflicting-WAL fixture's origin remains unproven.
+
 ## 1.0.8
 
 - Bound retained-scan/rescan write batches by count, memory and elapsed time; commit before progress and flush received work on cancellation. Preserve discard-after-scan durability.

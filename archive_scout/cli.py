@@ -353,6 +353,12 @@ def cli_main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
+        if getattr(args, 'format', None) in {'json', 'jsonl'}:
+            # Automation output has one encoding on every platform, including
+            # redirected Windows/frozen consoles and archived Unicode snippets.
+            reconfigure = getattr(sys.stdout, 'reconfigure', None)
+            if reconfigure is not None:
+                reconfigure(encoding='utf-8', errors='strict')
         if args.command == "run":
             return _run_command(args)
         if args.command == "init":

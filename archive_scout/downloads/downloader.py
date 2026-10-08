@@ -44,17 +44,21 @@ from ..database.repositories import (
     upsert_document,
 )
 from ..events import ConnectivityPaused, ProgressEvent, Stopped
+from ..text_encoding import decode_prefix, TextDecodingError
 from .recovery import wait_for_archive
 from ..parsing.embeds import extract_embed_candidates_fast
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..scanning.jobs import ScanJob
+from ..scanning.workers import scanner_workers
 from ..scanning.batches import BoundedResultWriter
+from ..scanning.executor import ScanExecutor, ScanByteBudget
 from ..scanning.keywords import compile_prefilter
 from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..storage import capture_path as url_capture_path, sha256_file
 from ..utils import hash_text, normalize_search, utc_now
 from .rate_limit import (SharedFixedRateLimiter, WAYBACK_REPLAY_RATE_KEY, shared_host_gate)
 from .validation import classify_exception
+from .metrics import CommittedThroughput
 from ..network.transports import PreviewRejected, RedirectPolicyError, is_local_storage_error
 
 CLASSIFIER_REVISION = 2
@@ -744,13 +748,19 @@ def _download_capture(
             "content_type": str(content_type), "http_status": response["status"],
             "final_url": response["final_url"],
         }
-    preview_text = decode_bytes(preview, str(content_type))
+    try:
+        preview_text, encoding = decode_prefix(preview, str(content_type))
+    except TextDecodingError:
+        # Preserve the complete raw evidence. A full scan will record a visible
+        # decoding failure instead of silently accepting an ambiguous charset.
+        preview_text = ""
+        charset = CHARSET_PATTERN.search(str(content_type))
+        encoding = charset.group(1) if charset else ""
     replay_problem = classify_replay_content(preview_text, str(response["final_url"]))
     if replay_problem:
         temp.unlink(missing_ok=True)
         raise RuntimeError(replay_problem)
     os.replace(temp, path)
-    charset = CHARSET_PATTERN.search(str(content_type))
     return {
         "kind": "downloaded",
         "capture_id": int(row["id"]), "path": path,
@@ -758,7 +768,7 @@ def _download_capture(
         "content_hash": str(response["content_hash"]),
         "http_status": response["status"], "final_url": response["final_url"],
         "content_type": str(content_type), "preview": preview,
-        "encoding": charset.group(1) if charset else "",
+        "encoding": encoding,
     }
 
 
@@ -768,7 +778,7 @@ def _scan_saved_capture(
     data = path.read_bytes()
     content_type = str(row.get("mimetype") or "")
     if row.get("detected_encoding"):
-        content_type += "; charset=" + str(row["detected_encoding"])
+        content_type = content_type.split(';', 1)[0] + "; charset=" + str(row["detected_encoding"])
     if not looks_textual_bytes(data[:16384], content_type):
         return {"kind": "non_text", "capture_id": int(row["id"]), "path": path}
     content_hash = hashlib.sha256(data).hexdigest()
@@ -1088,7 +1098,7 @@ def _current_discard_spool_bytes(database: sqlite3.Connection, root: Path) -> in
            WHERE payload_origin='acquired' AND payload_retention='discard_after_scan'
              AND payload_availability IN ('partial','spooled_unscanned','cleanup_pending')
              AND local_path IS NOT NULL"""
-    ).fetchall()
+    )
     for row in rows:
         path = _owned_capture_path(root, str(row["local_path"] or ""))
         if path is None:
@@ -1214,6 +1224,7 @@ def _acquire_archive(
             ))) if callback else None
         ),
     )
+    scan_mode = bool(scan_jobs)
     discard_mode = bool(scan_jobs) and config.text_retention == "discard_after_scan"
     scan_jobs = list(scan_jobs or [])
     if callback:
@@ -1262,13 +1273,17 @@ def _acquire_archive(
     last_emit = 0.0
     last_flush = started
     flush_count = max(32, min(128, config.workers * 8))
+    committed = CommittedThroughput()
+    adoption_buffer: list[bool] = []
     success_buffer: list[tuple[str, str, str, str, str, int, str, int, int, int, str]] = []
     skipped_buffer: list[tuple[int, str]] = []
     error_buffer: list[tuple[int, dict[str, object], BaseException]] = []
 
     scan_workers = 0
     scan_limit = 0
-    scan_pool: concurrent.futures.ThreadPoolExecutor | None = None
+    scan_pool = None
+    scan_budget = ScanByteBudget(config.scan_memory_mb)
+    scan_reservations = {}
     scan_futures: dict[concurrent.futures.Future, tuple[dict[str, object], int, bool]] = {}
     waiting_scan: deque[tuple[dict[str, object], int, bool]] = deque()
     spool_bytes = _current_discard_spool_bytes(database, config.output_dir) if discard_mode else 0
@@ -1289,13 +1304,10 @@ def _acquire_archive(
     backpressure_active = False
     scan_completed = scan_matched = scan_failures = 0
     retained_failure_bytes = 0
-    if discard_mode:
-        scan_workers = config.scan_workers or min(4, max(1, (os.cpu_count() or 4) // 2))
-        scan_workers = max(1, min(8, int(scan_workers)))
+    if scan_mode:
+        scan_workers = scanner_workers(config.scan_workers, overlap=True)
         scan_limit = max(scan_workers * 3, scan_workers)
-        scan_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=scan_workers, thread_name_prefix="archive-discard-scan"
-        )
+        scan_pool = ScanExecutor(scan_workers, scan_jobs, config=config, total=total, backend=config.scan_backend)
 
     def network_metrics() -> dict[str, float | int]:
         getter = getattr(client, "metrics_snapshot", None)
@@ -1391,6 +1403,8 @@ def _acquire_archive(
                         ),
                         target=str(item["original_url"]), http_status=status,
                     )
+        committed.commit((row[7] for row in success_buffer), adoption_buffer)
+        adoption_buffer.clear()
         success_buffer.clear()
         skipped_buffer.clear()
         error_buffer.clear()
@@ -1445,11 +1459,17 @@ def _acquire_archive(
         ready_downloads.extend(staged)
 
     def schedule_discard_scans() -> None:
-        if not discard_mode or scan_pool is None:
+        if not scan_mode or scan_pool is None:
             return
         scheduled: list[tuple[dict[str, object], int, bool]] = []
         while waiting_scan and len(scan_futures) + len(scheduled) < scan_limit:
-            scheduled.append(waiting_scan.popleft())
+            reservation = scan_budget.estimate(waiting_scan[0][0])
+            if not scan_budget.accepts(reservation):
+                break
+            item = waiting_scan.popleft()
+            scan_budget.reserve(reservation)
+            scan_reservations[int(item[0]["id"])] = reservation
+            scheduled.append(item)
         if scheduled:
             now = utc_now()
             with database:
@@ -1464,7 +1484,7 @@ def _acquire_archive(
 
     def process_discard_scans(timeout: float = 0.0) -> None:
         nonlocal spool_bytes, scan_completed, scan_matched, scan_failures, retained_failure_bytes
-        if not discard_mode or not scan_futures:
+        if not scan_mode or not scan_futures:
             return
         done, _ = concurrent.futures.wait(
             tuple(scan_futures), timeout=timeout,
@@ -1479,6 +1499,7 @@ def _acquire_archive(
             for future in done:
                 item, size, discard_eligible = scan_futures.pop(future)
                 capture_id = int(item["id"])
+                scan_budget.release(scan_reservations.pop(capture_id))
                 try:
                     outcome = future.result()
                 except Exception as exc:
@@ -1554,7 +1575,8 @@ def _acquire_archive(
         metrics = network_metrics()
         starts = int(metrics["request_starts"])
         completions = int(metrics["request_completions"])
-        request_failures = int(metrics.get("request_failures", 0))
+        request_failures = int(metrics.get("transport_failures", metrics.get("request_failures", 0)))
+        saved_metrics = committed.snapshot()
         retries = int(metrics["retry_waits"]) + int(metrics["rate_limit_events"])
         worker_wait_seconds = (
             float(metrics["pacing_wait_seconds"])
@@ -1568,13 +1590,14 @@ def _acquire_archive(
         discard_detail = (
             f"; scanned {scan_completed:,}; scan errors {scan_failures:,}; spool {spool_bytes / (1024*1024):.1f} MiB; "
             f"retained failed-scan bytes {retained_failure_bytes / (1024*1024):.1f} MiB"
-            if discard_mode else ""
+            if scan_mode else ""
         )
         callback(ProgressEvent(
             progress_stage,
             f"{label}: wire request starts {starts:,} ({starts/elapsed:.1f}/s); "
             f"responses {completions:,}; transport failures {request_failures:,}; "
-            f"saved {downloaded:,} ({downloaded/elapsed:.1f}/s); retries {retries:,}; "
+            f"fresh committed {saved_metrics['fresh_committed']:,} ({saved_metrics['fresh_rate_60s']:.1f}/s recent, "
+            f"{saved_metrics['fresh_average_rate']:.1f}/s average); adopted {saved_metrics['adopted_existing']:,}; retries {retries:,}; "
             f"worker waits {worker_wait_seconds:.1f} worker-s; service gate {float(metrics.get('service_gate_wall_seconds', 0.0)):.1f} wall-s; "
             f"delayed retries {len(delayed_retries):,}; "
             f"skipped {skipped + metadata_skipped + url_skipped:,}; errors {failures:,}; {settled:,}/{total:,}" + discard_detail,
@@ -1597,13 +1620,16 @@ def _acquire_archive(
                 "network_seconds": network_seconds,
                 "network_bytes": network_bytes,
                 "downloaded": downloaded,
-                "download_rate": downloaded / elapsed,
+                "download_rate": saved_metrics["fresh_rate_60s"],
+                **saved_metrics,
+                **{key: int(metrics.get(key, 0)) for key in ("service_response_failures", "validation_failures", "storage_failures", "cancelled_attempts")},
                 "skipped": skipped + metadata_skipped + url_skipped,
                 "failures": failures,
                 "pending": max(0, total - settled),
                 "downloaded_unscanned": downloaded,
                 "download_workers": config.workers,
-                "scan_workers": scan_workers if discard_mode else 0,
+                "scan_workers": scan_workers if scan_mode else 0,
+                "scan_backend": scan_pool.backend if scan_pool else None,
                 "scan_completed": scan_completed,
                 "scan_matches": scan_matched,
                 "scan_failures": scan_failures,
@@ -1688,7 +1714,7 @@ def _acquire_archive(
                 slots -= 1
 
             if not futures:
-                if discard_mode:
+                if scan_mode:
                     flush_results(force=True)
                     schedule_discard_scans()
                     process_discard_scans(0.05 if scan_futures else 0.0)
@@ -1773,8 +1799,11 @@ def _acquire_archive(
                         int(result["http_status"]), str(result["final_url"]), int(result["bytes_saved"]),
                         CLASSIFIER_REVISION, capture_id, str(result.get("encoding") or ""),
                     ))
+                    adoption_buffer.append(adopted_existing)
                     downloaded += 1
-                    if discard_mode:
+                    if scan_mode and (discard_mode or len(waiting_scan) < scan_limit * 2):
+                        # Excess retained work remains in the durable manifest;
+                        # the final local phase drains it without a RAM backlog.
                         scan_item = dict(item)
                         scan_item.update(result)
                         scan_item["local_path"] = str(path)
@@ -1829,7 +1858,7 @@ def _acquire_archive(
                     error_buffer.append((capture_id, item, exc))
                     failures += 1
 
-            flush_results(force=discard_mode and bool(waiting_scan))
+            flush_results(force=scan_mode and bool(waiting_scan))
             schedule_discard_scans()
             process_discard_scans(0.0)
             schedule_discard_scans()
@@ -1857,7 +1886,7 @@ def _acquire_archive(
             if scan_pool is not None:
                 for future in scan_futures:
                     future.cancel()
-                scan_pool.shutdown(wait=True, cancel_futures=True)
+                scan_pool.shutdown(cancel=True)
         # Atomic finals from workers that settled during cancellation are
         # adopted by the existing file recovery path. No new worker generation
         # can own their .part paths until this executor has fully stopped.
@@ -1865,7 +1894,7 @@ def _acquire_archive(
     else:
         pool.shutdown(wait=True)
         if scan_pool is not None:
-            scan_pool.shutdown(wait=True)
+            scan_pool.shutdown()
         flush_results(force=True)
         emit_progress(force=True)
         metrics = network_metrics()
@@ -1875,7 +1904,10 @@ def _acquire_archive(
             "skipped": skipped + int(selection_stats["metadata_skipped"]) + int(selection_stats["url_skipped"]),
             "errors": failures,
             "scan_errors": scan_failures,
+            "scanned": scan_completed,
+            "matched": scan_matched,
             "elapsed": time.monotonic() - started,
+            **committed.snapshot(),
             "http_starts": int(metrics["request_starts"]),
             "http_completions": int(metrics["request_completions"]),
         }
@@ -1924,8 +1956,7 @@ def _scan_pending_captures(
             callback(ProgressEvent("scan", "No downloaded captures are waiting for scanning.", 0, 0))
         return {"queued": 0, "scanned": 0, "matched": 0, "skipped": 0, "errors": 0, "elapsed": 0.0}
 
-    scan_workers = config.scan_workers or min(8, max(1, (os.cpu_count() or 4) - 1))
-    scan_workers = max(1, min(32, scan_workers))
+    scan_workers = scanner_workers(config.scan_workers)
     inflight_limit = max(scan_workers, scan_workers * 3)
     # Keep the long-standing helper/mocking contract for retain mode. Only the
     # destructive discard path needs the additional selector flag.
@@ -1936,6 +1967,9 @@ def _scan_pending_captures(
     )
     futures: dict[concurrent.futures.Future, dict[str, object]] = {}
     exhausted = False
+    deferred_row = None
+    budget = ScanByteBudget(config.scan_memory_mb)
+    reservations = {}
     submitted = scanned = matched = skipped = failures = 0
     started = time.monotonic()
     last_emit = 0.0
@@ -1966,6 +2000,8 @@ def _scan_pending_captures(
                 "skipped": skipped,
                 "failures": failures,
                 "scan_workers": scan_workers,
+                **pool.metrics_snapshot(),
+                "scan_reserved_bytes": budget.used,
             },
         ))
 
@@ -2018,9 +2054,7 @@ def _scan_pending_captures(
     writer = None if discard_mode else BoundedResultWriter(persist_results)
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=scan_workers, thread_name_prefix="archive-scan"
-        ) as pool:
+        with ScanExecutor(scan_workers, jobs, config=config, total=total, backend=config.scan_backend) as pool:
             while True:
                 if stop_event.is_set():
                     raise Stopped
@@ -2029,11 +2063,19 @@ def _scan_pending_captures(
                 batch: list[dict[str, object]] = []
                 while not exhausted and len(batch) < slots:
                     try:
-                        row = next(row_iter)
+                        row = deferred_row if deferred_row is not None else next(row_iter)
+                        deferred_row = None
                     except StopIteration:
                         exhausted = True
                         break
-                    batch.append(dict(row))
+                    item = dict(row)
+                    reservation = budget.estimate(item)
+                    if not budget.accepts(reservation):
+                        deferred_row = row
+                        break
+                    budget.reserve(reservation)
+                    reservations[int(item["id"])] = reservation
+                    batch.append(item)
                 if batch:
                     now = utc_now()
                     with database:
@@ -2066,6 +2108,7 @@ def _scan_pending_captures(
                 results: list[tuple[dict[str, object], dict | BaseException]] = []
                 for future in done:
                     item = futures.pop(future)
+                    budget.release(reservations.pop(int(item["id"])))
                     try:
                         results.append((item, future.result()))
                     except Exception as exc:
@@ -2089,7 +2132,7 @@ def _scan_pending_captures(
             "errors": failures,
             "elapsed": time.monotonic() - started,
         }
-    except Stopped:
+    except BaseException:
         if writer is not None:
             writer.flush()
         for future in futures:
@@ -2152,16 +2195,22 @@ def download_archive(
                 progress_stage="download", scan_jobs=jobs,
             )
             aggregate["scan_errors"] += int(acquire_stats.get("scan_errors", 0))
+            aggregate["scanned"] += int(acquire_stats.get("scanned", 0))
+            aggregate["matched"] += int(acquire_stats.get("matched", 0))
     else:
-        # Preserve the established acquisition-first contract even when runtime
-        # settings require per-target replay pools: acquire every target first,
-        # then drain the local scan backlog target by target.
+        # Retained files are immutable, durable work. Overlap bounded local
+        # scans with network acquisition; SQLite stays solely in this parent.
         for runtime_config in runtime_configs:
-            _acquire_archive(
+            acquire_stats = _acquire_archive(
                 runtime_config, database, stop_event, callback,
                 patterns=combined_patterns, states=states, capture_ids=capture_ids,
                 progress_stage="download",
+                **({"scan_jobs": jobs} if config.scan_overlap else {}),
             )
+            if isinstance(acquire_stats, dict):
+                aggregate["scanned"] += int(acquire_stats.get("scanned", 0))
+                aggregate["matched"] += int(acquire_stats.get("matched", 0))
+                aggregate["scan_errors"] += int(acquire_stats.get("scan_errors", 0))
         for runtime_config in runtime_configs:
             scan_stats = _scan_pending_captures(
                 runtime_config, database, jobs, stop_event, callback, capture_ids=capture_ids

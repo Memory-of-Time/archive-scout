@@ -275,6 +275,9 @@ class ArchiveScoutApp(tk.Tk):
         self.page_size_var = tk.StringVar(value="100000")
         self.workers_var = tk.StringVar(value="10")
         self.scan_workers_var = tk.StringVar(value="0")
+        self.scan_backend_var = tk.StringVar(value="auto")
+        self.scan_overlap_var = tk.BooleanVar(value=True)
+        self.scan_memory_mb_var = tk.StringVar(value="256")
         self.max_file_var = tk.StringVar(value="25")
         self.minimum_score_var = tk.StringVar(value="1")
         self.report_output_vars = {name: tk.BooleanVar(value=True) for name in REPORT_OUTPUT_NAMES}
@@ -374,6 +377,7 @@ class ArchiveScoutApp(tk.Tk):
         self.research_limit_var = tk.StringVar(value="100")
         self.error_category_var = tk.StringVar(value="All")
         self.error_status_filter_var = tk.StringVar(value="Open")
+        self.retry_include_unavailable_var = tk.BooleanVar(value=False)
         self.error_page_var = tk.StringVar(value="Page 1")
         self.history_page_var = tk.StringVar(value="Page 1")
         self.forum_profile_var = tk.StringVar(value="auto")
@@ -1393,6 +1397,7 @@ class ArchiveScoutApp(tk.Tk):
         perf_rows = [
             ("Download workers (10 = fast default)", self.workers_var),
             ("Scanner workers (0 = automatic)", self.scan_workers_var),
+            ("Scanner memory reservation (MiB)", self.scan_memory_mb_var),
             ("Maximum text-page budget (MB)", self.max_file_var),
             ("Index/CDX spacing (2.5 sec = 24/min shared ceiling)", self.cdx_delay_var),
             ("Replay spacing (0.125 sec = 8/sec shared ceiling)", self.download_delay_var),
@@ -1401,6 +1406,11 @@ class ArchiveScoutApp(tk.Tk):
             ttk.Label(performance, text=label + ":", wraplength=360).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(performance, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         row = len(perf_rows)
+        ttk.Label(performance, text="Scanner engine:").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Combobox(performance, textvariable=self.scan_backend_var, values=("auto", "process", "thread"), state="readonly").grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        row += 1
+        ttk.Checkbutton(performance, text="Scan saved captures while downloading", variable=self.scan_overlap_var).grid(row=row, column=0, columnspan=2, sticky="w", pady=3)
+        row += 1
         ttk.Label(performance, text="Download scope:").grid(row=row, column=0, sticky="w", pady=3)
         ttk.Combobox(performance, textvariable=self.scope_var, values=list(SCOPE_LABELS), state="readonly").grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         ttk.Label(
@@ -1811,6 +1821,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(controls, text="›", width=3, command=self.next_error_page).grid(row=0, column=7, padx=2)
         ttk.Button(controls, text="Retry selected errors", command=self.retry_selected_errors).grid(row=0, column=8, padx=(8, 2))
         ttk.Button(controls, text="Ignore selected", command=self.ignore_selected_errors).grid(row=0, column=9, padx=2)
+        ttk.Checkbutton(controls, text="Recheck unavailable captures during manual retries", variable=self.retry_include_unavailable_var).grid(row=1, column=0, columnspan=10, sticky="w", pady=(5, 0))
 
         columns = ("operation", "category", "attempts", "retryable", "last_seen", "url", "message")
         self.errors_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="extended")
@@ -2076,6 +2087,9 @@ class ArchiveScoutApp(tk.Tk):
                 page_size=int(self.page_size_var.get()),
                 workers=int(self.workers_var.get()),
                 scan_workers=int(self.scan_workers_var.get()),
+                scan_overlap=(bool(self.__dict__["scan_overlap_var"].get()) if "scan_overlap_var" in self.__dict__ else True),
+                scan_backend=(self.__dict__["scan_backend_var"].get() if "scan_backend_var" in self.__dict__ else "auto"),
+                scan_memory_mb=(float(self.__dict__["scan_memory_mb_var"].get()) if "scan_memory_mb_var" in self.__dict__ else 256.0),
                 download_scope=SCOPE_LABELS[self.scope_var.get()],
                 minimum_score=int(self.minimum_score_var.get()),
                 report=ReportConfig(
@@ -2118,6 +2132,7 @@ class ArchiveScoutApp(tk.Tk):
                 hitlist_file=self.hitlist_file_var.get(),
                 import_source=self.import_source_var.get(),
                 download_external_redirects=self.download_external_redirects_var.get(),
+                retry_include_unavailable=(bool(self.__dict__["retry_include_unavailable_var"].get()) if "retry_include_unavailable_var" in self.__dict__ else False),
             ).normalized()
             if same_project and loaded is not None:
                 config = replace(
@@ -3522,21 +3537,14 @@ class ArchiveScoutApp(tk.Tk):
             messagebox.showinfo(APP_NAME, "The selected error belongs to another project. Refresh Errors first.")
             return
         config = self.build_config(require_keywords=False)
-        eligible = [
-            row for row in selected
-            if bool(row.get("retryable"))
-            or (row.get("category") == "external_redirect_blocked" and config.download_external_redirects)
-        ]
-        if not eligible:
-            messagebox.showinfo(
-                APP_NAME,
-                "The selected errors are permanent under the current policy. If an external redirect was blocked, enable Download external redirect destinations before explicitly retrying it.",
-            )
-            return
+        # Choosing specific errors is a deliberate single-cycle recheck. It
+        # does not change permanent-error eligibility for automatic runs.
+        eligible = selected
+        config.retry_include_unavailable = any(not bool(row.get("retryable")) for row in selected)
         capture_ids = sorted({int(row["capture_id"]) for row in eligible if row.get("capture_id")})
         media_ids = sorted({int(row["media_capture_id"]) for row in eligible if row.get("media_capture_id")})
         if not capture_ids and not media_ids:
-            messagebox.showinfo(APP_NAME, "Select one or more retryable text-page or media errors.")
+            messagebox.showinfo(APP_NAME, "Select one or more text-page or media errors.")
             return
         config.retry_capture_ids = capture_ids
         config.retry_media_capture_ids = media_ids
@@ -3606,6 +3614,10 @@ class ArchiveScoutApp(tk.Tk):
         self.page_size_var.set(str(config.page_size))
         self.workers_var.set(str(config.workers))
         self.scan_workers_var.set(str(config.scan_workers))
+        self.scan_backend_var.set(config.scan_backend)
+        self.scan_overlap_var.set(config.scan_overlap)
+        self.retry_include_unavailable_var.set(config.retry_include_unavailable)
+        self.scan_memory_mb_var.set(str(config.scan_memory_mb))
         self.max_file_var.set(str(config.max_file_mb))
         self.minimum_score_var.set(str(config.minimum_score))
         report = config.report.normalized()

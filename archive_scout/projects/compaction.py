@@ -26,13 +26,16 @@ def _directory_size(path: Path) -> int:
 
 
 def _dedupe_group(paths: list[Path]) -> int:
-    existing = [path for path in paths if path.is_file()]
-    if len(existing) < 2:
-        return 0
-    canonical = existing[0]
+    canonical = None
     saved = 0
-    size = canonical.stat().st_size
-    for path in existing[1:]:
+    size = 0
+    for path in paths:
+        if not path.is_file():
+            continue
+        if canonical is None:
+            canonical = path
+            size = canonical.stat().st_size
+            continue
         method = deduplicate_exact_file(path, canonical)
         if method == 'clone':
             saved += size
@@ -130,14 +133,19 @@ def compact_project_storage(
     ):
         groups = database.execute(
             f"SELECT {hash_col},COUNT(*) FROM {table} WHERE COALESCE({hash_col},'')<>'' AND COALESCE({path_col},'')<>'' GROUP BY {hash_col} HAVING COUNT(*)>1"
-        ).fetchall()
+        )
         for group in groups:
             if stop_event.is_set():
                 raise Stopped
-            paths = [Path(str(row[0])) for row in database.execute(
+            paths = (Path(str(row[0])) for row in database.execute(
                 f"SELECT {path_col} FROM {table} WHERE {hash_col}=? ORDER BY id", (group[0],)
-            )]
-            dedupe_saved += _dedupe_group(paths)
+            ))
+            def cancellable_paths():
+                for path in paths:
+                    if stop_event.is_set():
+                        raise Stopped
+                    yield path
+            dedupe_saved += _dedupe_group(cancellable_paths())
 
     # Reclaim superseded token versions without storing a second body corpus.
     rebuild_document_index(database, callback=callback)

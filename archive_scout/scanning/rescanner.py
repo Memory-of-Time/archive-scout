@@ -16,7 +16,9 @@ from ..events import ProgressEvent, Stopped
 from ..document_store import decompress_text, document_links
 from ..utils import hash_text
 from .jobs import ScanJob
+from .workers import scanner_workers
 from .batches import BoundedResultWriter
+from .executor import ScanExecutor, ScanByteBudget
 from .scoring import analyze_content, prepare_analysis_fields
 
 
@@ -33,7 +35,7 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob], report_
         document_changed = content_hash != str(row.get("content_hash") or "")
         content_type = str(row.get("mimetype") or "")
         if row.get("detected_encoding"):
-            content_type += "; charset=" + str(row["detected_encoding"])
+            content_type = content_type.split(';', 1)[0] + "; charset=" + str(row["detected_encoding"])
         raw = decode_bytes(data, content_type)
         # Avoid retaining both raw bytes and decoded text during the expensive
         # parse/normalization/scoring phase. Hashing the in-memory bytes also
@@ -149,6 +151,7 @@ def rescan_keyword_sets(
     document_ids: list[int] | None = None,
     workers: int | None = None,
     report_config=None,
+    *, scan_backend="auto", scan_memory_mb=256,
 ) -> None:
     if not jobs or any(not job.patterns for job in jobs):
         raise ValueError("at least one keyword rule is required in every selected keyword set")
@@ -184,10 +187,13 @@ def rescan_keyword_sets(
             callback(ProgressEvent("rescan", "No saved documents to rescan.", 0, 0))
         return
 
-    worker_count = max(1, min(32, int(workers or min(8, os.cpu_count() or 4))))
+    worker_count = scanner_workers(workers)
     max_inflight = max(worker_count, worker_count * 3)
     rows = _document_rows(database, clauses, params)
     completed = 0
+    budget = ScanByteBudget(scan_memory_mb)
+    reservations = {}
+    deferred_row = None
     last_emit = 0.0
 
     def persist_results(results: list[dict[str, object]]) -> None:
@@ -258,23 +264,29 @@ def rescan_keyword_sets(
             last_emit = now
             callback(ProgressEvent(
                 "rescan", f"Rescanned {completed:,}/{total:,} against {len(jobs):,} keyword set(s)",
-                completed, total, {"workers": worker_count},
+                completed, total, {"workers": worker_count, **pool.metrics_snapshot()},
             ))
 
     writer = BoundedResultWriter(persist_results)
     futures: dict[concurrent.futures.Future[dict[str, object]], dict[str, object]] = {}
     try:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count, thread_name_prefix="archive-rescan"
-        ) as pool:
+        with ScanExecutor(worker_count, jobs, report=report_config, total=total, backend=scan_backend) as pool:
             def submit_available() -> None:
+                nonlocal deferred_row
                 while len(futures) < max_inflight:
                     if stop_event.is_set():
                         raise Stopped
                     try:
-                        row = next(rows)
+                        row = deferred_row if deferred_row is not None else next(rows)
+                        deferred_row = None
                     except StopIteration:
                         return
+                    size = budget.estimate(row)
+                    if not budget.accepts(size):
+                        deferred_row = row
+                        return
+                    budget.reserve(size)
+                    reservations[int(row["capture_id"])] = size
                     futures[pool.submit(_analyze_saved_document, row, jobs, report_config)] = row
 
             submit_available()
@@ -285,12 +297,13 @@ def rescan_keyword_sets(
                     futures, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED
                 )
                 for future in done:
-                    futures.pop(future, None)
+                    row = futures.pop(future)
+                    budget.release(reservations.pop(int(row["capture_id"])))
                     writer.add(future.result())
                 writer.flush_if_due()
                 submit_available()
             writer.flush()
-    except Stopped:
+    except BaseException:
         for pending in futures:
             pending.cancel()
         writer.flush()
@@ -306,6 +319,7 @@ def rescan_documents(
     document_ids: list[int] | None = None,
     workers: int | None = None,
     report_config=None,
+    *, scan_backend="auto", scan_memory_mb=256,
 ) -> None:
     rescan_keyword_sets(
         database,
@@ -315,4 +329,5 @@ def rescan_documents(
         document_ids,
         workers,
         report_config,
+        scan_backend=scan_backend, scan_memory_mb=scan_memory_mb,
     )

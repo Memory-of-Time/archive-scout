@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import difflib
 import json
 import sqlite3
-from collections import defaultdict
+from collections import Counter
 from dataclasses import dataclass
 
 from ..document_store import document_body
 from ..scanning.automaton import LiteralAutomaton
 from ..utils import clean_space, utc_now
+from ..events import Stopped, ProgressEvent
 
 
 @dataclass(slots=True)
@@ -18,63 +18,112 @@ class DiffSummary:
     first_appearances: int = 0
 
 
-def _summary(earlier: str, later: str) -> dict:
-    earlier_lines = [value for line in earlier.splitlines() if (value := clean_space(line))]
-    later_lines = [value for line in later.splitlines() if (value := clean_space(line))]
-    matcher = difflib.SequenceMatcher(None, earlier, later, autojunk=False)
-    earlier_set = set(earlier_lines)
-    later_set = set(later_lines)
-    added = sorted(later_set - earlier_set)
-    removed = sorted(earlier_set - later_set)
+def _summary(earlier: str, later: str, stop_event=None) -> dict:
+    """Complete linear-work anchored-block comparison with explicit semantics.
+
+    Common prefix/suffix characters and identical 64-character middle blocks
+    contribute to similarity. It is a block-overlap measure, not the old greedy
+    character SequenceMatcher ratio. Exact change detection is independent of
+    that descriptive metric, including reordered text and tiny large-file edits.
+    """
+    def stopped():
+        if stop_event is not None and stop_event.is_set():
+            raise Stopped
+    stopped()
+    shorter = min(len(earlier), len(later))
+    prefix = 0
+    while prefix + 4096 <= shorter and earlier[prefix:prefix+4096] == later[prefix:prefix+4096]:
+        stopped()
+        prefix += 4096
+    while prefix < shorter and earlier[prefix] == later[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix + 4096 <= shorter - prefix and earlier[len(earlier)-suffix-4096:len(earlier)-suffix] == later[len(later)-suffix-4096:len(later)-suffix]:
+        stopped()
+        suffix += 4096
+    while suffix < shorter - prefix and earlier[len(earlier)-suffix-1] == later[len(later)-suffix-1]:
+        suffix += 1
+    def blocks(text):
+        counts = Counter()
+        end = len(text) - suffix
+        for offset in range(prefix, end, 64):
+            if offset % 65536 == prefix % 65536:
+                stopped()
+            counts[text[offset:min(offset+64, end)]] += 1
+        return counts
+    a, b = blocks(earlier), blocks(later)
+    matches = prefix + suffix + sum(len(block) * min(count, b.get(block, 0)) for block, count in a.items())
+    denominator = len(earlier) + len(later)
+    def lines(text):
+        result = set()
+        for line in text.splitlines():
+            stopped()
+            value = clean_space(line)
+            if value:
+                result.add(value)
+        return result
+    earlier_lines, later_lines = lines(earlier), lines(later)
+    added, removed = sorted(later_lines - earlier_lines), sorted(earlier_lines - later_lines)
     return {
-        "similarity": round(matcher.ratio(), 6),
-        "earlier_chars": len(earlier),
-        "later_chars": len(later),
-        "added_lines": added[:200],
-        "removed_lines": removed[:200],
-        "added_count": len(added),
-        "removed_count": len(removed),
+        "similarity": round(2 * matches / denominator, 6) if denominator else 1.0,
+        "similarity_method": "anchored_character_blocks_64_v1",
+        "changed": earlier != later,
+        "earlier_chars": len(earlier), "later_chars": len(later),
+        "added_lines": added[:200], "removed_lines": removed[:200],
+        "added_count": len(added), "removed_count": len(removed),
+        "summary_line_limit": 200,
     }
 
 
-def compare_snapshots(database: sqlite3.Connection) -> DiffSummary:
+def compare_snapshots(database: sqlite3.Connection, *, stop_event=None, callback=None) -> DiffSummary:
     summary = DiffSummary()
     previous: sqlite3.Row | None = None
     with database:
-        database.execute("DELETE FROM snapshot_diffs")
+        database.execute("DROP TABLE IF EXISTS temp.archive_scout_diff_work")
+        database.execute("CREATE TEMP TABLE archive_scout_diff_work(earlier_capture_id INTEGER,later_capture_id INTEGER,summary_json TEXT,created_at TEXT)")
         for row in database.execute(
             """
-            SELECT d.*,c.id AS capture_id,c.original_url,c.timestamp
+            SELECT d.*,c.id AS capture_id,c.original_url,c.timestamp,c.mimetype,c.detected_encoding
             FROM captures c JOIN documents d ON d.id=c.document_id
             WHERE c.state='downloaded'
             ORDER BY c.original_url,c.timestamp,c.id
             """
         ):
+            if stop_event is not None and stop_event.is_set():
+                raise Stopped
             if previous is not None and previous["original_url"] == row["original_url"]:
                 previous_hash = str(previous["normalized_hash"] or "")
                 current_hash = str(row["normalized_hash"] or "")
                 if previous_hash and previous_hash == current_hash:
                     result = {
-                        "similarity": 1.0,
+                        "similarity": 1.0, "changed": False,
+                        "similarity_method": "anchored_character_blocks_64_v1",
                         "earlier_chars": len(document_body(previous)),
                         "later_chars": len(document_body(row)),
                         "added_lines": [], "removed_lines": [], "added_count": 0, "removed_count": 0,
                     }
                 else:
-                    result = _summary(document_body(previous), document_body(row))
+                    result = _summary(document_body(previous), document_body(row), stop_event)
                 database.execute(
                     """
-                    INSERT INTO snapshot_diffs(earlier_capture_id,later_capture_id,summary_json,created_at)
+                    INSERT INTO archive_scout_diff_work(earlier_capture_id,later_capture_id,summary_json,created_at)
                     VALUES(?,?,?,?)
-                    ON CONFLICT(earlier_capture_id,later_capture_id) DO UPDATE SET
-                        summary_json=excluded.summary_json,created_at=excluded.created_at
                     """,
                     (previous["capture_id"], row["capture_id"], json.dumps(result, ensure_ascii=False), utc_now()),
                 )
                 summary.compared_pairs += 1
-                if result["similarity"] < 0.999999:
+                if result.get("changed", False):
                     summary.changed_pairs += 1
+                if callback and summary.compared_pairs % 100 == 0:
+                    callback(ProgressEvent('snapshot_differences', f'Compared {summary.compared_pairs:,} snapshot pairs', summary.compared_pairs, None))
             previous = row
+        if stop_event is not None and stop_event.is_set():
+            raise Stopped
+        database.execute("DELETE FROM snapshot_diffs")
+        database.execute("INSERT INTO snapshot_diffs(earlier_capture_id,later_capture_id,summary_json,created_at) SELECT * FROM archive_scout_diff_work")
+        database.execute("DROP TABLE archive_scout_diff_work")
+    if callback:
+        callback(ProgressEvent('snapshot_differences', f'Compared {summary.compared_pairs:,} snapshot pairs', summary.compared_pairs, summary.compared_pairs))
     return summary
 
 
@@ -118,7 +167,7 @@ def build_first_appearances(database: sqlite3.Connection, queries: list[str]) ->
         matches: dict[str, tuple[sqlite3.Row, sqlite3.Row]] = {}
         for row in database.execute(
             """
-            SELECT d.*,c.id AS capture_id,c.original_url,c.timestamp
+            SELECT d.*,c.id AS capture_id,c.original_url,c.timestamp,c.mimetype,c.detected_encoding
             FROM captures c JOIN documents d ON d.id=c.document_id
             ORDER BY c.original_url,c.timestamp,c.id
             """

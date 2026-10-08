@@ -18,6 +18,7 @@ import urllib3
 from ..constants import RETRYABLE_STATUS
 from ..downloads.rate_limit import FixedRateLimiter, RecoveryDeadlineExceeded, SharedHostGate
 from ..events import ConnectivityPaused, Stopped
+from ..text_encoding import TextDecodingError
 from ..json_codec import JSONDecodeErrors, loads as json_loads
 from ..network.transports import (
     BackendsCoolingDown,
@@ -25,6 +26,7 @@ from ..network.transports import (
     ResilientTransport,
     InvalidRangeResponse,
     PreviewRejected,
+    PayloadValidationError,
     RequestAdmissionRejected,
     ServiceStatusResponse,
     TransportExhaustedError,
@@ -307,6 +309,9 @@ class HttpClient:
         ):
             values[key] = round(float(values.get(key, 0.0)), 9)
         values["service_gate_wall_seconds"] = round(max(0.0, float(self._gate_snapshot().get("service_wait_seconds", 0.0)) - self._gate_wait_baseline), 9)
+        transport_metrics = getattr(self.transport, "metrics_snapshot", None)
+        if callable(transport_metrics):
+            values.update(transport_metrics())
         return values
 
     def _active_stop_event(self):
@@ -507,8 +512,19 @@ class HttpClient:
             network_started = time.monotonic()
             try:
                 yield self._response_progress
-            except BaseException:
+            except BaseException as exc:
                 self._metric_add("request_failures")
+                if isinstance(exc, Stopped):
+                    category = "cancelled_attempts"
+                elif isinstance(exc, ServiceStatusResponse):
+                    category = "service_response_failures"
+                elif isinstance(exc, (TextDecodingError, PayloadValidationError, PreviewRejected, RedirectPolicyError, InvalidRangeResponse, RequestAdmissionRejected)) or str(exc).startswith("response exceeds"):
+                    category = "validation_failures"
+                elif is_local_storage_error(exc):
+                    category = "storage_failures"
+                else:
+                    category = "transport_failures"
+                self._metric_add(category)
                 raise
             else:
                 self._metric_add("request_completions")
@@ -715,7 +731,7 @@ class HttpClient:
                 self.host_gate.finish_request(permit, recovered=False)
                 self._wait_for_backend_cooldown(exc)
                 continue
-            except RedirectPolicyError:
+            except (RedirectPolicyError, PayloadValidationError, TextDecodingError):
                 self.host_gate.finish_request(permit, recovered=True)
                 raise
             except RequestAdmissionRejected:
@@ -941,7 +957,10 @@ class HttpClient:
                     raise ReplayRetryScheduled(str(exc), exc.wait_seconds, generic_attempt + 1) from exc
                 self._wait_for_backend_cooldown(exc)
                 continue
-            except RedirectPolicyError:
+            except (RedirectPolicyError, PayloadValidationError, TextDecodingError):
+                self.host_gate.finish_request(permit, recovered=True)
+                raise
+            except (PayloadValidationError, TextDecodingError):
                 self.host_gate.finish_request(permit, recovered=True)
                 raise
             except PreviewRejected:

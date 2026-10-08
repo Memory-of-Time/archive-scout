@@ -3,6 +3,8 @@ from __future__ import annotations
 import codecs
 import re
 
+from .text_encoding import encoding_candidates, TextDecodingError
+
 _CHARSET_RE = re.compile(r"charset\s*=\s*['\"]?([A-Za-z0-9._-]+)", re.IGNORECASE)
 _SVG_ROOT_RE = re.compile(
     r"^\s*(?:<\?xml[^>]*>\s*)?(?:<!--.*?-->\s*)*(?:<!DOCTYPE[^>]*>\s*)*<svg(?:\s|>)",
@@ -21,25 +23,14 @@ def _charset(content_type: str) -> str:
 
 
 def _text_encoding(data: bytes, content_type: str) -> str:
-    if data.startswith(codecs.BOM_UTF8):
-        return "utf-8-sig"
-    if data.startswith(codecs.BOM_UTF32_LE):
-        return "utf-32-le"
-    if data.startswith(codecs.BOM_UTF32_BE):
-        return "utf-32-be"
-    if data.startswith(codecs.BOM_UTF16_LE):
-        return "utf-16-le"
-    if data.startswith(codecs.BOM_UTF16_BE):
-        return "utf-16-be"
-    charset = _charset(content_type)
-    aliases = {
-        "utf16": "utf-16", "utf-16le": "utf-16-le", "utf-16be": "utf-16-be",
-        "utf32": "utf-32", "utf-32le": "utf-32-le", "utf-32be": "utf-32-be",
-    }
-    normalized = aliases.get(charset, charset)
-    if normalized.startswith(("utf-16", "utf-32")):
-        return normalized
-    return ""
+    sample = data[:16384]
+    if b"\x00" not in sample and not data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)) and not re.search(r"utf[-_]?1[6]|utf[-_]?32", content_type or "", re.I):
+        return ""
+    try:
+        return next((encoding for encoding in encoding_candidates(data, content_type)
+                     if encoding.startswith(("utf-16", "utf-32"))), "")
+    except TextDecodingError:
+        return ""
 
 
 def _decoded_text_shape(data: bytes, content_type: str) -> tuple[str | None, str | None]:
@@ -49,7 +40,7 @@ def _decoded_text_shape(data: bytes, content_type: str) -> tuple[str | None, str
     try:
         decoder = codecs.getincrementaldecoder(encoding)("strict")
         text = decoder.decode(data, final=False)
-    except (LookupError, UnicodeDecodeError):
+    except (LookupError, UnicodeError):
         return None, None
     if not text:
         return None, None

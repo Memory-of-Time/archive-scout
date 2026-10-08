@@ -6,25 +6,27 @@ from pathlib import Path
 from typing import Callable
 
 from ..config import ProjectConfig
-from ..events import ProgressEvent
+from ..events import ProgressEvent, Stopped
 from ..scanning.jobs import ScanJob
+from ..scanning.workers import scanner_workers, scanner_options
 from ..scanning.rescanner import rescan_documents, rescan_keyword_sets
-from .downloader import download_archive, download_archive_only
+from .downloader import download_archive, download_archive_only, _scan_pending_captures
 
 
 class _RetryCaptureIds:
     """Reiterable SQLite selection; no project-sized Python ID list."""
 
-    def __init__(self, database: sqlite3.Connection, count: int):
+    def __init__(self, database: sqlite3.Connection, count: int, table: str = "archive_scout_download_retry_work"):
         self.database = database
         self.count = count
+        self.table = table
 
     def __len__(self):
         return self.count
 
     def __iter__(self):
         return (int(row[0]) for row in self.database.execute(
-            "SELECT id FROM archive_scout_download_retry_work ORDER BY id"
+            f"SELECT id FROM {self.table} ORDER BY id"
         ))
 
 
@@ -36,7 +38,8 @@ def retry_error_urls(
     callback: Callable[[ProgressEvent], None] | None,
     scan_jobs: list[ScanJob] | None = None,
 ) -> None:
-    retry_clause = "(e.retryable=1 OR e.category='external_redirect_blocked')" if config.download_external_redirects else "e.retryable=1"
+    retry_clause = ("1=1" if config.retry_include_unavailable else
+                    "(e.retryable=1 OR e.category='external_redirect_blocked')" if config.download_external_redirects else "e.retryable=1")
     clauses = ["e.resolved=0", "e.ignored=0", retry_clause, "e.capture_id IS NOT NULL"]
     params: list[object] = []
     if config.retry_error_categories:
@@ -56,30 +59,49 @@ def retry_error_urls(
         )
     rows = database.execute(
         """
-        SELECT e.capture_id,MAX(e.document_id) AS document_id,GROUP_CONCAT(DISTINCT e.operation) AS operations,MAX(d.path) AS path
-        FROM errors e LEFT JOIN documents d ON d.id=e.document_id
+        SELECT e.capture_id,MAX(e.document_id) AS document_id,GROUP_CONCAT(DISTINCT e.operation) AS operations,MAX(COALESCE(d.path,c.local_path)) AS path
+        FROM errors e JOIN captures c ON c.id=e.capture_id LEFT JOIN documents d ON d.id=e.document_id
         WHERE """ + " AND ".join(clauses) + " GROUP BY e.capture_id ORDER BY e.capture_id",
         params,
     )
-    local_document_ids: list[int] = []
-    download_capture_ids: list[int] = []
+    names = ("archive_scout_retry_local_docs", "archive_scout_retry_local_captures", "archive_scout_retry_downloads")
+    for name in names:
+        database.execute(f"DROP TABLE IF EXISTS temp.{name}")
+        database.execute(f"CREATE TEMP TABLE {name}(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+    batches = {name: [] for name in names}
+    def flush():
+        for name, values in batches.items():
+            if values:
+                database.executemany(f"INSERT OR IGNORE INTO {name}(id) VALUES(?)", values)
+                values.clear()
     for row in rows:
+        if stop_event.is_set():
+            raise Stopped
         capture_id = int(row["capture_id"])
         document_id = int(row["document_id"]) if row["document_id"] is not None else None
         path = Path(row["path"]) if row["path"] else None
         operations = {value for value in str(row["operations"] or "").split(",") if value}
-        if document_id and path and path.exists() and operations and operations.issubset({"scan", "parse"}):
-            local_document_ids.append(document_id)
-        else:
-            download_capture_ids.append(capture_id)
+        local = path and path.is_file() and operations and operations.issubset({"scan", "parse"})
+        name = names[0] if local and document_id else names[1] if local else names[2]
+        batches[name].append((document_id if local and document_id else capture_id,))
+        if sum(map(len, batches.values())) >= 256:
+            flush()
+    flush()
+    selections = [_RetryCaptureIds(database, int(database.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]), name)
+                  for name in names]
+    local_document_ids, local_capture_ids, download_capture_ids = selections
     jobs = scan_jobs or [ScanJob.create(scan_run_id, config.keyword_set_name, config.keywords)]
     if callback:
         callback(ProgressEvent("retry", f"Retrying {len(download_capture_ids):,} downloads and {len(local_document_ids):,} local scans"))
     if local_document_ids:
         if len(jobs) == 1:
-            rescan_documents(database, jobs[0].scan_run_id, jobs[0].rules, stop_event, callback, local_document_ids, workers=config.workers, report_config=config.report)
+            rescan_documents(database, jobs[0].scan_run_id, jobs[0].rules, stop_event, callback, local_document_ids, workers=scanner_workers(config.scan_workers), report_config=config.report, **scanner_options(config))
         else:
-            rescan_keyword_sets(database, jobs, stop_event, callback, local_document_ids, workers=config.workers, report_config=config.report)
+            rescan_keyword_sets(database, jobs, stop_event, callback, local_document_ids, workers=scanner_workers(config.scan_workers), report_config=config.report, **scanner_options(config))
+    if local_capture_ids:
+        with database:
+            database.execute("UPDATE captures SET state='downloaded_unscanned' WHERE id IN (SELECT id FROM archive_scout_retry_local_captures)")
+        _scan_pending_captures(config, database, jobs, stop_event, callback, capture_ids=local_capture_ids)
     if download_capture_ids:
         if len(jobs) == 1:
             download_archive(
@@ -105,7 +127,8 @@ def retry_error_downloads(
     match, report-enrichment, or Research Intelligence work is introduced just
     because a replay GET previously failed.
     """
-    retry_clause = "(e.retryable=1 OR e.category='external_redirect_blocked')" if config.download_external_redirects else "e.retryable=1"
+    retry_clause = ("1=1" if config.retry_include_unavailable else
+                    "(e.retryable=1 OR e.category='external_redirect_blocked')" if config.download_external_redirects else "e.retryable=1")
     clauses = ["e.resolved=0", "e.ignored=0", retry_clause, "e.capture_id IS NOT NULL"]
     params: list[object] = []
     if config.retry_error_categories:

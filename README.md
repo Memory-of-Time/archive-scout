@@ -1,12 +1,23 @@
 # Archive Scout
 
-**Archive Scout 1.0.8** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
+**Archive Scout 1.0.9** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
 
 ## Installation
 
-- [Download for Windows](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Windows-x64.zip)
-- [Download for macOS](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-macOS-Universal.zip)
-- [Download for Linux](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.8/ArchiveScout-Linux-x64.zip)
+Apply the source patch using [APPLY_PATCH.md](APPLY_PATCH.md), then build the GUI and CLI for your platform. Published application packages are listed on the [releases page](https://github.com/Memory-of-Time/archive-scout/releases). This source patch does not itself publish a packaged application.
+
+## 1.0.9 highlights
+
+- Persistent pooled connections can interrupt stalled headers and bodies. Repeated proven connection/protocol failures can renew a drained pool without resetting the service's cooldown or abandoning active files.
+- Payload decoding and validation errors are distinct from network failures. BOMs, recorded encodings, contradictory wide-encoding declarations, and partial multibyte previews share one policy.
+- The displayed download rate counts fresh, validated, manifest-committed saves over the recent minute. Wire attempts, saved-file adoption, retries, typed failures and invocation averages are separate.
+- Retained download-and-scan overlaps bounded local scanning with acquisition. Large local workloads use spawn processes with parent-owned SQLite; regex work is isolated in automatic mode. Worker counts and byte reservations remain configurable, and oversize files are processed completely.
+- Local retry work can proceed during a saved network cooldown. Manual unavailable-capture rechecks are explicit; automatic retries preserve permanent-error eligibility.
+- Imports use immutable content-addressed source files. Integrity, retry selection and duplicate metadata stream or spill to disk. Duplicate threshold searches have complete Hamming-radius recall, and snapshot comparisons use a named linear-work similarity measure.
+- SQLite file mapping is disabled after the audit reproduced corruption in the mapped runtime. Backups are validated and atomically published before older valid snapshots are pruned.
+- Optional dashboard ETA uses measured phase progress and bounded project history. Later phases and unknown discovery totals remain explicit; item-retry telemetry does not restart estimates.
+
+See [release notes and measured limits](docs/RELEASE_1_0_9.md) and [validation scope](docs/VALIDATION_1_0_9.md).
 
 ## 1.0.8 highlights
 

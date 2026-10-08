@@ -272,7 +272,7 @@ class PatchDatabaseTests(unittest.TestCase):
         events = []
         backup = create_project_backup(self.root, callback=events.append)
         stages = {event.stage for event in events}
-        self.assertEqual(stages, {"backup_copy", "backup_compress"})
+        self.assertEqual(stages, {"backup_copy", "backup_compress", "backup_verify"})
         for stage in stages:
             last = [event for event in events if event.stage == stage][-1]
             self.assertEqual(last.current, last.total)

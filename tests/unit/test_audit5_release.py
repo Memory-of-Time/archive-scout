@@ -63,7 +63,7 @@ class PrefixClient:
 
 class Audit5ReleaseTests(unittest.TestCase):
     def test_release_identity_and_historical_healthy_cdx_default(self):
-        self.assertEqual(VERSION, "1.0.8")
+        self.assertEqual(VERSION, "1.0.9")
         cfg = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(cfg.cdx_delay, 2.5)
         self.assertEqual(cfg.network.cdx_workers, 10)

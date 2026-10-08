@@ -44,7 +44,11 @@ def document_body(row: Mapping[str, Any] | sqlite3.Row) -> str:
     if not path.is_file():
         return ''
     try:
-        raw = decode_bytes(path.read_bytes(), '')
+        content_type = str(_get(row, 'mimetype', '') or '').split(';', 1)[0]
+        encoding = str(_get(row, 'detected_encoding', '') or '')
+        if encoding:
+            content_type += '; charset=' + encoding
+        raw = decode_bytes(path.read_bytes(), content_type)
         _title, visible, _links = parse_page(raw, str(_get(row, 'original_url', '') or ''))
         return visible
     except Exception:

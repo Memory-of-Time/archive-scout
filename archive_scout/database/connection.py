@@ -174,11 +174,13 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         database.execute("PRAGMA journal_mode=WAL")
         database.execute("PRAGMA synchronous=NORMAL")
         database.execute("PRAGMA foreign_keys=ON")
-        database.execute("PRAGMA temp_store=MEMORY")
+        # Large selections and maintenance indexes may spill instead of growing
+        # resident memory with the entire project.
+        database.execute("PRAGMA temp_store=FILE")
         database.execute("PRAGMA cache_size=-65536")
-        # Bound mapped working sets on long runs while retaining the 64 MiB page
-        # cache that protects write-heavy scans from unnecessary disk churn.
-        database.execute("PRAGMA mmap_size=67108864")
+        # Prefer the bounded SQLite page cache over mapped evidence files.
+        # This reduces mapping exposure; it is not a complete corruption fix.
+        database.execute("PRAGMA mmap_size=0")
         database.execute("PRAGMA wal_autocheckpoint=10000")
         database.execute("PRAGMA journal_size_limit=67108864")
         database.execute("PRAGMA busy_timeout=60000")

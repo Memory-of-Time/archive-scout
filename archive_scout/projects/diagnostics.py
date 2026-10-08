@@ -68,6 +68,11 @@ def export_diagnostics(
         "machine": platform.machine(),
         "cpu_count": os.cpu_count(),
         "frozen": bool(getattr(sys, "frozen", False)),
+        "sqlite_version": sqlite3.sqlite_version,
+        "sqlite_source_id": database.execute("SELECT sqlite_source_id()").fetchone()[0],
+        "sqlite_compile_options": [row[0] for row in database.execute("PRAGMA compile_options")],
+        "sqlite_mmap_size": database.execute("PRAGMA mmap_size").fetchone()[0],
+        "sqlite_cache_size": database.execute("PRAGMA cache_size").fetchone()[0],
     }
     counts = {}
     for table in (
@@ -79,9 +84,28 @@ def export_diagnostics(
             counts[table] = int(database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         except Exception:
             counts[table] = None
+    performance = []
+    permitted = {'fresh_committed', 'adopted_existing', 'committed_bytes', 'fresh_average_rate',
+                 'fresh_rate_10s', 'fresh_rate_60s', 'fresh_rate_300s', 'bytes_rate_60s',
+                 'replay_started', 'http_completions', 'transport_failures', 'service_response_failures',
+                 'validation_failures', 'storage_failures', 'cancelled_attempts', 'network_retries',
+                 'service_gate_wall_seconds', 'download_workers', 'scan_workers', 'scanned',
+                 'scan_rate', 'scan_completed', 'scan_failures', 'scan_reserved_bytes',
+                 'scan_worker_peak_rss_sum_mib'}
+    for row in database.execute('SELECT id,mode,status,progress_json FROM operation_runs ORDER BY id DESC LIMIT 20'):
+        try:
+            progress = json.loads(row['progress_json'] or '{}')
+            detail = progress.get('detail') or {}
+            performance.append({'operation_id': row['id'], 'mode': row['mode'], 'status': row['status'],
+                                'stage': progress.get('stage'),
+                                'metrics': {key: value for key, value in detail.items()
+                                            if key in permitted and isinstance(value, (int, float))}})
+        except (ValueError, TypeError, AttributeError):
+            continue
     payloads = {
         "system.json": system,
         "counts.json": counts,
+        "recent-operation-performance.json": performance,
         "project-summary.json": _project_summary(root / "project.json"),
         "error-summary.json": _rows(
             database,

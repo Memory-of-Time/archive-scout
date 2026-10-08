@@ -33,9 +33,12 @@ class MediaRetryTests(unittest.TestCase):
                 record_error(database, "media_download", "timeout", "timeout", media_capture_id=media_id)
                 database.execute("UPDATE media_captures SET state='error' WHERE id=?", (media_id,))
             database.commit()
-            with patch("archive_scout.media.downloader.download_media") as mocked:
+            selected = []
+            def receive(*args, **kwargs):
+                selected.extend(kwargs['media_capture_ids'])
+            with patch("archive_scout.media.downloader.download_media", side_effect=receive):
                 retry_media_errors(config, database, threading.Event(), media_capture_ids=[ids[1]])
-                self.assertEqual(mocked.call_args.kwargs["media_capture_ids"], [ids[1]])
+                self.assertEqual(selected, [ids[1]])
             database.close()
 
 

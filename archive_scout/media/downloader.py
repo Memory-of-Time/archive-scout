@@ -599,7 +599,7 @@ def retry_media_errors(
     callback: Callable[[ProgressEvent], None] | None = None,
     media_capture_ids: list[int] | None = None,
 ) -> None:
-    clauses = ["resolved=0", "ignored=0", "retryable=1", "media_capture_id IS NOT NULL"]
+    clauses = ["resolved=0", "ignored=0", "1=1" if config.retry_include_unavailable else "retryable=1", "media_capture_id IS NOT NULL"]
     params: list[object] = []
     selected = media_capture_ids if media_capture_ids is not None else config.retry_media_capture_ids
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_retry_selection")
@@ -614,15 +614,11 @@ def retry_media_errors(
         clauses.append(
             "EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=errors.media_capture_id)"
         )
-    ids = [
-        int(row[0])
-        for row in database.execute(
-            "SELECT DISTINCT media_capture_id FROM errors WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY media_capture_id",
-            params,
-        )
-    ]
+    database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_retry_work")
+    database.execute("CREATE TEMP TABLE archive_scout_media_retry_work(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+    database.execute("INSERT OR IGNORE INTO archive_scout_media_retry_work SELECT DISTINCT media_capture_id FROM errors WHERE " + " AND ".join(clauses), params)
+    from ..downloads.retry import _RetryCaptureIds
+    ids = _RetryCaptureIds(database, int(database.execute("SELECT COUNT(*) FROM archive_scout_media_retry_work").fetchone()[0]), "archive_scout_media_retry_work")
     if callback:
         callback(ProgressEvent("media_retry", f"Retrying {len(ids):,} errored media captures"))
     if ids:
