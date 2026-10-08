@@ -1,0 +1,50 @@
+{
+  "release": "1.0.9",
+  "schema": 13,
+  "type": "follow-up source overlay",
+  "requires": "previous ArchiveScout-v1.0.9-Patch.zip already applied",
+  "repository": "https://github.com/Memory-of-Time/archive-scout/",
+  "files": [
+    {
+      "path": "README.md",
+      "action": "replace",
+      "accepted_predecessor_sha256": [
+        "3f27fdded96e76e640aac1a70f813c4e2316ac807616c40f366082f73ff4ebea",
+        "40b19eb73e26222058ece4fabd6b8d825690da85b066f5167921cf8a69d83ed9"
+      ],
+      "sha256": "a22ae3b090a6f881cec899a0e4fa1ac27e0d537a2d315f91983d7e2cdc3db17c"
+    },
+    {
+      "path": "archive_scout/projects/backups.py",
+      "action": "replace",
+      "accepted_predecessor_sha256": [
+        "20ad25bd28cd714c4f420694a659ed8b212b7bf63e1c5d576ffb3d4605e9b3da"
+      ],
+      "sha256": "e324f5aa91de52e8fff25709e87b78c16427b69e4fdca5aaf88c2f303d61114d"
+    },
+    {
+      "path": "archive_scout/network/cancellation.py",
+      "action": "replace",
+      "accepted_predecessor_sha256": [
+        "4be729487795e77b3545f1d6d94feb052eb54f18983d655fd0cbc6669cacb768"
+      ],
+      "sha256": "4d93d2c50ed8762ece36b2a48977707e226dabc8042bb2da666820e25cdfacf6"
+    },
+    {
+      "path": "tests/unit/test_v109_reliability.py",
+      "action": "replace",
+      "accepted_predecessor_sha256": [
+        "47cf241f320775a399e03968f1c0d4785f9a23c4c15bfd7f52acb853eda0f8a1"
+      ],
+      "sha256": "eea9a903c9e257d2a05d116f885ba372ecc488acefece0be4942c5f016f328a6"
+    },
+    {
+      "path": "tests/unit/test_v109_platform_fixes.py",
+      "action": "add",
+      "accepted_predecessor_sha256": [],
+      "sha256": "5a55453d2ea77e06cc2116b39c8654c82df8ca66cc1ef3272f9dbe0886ad08e9"
+    }
+  ],
+  "unchanged_original_source_files_verified": 302,
+  "native_ci_status": "not rerun; upload patch and run the existing Tests workflow"
+}

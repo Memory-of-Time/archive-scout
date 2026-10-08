@@ -4,9 +4,9 @@
 
 ## Downloads
 
-- [Windows x64](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.9/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.9/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/Memory-of-Time/archive-scout/releases/download/v1.0.9/ArchiveScout-macOS-Universal.zip)
+[**Windows x64**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/ArchiveScout-Windows-x64.zip) · [**macOS Universal**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/ArchiveScout-macOS-Universal.zip) · [**Linux x64**](https://github.com/Memory-of-Time/archive-scout/releases/latest) · [Installation guide](#installation)
+
+These links open the latest published application packages. For Linux, choose the Linux archive under **Assets**; its format may be ZIP or TAR.GZ. The v1.0.9 source changes become an application download after its build is published.
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
@@ -259,7 +259,7 @@ Download `ArchiveScout-macOS-Universal.zip`, extract it completely, move `Archiv
 
 ### Linux
 
-Download `ArchiveScout-Linux-x64.tar.gz`, extract it, and run the included application or install it with the provided user-local installer. The installer maps `archive-scout` to the packaged CLI and keeps the GUI in the desktop application menu.
+Download the Linux archive from the [latest release](https://github.com/Memory-of-Time/archive-scout/releases/latest), extract it, and run the included application or install it with the provided user-local installer. Published archives may use ZIP or TAR.GZ. The installer maps `archive-scout` to the packaged CLI and keeps the GUI in the desktop application menu.
 
 ## Source development
 
