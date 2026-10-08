@@ -33,6 +33,10 @@ jobs:
         run: python -m compileall -q archive_scout
       - name: Run tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Verify source identity and complete spawned scans
+        run: |
+          python scripts/verify_release.py --source-only
+          python scripts/verify_packaged_scan.py --output validation/source-spawn-smoke.json
 
   windows:
     name: Build Windows x64
@@ -92,7 +96,11 @@ jobs:
         run: ./scripts/build_windows.ps1 -SkipBuild -RequireSigned
       - name: Verify Windows CLI executable
         shell: pwsh
-        run: .\dist\ArchiveScoutCLI\ArchiveScoutCLI.exe --help | Out-Null
+        run: |
+          .\dist\ArchiveScoutCLI\ArchiveScoutCLI.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "CLI startup failed" }
+          python scripts/verify_packaged_scan.py --executable dist/ArchiveScoutCLI/ArchiveScoutCLI.exe --output validation/windows-frozen-scan.json
+          if ($LASTEXITCODE -ne 0) { throw "Frozen process scan failed" }
       - name: Verify Windows release files
         shell: pwsh
         run: |
@@ -138,7 +146,9 @@ jobs:
       - name: Build Linux x64 package
         run: bash scripts/build_linux.sh
       - name: Verify Linux CLI executable
-        run: ./dist/ArchiveScoutCLI/ArchiveScoutCLI --help >/dev/null
+        run: |
+          ./dist/ArchiveScoutCLI/ArchiveScoutCLI --help >/dev/null
+          python scripts/verify_packaged_scan.py --executable dist/ArchiveScoutCLI/ArchiveScoutCLI --output validation/linux-frozen-scan.json
       - name: Verify Linux release files
         run: |
           test -f release/ArchiveScout-Linux-x64.tar.gz
@@ -177,6 +187,8 @@ jobs:
           lipo -archs "$PYTHON_BINARY"
       - name: Build universal macOS package
         run: bash scripts/build_macos.sh
+      - name: Verify macOS complete frozen process scan
+        run: python scripts/verify_packaged_scan.py --executable dist/ArchiveScoutCLI --output validation/macos-frozen-scan.json
       - name: Verify macOS release files
         run: |
           test -f release/ArchiveScout-macOS-Universal.zip
