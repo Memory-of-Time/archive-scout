@@ -132,7 +132,7 @@ class AdaptiveConfigurationTests(unittest.TestCase):
             self.assertFalse(config.adaptive_rate_limiting)
             self.assertEqual((config.cdx_delay, config.download_delay), (2.5, 0.125))
             path = root / "project.json"
-            path.write_text(json.dumps({"version": "1.1.0", "targets": ["example.com/*"]}), encoding="utf-8")
+            path.write_text(json.dumps({"version": "1.1.1", "targets": ["example.com/*"]}), encoding="utf-8")
             self.assertFalse(load_project_config(path).adaptive_rate_limiting)
 
     def test_setting_roundtrips_and_reaches_target_runtime_config(self):

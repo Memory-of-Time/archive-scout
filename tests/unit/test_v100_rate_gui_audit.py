@@ -47,7 +47,7 @@ def client_for(transport, limiter=None):
 
 class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
     def test_initial_release_identity_and_safe_rate_floors(self):
-        self.assertEqual(VERSION, "1.1.0")
+        self.assertEqual(VERSION, "1.1.1")
         config = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(config.cdx_delay, 2.5)
         self.assertEqual(config.download_delay, 0.125)
@@ -133,7 +133,7 @@ class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
     def test_headerless_rate_limit_starts_at_at_least_sixty_seconds(self):
         with mock.patch("archive_scout.downloads.rate_limit.time.monotonic", return_value=1000.0), \
              mock.patch("archive_scout.downloads.rate_limit.random.uniform", return_value=1.0):
-            gate = SharedHostGate()
+            gate = SharedHostGate(adaptive=True)
             self.assertGreaterEqual(gate.pause_for_rate_limit(), 60.0)
 
     def test_retry_after_is_never_shortened_by_generic_retry_jitter(self):

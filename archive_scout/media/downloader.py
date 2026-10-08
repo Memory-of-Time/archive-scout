@@ -343,7 +343,7 @@ def download_media(
         return
     limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY,
                                     adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
 
     def on_retry(attempt: int, total_attempts: int, reason: str, wait_seconds: float) -> None:
         if callback:

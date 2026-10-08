@@ -1444,8 +1444,8 @@ class ArchiveScoutApp(tk.Tk):
             ("Per-capture retry base (seconds)", self.network_retry_base_var),
             ("Per-capture retry ceiling (seconds)", self.network_retry_max_var),
             ("Failures before shared automatic recovery", self.network_failure_limit_var),
-            ("429/503 minimum host cooldown (seconds)", self.rate_limit_base_var),
-            ("429/503 maximum host cooldown (seconds)", self.rate_limit_max_var),
+            ("Adaptive 429/503 starting cooldown (seconds)", self.rate_limit_base_var),
+            ("Adaptive 429/503 maximum cooldown (seconds)", self.rate_limit_max_var),
         ]
         for row, (label, variable) in enumerate(recovery_rows):
             ttk.Label(recovery, text=label + ":", wraplength=340).grid(row=row, column=0, sticky="w", pady=3)
@@ -1453,7 +1453,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
         ttk.Label(recovery, text="Recommended and enabled by default. A recovery-cycle threshold pauses archive admissions and schedules another shared probe; it does not end the operation. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Checkbutton(recovery, text="Adaptive rate limiting (experimental — still in testing)", variable=self.adaptive_rate_limiting_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 2))
-        ttk.Label(recovery, text="Optional and off by default. Adds slower request spacing after a 429, then recovers toward your configured rate. Fixed shared request ceilings, connection recovery, and server-requested waits always remain active.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(recovery, text="Off by default. Off uses fixed spacing and a retry probe after at most five seconds when a 429/503 has no server deadline. On adds increasing cooldowns and slower spacing after throttles. The cooldown settings above apply only when on. Server-requested waits and connection recovery always remain active.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         redirect = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
         redirect.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)

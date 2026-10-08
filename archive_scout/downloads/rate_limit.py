@@ -13,6 +13,22 @@ from ..events import Stopped
 WAYBACK_HOST_GATE_KEY = "web.archive.org"
 WAYBACK_INDEX_RATE_KEY = "web.archive.org:index"
 WAYBACK_REPLAY_RATE_KEY = "web.archive.org:replay"
+FIXED_SERVICE_RETRY_SECONDS = 5.0
+
+
+def saved_service_eligibility(detail: dict, *, adaptive: bool, base_pause: float) -> float:
+    """Shorten only a positively identified optional wait when resuming off.
+
+    Older records lack provenance; their deadlines remain authoritative. A
+    known Retry-After minimum survives even when optional fallback was longer.
+    """
+    eligible = float(detail.get("eligible_at_epoch") or 0.0)
+    if not adaptive and detail.get("wait_source") == "adaptive_fallback":
+        signaled = float(detail.get("rate_limit_signal_at_epoch") or 0.0)
+        if signaled > 0:
+            eligible = max(float(detail.get("server_eligible_at_epoch") or 0.0),
+                           min(eligible, signaled + min(FIXED_SERVICE_RETRY_SECONDS, base_pause)))
+    return eligible
 
 _shared_rate_lock = threading.Lock()
 _shared_rate_states: dict[str, "_SharedRateState"] = {}
@@ -289,6 +305,8 @@ class SharedHostGate:
         max_pause: float = 600.0,
         coalesce_seconds: float = 2.0,
         decay_seconds: float = 600.0,
+        *,
+        adaptive: bool = False,
     ) -> None:
         self.base_pause = max(0.01, float(base_pause))
         self.max_pause = max(self.base_pause, float(max_pause))
@@ -310,18 +328,25 @@ class SharedHostGate:
         self.generation = 0
         self.probe_required = False
         self.probe_inflight = False
+        self.adaptive = bool(adaptive)
+        self.wait_source = ""
+        self.server_until = self.server_until_wall = 0.0
+        self.fallback_until = self.fallback_until_wall = 0.0
+        self.last_signal_wall = 0.0
+        self.fallback_signal = self.fallback_signal_wall = 0.0
+        self._fallback_adaptive = False
         self.connection_failures = 0
         self.last_connection_failure = 0.0
-        self._default_policy = (self.base_pause, self.max_pause)
-        self._policies: dict[object, tuple[float, float]] = {}
+        self._default_policy = (self.base_pause, self.max_pause, self.adaptive)
+        self._policies: dict[object, tuple[float, float, bool]] = {}
         self._wait_started: float | None = None
         self._wait_seconds = 0.0
 
-    def register_policy(self, base_pause: float, max_pause: float) -> object:
+    def register_policy(self, base_pause: float, max_pause: float, *, adaptive: bool = False) -> object:
         token = object()
         with self.condition:
             base = max(0.01, float(base_pause))
-            self._policies[token] = (base, max(base, float(max_pause)))
+            self._policies[token] = (base, max(base, float(max_pause)), bool(adaptive))
             self._configure_active_policy()
         return token
 
@@ -334,9 +359,27 @@ class SharedHostGate:
         policies = list(self._policies.values()) or [self._default_policy]
         self.base_pause = max(value[0] for value in policies)
         self.max_pause = max(value[1] for value in policies)
-        # Policy turnover affects future fallback waits, never an existing
-        # server deadline or an admitted probe.
+        # A fixed-only client must not inherit another client's optional host
+        # delay. Mixed clients still share the server deadline and one probe.
+        self.adaptive = all(value[2] for value in policies)
+        if not self.adaptive and self._fallback_adaptive:
+            self.fallback_until = min(self.fallback_until, self.fallback_signal + self.fixed_retry_seconds)
+            self.fallback_until_wall = min(self.fallback_until_wall, self.fallback_signal_wall + self.fixed_retry_seconds)
+            self._fallback_adaptive = False
+            self._update_service_deadline()
         self.condition.notify_all()
+
+    @property
+    def fixed_retry_seconds(self) -> float:
+        return min(FIXED_SERVICE_RETRY_SECONDS, self.base_pause)
+
+    def _update_service_deadline(self) -> None:
+        self.blocked_until = max(self.server_until, self.fallback_until)
+        self.blocked_until_wall = max(self.server_until_wall, self.fallback_until_wall)
+        if self.server_until >= self.fallback_until and self.server_until_wall:
+            self.wait_source = "server_retry_after"
+        else:
+            self.wait_source = "adaptive_fallback" if self._fallback_adaptive else "fixed_fallback"
 
     def _start_wait(self, now: float) -> None:
         if self._wait_started is None:
@@ -421,6 +464,7 @@ class SharedHostGate:
             self.blocked_until = now + pause
             self.blocked_until_wall = time.time() + pause
             self.reason = "connection outage"
+            self.wait_source = "connection_recovery"
             self.probe_required = True
             self._start_wait(now)
             self.connection_outage_generation = self.generation
@@ -455,6 +499,11 @@ class SharedHostGate:
                     pause = min(60.0, self.connection_outage_base * 2 ** min(self.connection_outage_cycles - 1, 5) * random.uniform(1.0, 1.1))
                 self.blocked_until = max(self.blocked_until, time.monotonic() + pause)
                 self.blocked_until_wall = max(self.blocked_until_wall, time.time() + pause)
+                if self.reason != "connection outage":
+                    self.fallback_until = self.blocked_until
+                    self.fallback_until_wall = self.blocked_until_wall
+                    self._fallback_adaptive = False
+                    self._update_service_deadline()
                 self.generation += 1
             self.condition.notify_all()
 
@@ -475,6 +524,11 @@ class SharedHostGate:
         self.probe_inflight = False
         self.blocked_until = 0.0
         self.blocked_until_wall = 0.0
+        self.server_until = self.server_until_wall = 0.0
+        self.fallback_until = self.fallback_until_wall = 0.0
+        self._fallback_adaptive = False
+        self.fallback_signal = self.fallback_signal_wall = 0.0
+        self.wait_source = ""
         # Quota incident memory decays in the optional adaptive rate pool.
         self.incidents = max(0, self.incidents - 1)
         self.reason = ""
@@ -532,13 +586,23 @@ class SharedHostGate:
             elif fresh_probe:
                 self.incidents += 1
             self.last_signal = now
+            self.last_signal_wall = wall_now
 
             if retry_after is not None:
                 # Retry-After is a minimum server deadline; never jitter below it.
                 pause = max(0.0, float(retry_after))
+                self.server_until = max(self.server_until, now + pause)
+                self.server_until_wall = max(self.server_until_wall, wall_now + pause)
             else:
-                exponent = max(0, min(self.incidents - 1, 4))
-                pause = min(self.max_pause, self.base_pause * (2**exponent) * random.uniform(1.0, 1.1))
+                if self.adaptive:
+                    exponent = max(0, min(self.incidents - 1, 4))
+                    pause = min(self.max_pause, self.base_pause * (2**exponent) * random.uniform(1.0, 1.1))
+                else:
+                    pause = self.fixed_retry_seconds
+                self.fallback_until = now + pause
+                self.fallback_until_wall = wall_now + pause
+                self._fallback_adaptive = self.adaptive
+                self.fallback_signal, self.fallback_signal_wall = now, wall_now
 
             # A duplicate explicit deadline only changes the generation when it
             # actually extends eligibility; otherwise keep the one live probe.
@@ -546,6 +610,12 @@ class SharedHostGate:
                 return max(0.0, self.blocked_until - now), self.incident_id, self.blocked_until_wall, False
             self.blocked_until = max(self.blocked_until, now + pause)
             self.blocked_until_wall = max(self.blocked_until_wall, wall_now + pause)
+            # Preserve any connection recovery deadline that was already live.
+            # Quota provenance tracks server and optional application waits
+            # separately so opting out cannot shorten a Retry-After deadline.
+            self.fallback_until = max(self.fallback_until, self.blocked_until if self.reason == "connection outage" else 0.0)
+            self.fallback_until_wall = max(self.fallback_until_wall, self.blocked_until_wall if self.reason == "connection outage" else 0.0)
+            self._update_service_deadline()
             self.reason = reason
             self.probe_required = True
             self._start_wait(now)
@@ -567,6 +637,44 @@ class SharedHostGate:
         """Compatibility wrapper returning only the effective shared wait."""
         return self.signal_rate_limit(retry_after, reason)[0]
 
+    def restore_service_wait(self, detail: dict) -> float:
+        """Restore persisted eligibility without turning optional debt into a server wait."""
+        with self.condition:
+            now, wall_now = time.monotonic(), time.time()
+            eligible = saved_service_eligibility(detail, adaptive=self.adaptive, base_pause=self.base_pause)
+            if eligible <= wall_now:
+                return max(0.0, self.blocked_until - now)
+            before = self.blocked_until
+            source = detail.get("wait_source")
+            signaled = float(detail.get("rate_limit_signal_at_epoch") or 0.0)
+            if source in {"adaptive_fallback", "fixed_fallback"} and signaled > 0:
+                self.fallback_until = max(self.fallback_until, now + eligible - wall_now)
+                self.fallback_until_wall = max(self.fallback_until_wall, eligible)
+                self._fallback_adaptive = source == "adaptive_fallback" and self.adaptive
+                self.fallback_signal, self.fallback_signal_wall = now + signaled - wall_now, signaled
+                server_epoch = float(detail.get("server_eligible_at_epoch") or 0.0)
+            else:
+                # Unlabelled legacy records can contain server instructions.
+                server_epoch = eligible
+            if server_epoch > wall_now:
+                self.server_until = max(self.server_until, now + server_epoch - wall_now)
+                self.server_until_wall = max(self.server_until_wall, server_epoch)
+            if self.reason == "connection outage":
+                self.fallback_until = max(self.fallback_until, before)
+                self.fallback_until_wall = max(self.fallback_until_wall, self.blocked_until_wall)
+            self._update_service_deadline()
+            if self.blocked_until > before or not self.probe_required:
+                if not self.probe_required:
+                    self.incident_id += 1
+                    self.incident_started = self.recovery_cycle_started = now
+                    self.incident_started_wall = wall_now
+                self.probe_required, self.probe_inflight = True, False
+                self.reason = "saved service cooldown"
+                self.generation += 1
+                self._start_wait(now)
+            self.condition.notify_all()
+            return max(0.0, self.blocked_until - now)
+
     def remaining(self) -> float:
         with self.condition:
             return max(0.0, self.blocked_until - time.monotonic())
@@ -580,19 +688,34 @@ class SharedHostGate:
                 "incident_id": self.incident_id,
                 "incident_elapsed": max(0.0, now - self.incident_started) if self.incident_started else 0.0,
                 "reason": self.reason,
+                "wait_source": self.wait_source,
+                "adaptive_rate_limiting": self.adaptive,
+                "server_eligible_at_epoch": self.server_until_wall,
+                "rate_limit_signal_at_epoch": self.fallback_signal_wall or self.last_signal_wall,
                 "probe_required": self.probe_required,
                 "probe_inflight": self.probe_inflight,
                 "eligible_at_epoch": self.blocked_until_wall,
                 "service_wait_seconds": self._wait_seconds + (max(0.0, now - self._wait_started) if self._wait_started is not None else 0.0),
             }
 
-    def configure(self, base_pause: float, max_pause: float) -> None:
+    def configure(self, base_pause: float, max_pause: float, *, adaptive: bool | None = None) -> None:
         """Set the idle policy; active clients register and release their own."""
         with self.condition:
             requested_base = max(0.01, float(base_pause))
             requested_max = max(requested_base, float(max_pause))
-            self._default_policy = (requested_base, requested_max)
+            self._default_policy = (requested_base, requested_max, self._default_policy[2] if adaptive is None else bool(adaptive))
             self._configure_active_policy()
+
+    def service_wait_detail(self) -> dict[str, object]:
+        """Durable quota eligibility, suitable for progress and user-stop events."""
+        state = self.snapshot()
+        if (state['reason'] == 'connection outage'
+                or not (state['remaining'] or state['probe_required'] or state['probe_inflight'])):
+            return {}
+        return {'reason_code': 'service_rate_limit',
+                'http_status': 503 if '503' in str(state['reason']) else 429,
+                **{field: state[field] for field in ('eligible_at_epoch', 'incident_id', 'wait_source',
+                    'server_eligible_at_epoch', 'rate_limit_signal_at_epoch', 'adaptive_rate_limiting')}}
 
     def note_connection_failure(self, threshold: int) -> tuple[int, bool]:
         """Track a short burst of genuine connection-setup failures.
@@ -631,16 +754,18 @@ def shared_host_gate(
     base_pause: float = 60.0,
     max_pause: float = 600.0,
     key: str = WAYBACK_HOST_GATE_KEY,
+    *,
+    adaptive: bool | None = None,
 ) -> SharedHostGate:
     """Return the process-wide Wayback host gate used by every project."""
     normalized = str(key or WAYBACK_HOST_GATE_KEY).casefold()
     with _shared_rate_lock:
         gate = _shared_host_gates.get(normalized)
         if gate is None:
-            gate = SharedHostGate(base_pause, max_pause)
+            gate = SharedHostGate(base_pause, max_pause, adaptive=bool(adaptive))
             _shared_host_gates[normalized] = gate
         else:
-            gate.configure(base_pause, max_pause)
+            gate.configure(base_pause, max_pause, adaptive=adaptive)
         return gate
 
 

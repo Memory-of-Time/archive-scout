@@ -1,12 +1,12 @@
 # Network performance and Wayback pacing
 
-Archive Scout 1.0.6 uses two shared request-attempt clocks. CDX/Timemap/index traffic starts at a conservative 2.5-second interval (24 attempts/minute) and replay traffic at 0.125 seconds (8 attempts/second). These are attempt ceilings, not throughput promises: redirects, retry attempts, and transport-backend fallbacks each consume admission because they each create network load.
+Archive Scout 1.1.1 uses two shared request-attempt clocks. CDX/Timemap/index traffic starts at a conservative 2.5-second interval (24 attempts/minute) and replay traffic at 0.125 seconds (8 attempts/second). These are attempt ceilings, not throughput promises: redirects, retry attempts, and transport-backend fallbacks each consume admission because they each create network load.
 
 The scheduler uses monotonic time and does not accumulate burst credit after idle periods or cooldowns. Per-target settings can make a target slower, but cannot silently weaken the effective project pool. Multiple workers are therefore useful for hiding response latency, not for multiplying the allowed request-start rate.
 
 ## 429/503 behavior
 
-A live Wayback 429 or service-level 503 closes the shared host gate. Retry-After seconds and HTTP-date forms are treated as minimum deadlines. If no valid header is present, the first coordinated cooldown is at least 60 seconds and any jitter is positive-only. One recovery probe is allowed after the gate reopens; fresh 500/502/504 responses do not count as healthy recovery. Optional adaptive pacing changes at most once per coalesced HTTP 429 incident and then relaxes after sustained healthy starts. It is experimental, still testing, and off by default in v1.1.0. Disabled clients always use fixed requested spacing, including when an opted-in client shares the process; closing the last opted-in client clears optional pacing debt. Mandatory host recovery and Retry-After remain active in either mode.
+A live Wayback 429 or service-level 503 closes the shared host gate. Retry-After seconds and HTTP-date forms are treated as minimum deadlines. Without a valid header, adaptive-off uses a fixed retry wait of `min(5 seconds, rate_limit_base_pause)`, with no escalation or jitter. Adaptive-on uses the configured exponential cooldown (normally 60, 120, 240 seconds, bounded by the configured maximum), with positive-only jitter. One recovery probe is allowed after the gate reopens; fresh 500/502/504 responses do not count as healthy recovery. Optional adaptive pacing changes at most once per coalesced HTTP 429 incident and then relaxes after sustained healthy starts. It is experimental, still testing, and off by default in v1.1.0. Disabled clients use fixed requested spacing and fixed host fallback waits, including when an opted-in client shares the process; closing the last opted-in client clears optional pacing debt. Mandatory host recovery and Retry-After remain active in either mode.
 
 A historical 429/503 reproduced inside an archived replay is different: when the response carries replay/memento context it is treated as an archived origin status rather than evidence that the live Wayback service is throttling Archive Scout.
 
@@ -37,3 +37,13 @@ An admitted shared recovery probe can requalify an origin's cooled transport wit
 Deferred recovery stops queued admissions while running healthy acquisitions settle normally and commit their results. Trustworthy headers/body prefixes can reset the connection-failure streak and end a matching connection-only outage; they cannot release a server throttle. Final payload validation still determines whether bytes are saved.
 
 Select **Adaptive rate limiting (experimental — still testing)** in the GUI, set `adaptive_rate_limiting` in project JSON, or use `--adaptive-rate-limiting` / `--no-adaptive-rate-limiting` for a CLI run. Resume uses the current switch while preserving saved operation selection, retention, and server eligibility.
+
+## Complete opt-out in 1.1.1
+
+The checkbox controls both extra request spacing and escalating 429/503 fallback cooldowns. It stays experimental, still in testing, and off by default. The GUI's starting/maximum cooldown fields apply to adaptive-on only. A shorter configured base can shorten the fixed retry interval below five seconds. When projects sharing the host disagree, any active fixed-only client disables optional host escalation; opted-in clients can still use their own slower request spacing.
+
+Only one recovery probe can start at eligibility. A healthy probe reopens admissions immediately at the configured fixed rate without accumulating burst credit. Already healthy downloads drain and commit normally. Genuine connection recovery, ordinary per-capture retries and explicit server Retry-After waits remain active.
+
+Wait events identify `fixed_fallback`, `adaptive_fallback`, `server_retry_after`, or `connection_recovery`; service events include the parsed Retry-After duration and effective adaptive setting. Saved operation progress carries wait provenance and any server minimum. Opting out can shorten known adaptive debt, including after restart. Unlabelled waits saved by older versions are preserved because they may contain server instructions. No project-schema change is required.
+
+Capture directories are prepared by the coordinator before transfers begin, preventing Windows workers from racing to create the same date directory.

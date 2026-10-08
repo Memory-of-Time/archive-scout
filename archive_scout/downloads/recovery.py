@@ -35,7 +35,8 @@ def wait_for_archive(config, gate, stop_event, callback=None, *, stage="download
     Eligibility is never shortened. The HTTP admission layer, not this wait,
     announces and releases the one real probe.
     """
-    reason = str(gate.snapshot().get("reason") or "")
+    state = gate.snapshot()
+    reason = str(state.get("reason") or "")
     remaining = gate.remaining()
     detail = {
         "reason_code": "archive_connectivity" if reason == "connection outage" else "service_rate_limit",
@@ -43,11 +44,12 @@ def wait_for_archive(config, gate, stop_event, callback=None, *, stage="download
         "incident_id": gate.incident_id,
         "recovery_stage": stage,
         "waiting_seconds": remaining,
+        **{field: state.get(field) for field in ("wait_source", "server_eligible_at_epoch", "rate_limit_signal_at_epoch", "adaptive_rate_limiting")},
     }
     if callback:
         callback(ProgressEvent(
             "network_waiting" if reason == "connection outage" else "rate_limit_waiting",
-            f"Waiting for Internet Archive ({reason or 'recovery'}); progress is saved, next eligibility in {remaining:.1f}s.",
+            f"Waiting for Internet Archive ({reason or 'recovery'}, {state.get('wait_source') or 'shared recovery'}); progress is saved, next eligibility in {remaining:.1f}s.",
             detail=detail,
         ))
     gate.wait(stop_event)

@@ -66,7 +66,7 @@ class WorkflowVerificationTests(unittest.TestCase):
 
     def test_release_identity_checks_stay_enforced(self):
         path = self.root / "pyproject.toml"
-        path.write_bytes(path.read_bytes().replace(b'1.1.0', b'1.0.9'))
+        path.write_bytes(path.read_bytes().replace(b'1.1.1', b'1.0.9'))
         with self.assertRaisesRegex(RuntimeError, "runtime VERSION disagree"):
             self.verifier.verify(source_only=True)
 

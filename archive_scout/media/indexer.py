@@ -2014,7 +2014,7 @@ def index_external_embedded_media(
         raise ValueError("no image or video extensions remain after include/exclude filtering")
     signature = media_query_signature(config)
     limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if callback:
@@ -2085,7 +2085,7 @@ def index_media(
     signature = media_query_signature(config)
     state_signature = media_index_state_signature(config)
     limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if callback:

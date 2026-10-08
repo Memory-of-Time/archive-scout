@@ -445,8 +445,8 @@ class ProjectConfig:
     page_size: int = 100000
     cdx_delay: float = WAYBACK_INDEX_MIN_INTERVAL
     download_delay: float = WAYBACK_REPLAY_MIN_INTERVAL
-    # Experimental extra pacing after a service throttle; fixed request ceilings
-    # and shared recovery/Retry-After remain mandatory when this is disabled.
+    # Experimental extra pacing and escalating 429/503 fallback cooldowns.
+    # Fixed ceilings, connection recovery and server Retry-After always apply.
     adaptive_rate_limiting: bool = False
     retries: int = 4
     rate_limit_base_pause: float = WAYBACK_RATE_LIMIT_BASE_PAUSE

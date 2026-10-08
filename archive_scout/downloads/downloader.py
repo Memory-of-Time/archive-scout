@@ -1237,7 +1237,7 @@ def _acquire_archive(
 
     limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY,
                                     adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
     acquisition_cancel = threading.Event()
     worker_stop = _CombinedStopEvent(stop_event, acquisition_cancel)
 
@@ -1431,6 +1431,11 @@ def _acquire_archive(
             staged.append((item, path))
         if not staged:
             return
+        # Prepare shared year/month directories on the coordinator before any
+        # transfer starts. Concurrent recursive mkdir on Windows can transiently
+        # report Access denied while a sibling creates the same parent.
+        for parent in {path.parent for _item, path in staged}:
+            parent.mkdir(parents=True, exist_ok=True)
         now = utc_now()
         staged_updates = []
         for item, path in staged:

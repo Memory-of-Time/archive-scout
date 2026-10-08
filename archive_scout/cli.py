@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--adaptive-rate-limiting", action=argparse.BooleanOptionalAction, default=None,
-        help="Experimental, still in testing: add adaptive request spacing after throttles. Off by default; fixed ceilings and server waits remain active. Applies on resume too.",
+        help="Experimental, still in testing: add increasing cooldowns and slower request spacing after throttles. Off by default; fixed ceilings and server waits remain active. Applies on resume too.",
     )
 
     status = sub.add_parser("status", help="Read project/queue status without modifying it")
@@ -250,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument(
         "--adaptive-rate-limiting", action=argparse.BooleanOptionalAction, default=False,
-        help="Enable experimental adaptive request spacing (still in testing, default off). Fixed ceilings and server waits always remain active.",
+        help="Enable experimental increasing cooldowns and adaptive request spacing (still in testing, default off). Fixed ceilings and server waits always remain active.",
     )
     init.add_argument("--format", choices=FORMATS, default="text")
     return parser

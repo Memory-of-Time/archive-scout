@@ -18,7 +18,7 @@ from archive_scout.ui.main_window import ArchiveScoutApp
 
 class V102ReleaseTests(unittest.TestCase):
     def test_release_identity_and_schema(self):
-        self.assertEqual(VERSION, "1.1.0")
+        self.assertEqual(VERSION, "1.1.1")
         self.assertEqual(SCHEMA_VERSION, 13)
 
     def test_target_override_key_uses_same_normalized_identity_as_project_config(self):

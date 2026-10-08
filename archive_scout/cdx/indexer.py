@@ -492,7 +492,7 @@ def _client_for_config(
 ) -> HttpClient:
     network = config.network.normalized()
     limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if wait_seconds <= 0:
@@ -516,8 +516,11 @@ def _client_for_config(
             stage = "rate_limit_paused"
         else:
             spacing_text = f" Effective index spacing: {float(spacing):.3f}s." if spacing is not None else ""
+            source_text = {"server_retry_after": "Server Retry-After wait",
+                           "fixed_fallback": "Fixed retry wait (adaptive off)",
+                           "adaptive_fallback": "Experimental adaptive cooldown"}.get(detail.get("wait_source"), "Shared service wait")
             message = (
-                f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; "
+                f"Wayback HTTP {status}: {source_text} active for up to {wait_seconds:.1f}s; "
                 f"one recovery probe will run next.{spacing_text}"
             )
             stage = "rate_limit_waiting"

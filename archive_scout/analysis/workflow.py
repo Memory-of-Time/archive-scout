@@ -105,7 +105,7 @@ def _lookup_external_assets(
         (total,),
     )
     limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
     workers = min(8, max(1, config.network.normalized().cdx_workers))
 
     def retry_callback(attempt: int, total_attempts: int, reason: str, wait: float) -> None:

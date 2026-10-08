@@ -49,7 +49,7 @@ class WaitingPolicyTests(unittest.TestCase):
             gate = rl.SharedHostGate()
             old = gate.acquire_request(threading.Event())
             gate.signal_rate_limit(permit=old)
-            clock.advance(59)
+            clock.advance(4)
             gate.signal_rate_limit(permit=old)
             self.assertEqual(gate.remaining(), 1)
             self.assertEqual(gate.incidents, 1)
@@ -91,7 +91,7 @@ class WaitingPolicyTests(unittest.TestCase):
 
     def test_failed_fresh_probes_escalate_once_per_probe_with_bounded_jitter(self):
         with Clock() as clock, mock.patch.object(rl.random, "uniform", return_value=1.1):
-            gate = rl.SharedHostGate(base_pause=5, max_pause=12)
+            gate = rl.SharedHostGate(base_pause=5, max_pause=12, adaptive=True)
             old = gate.acquire_request(threading.Event())
             gate.signal_rate_limit(permit=old)
             waits = []

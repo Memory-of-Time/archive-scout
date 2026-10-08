@@ -100,12 +100,18 @@ class RateLimitDeferred(TransientRequestError):
         eligible_at_epoch: float | None = None,
         incident_id: int | None = None,
         reason_code: str = "service_rate_limit",
+        wait_source: str = "",
+        server_eligible_at_epoch: float = 0.0,
+        rate_limit_signal_at_epoch: float = 0.0,
     ) -> None:
         super().__init__(message, status=status, splittable=False)
         self.waited = float(waited)
         self.eligible_at_epoch = float(eligible_at_epoch) if eligible_at_epoch else None
         self.incident_id = int(incident_id) if incident_id is not None else None
         self.reason_code = str(reason_code or "service_rate_limit")
+        self.wait_source = str(wait_source)
+        self.server_eligible_at_epoch = float(server_eligible_at_epoch or 0.0)
+        self.rate_limit_signal_at_epoch = float(rate_limit_signal_at_epoch or 0.0)
 
     def to_detail(self) -> dict[str, object]:
         return {
@@ -114,6 +120,9 @@ class RateLimitDeferred(TransientRequestError):
             "waited_seconds": max(0.0, self.waited),
             "eligible_at_epoch": self.eligible_at_epoch,
             "incident_id": self.incident_id,
+            "wait_source": self.wait_source,
+            "server_eligible_at_epoch": self.server_eligible_at_epoch,
+            "rate_limit_signal_at_epoch": self.rate_limit_signal_at_epoch,
         }
 
 
@@ -260,6 +269,7 @@ class HttpClient:
         self._gate_policy = register(
             self.host_gate.base_pause if rate_limit_base_pause is None else rate_limit_base_pause,
             self.host_gate.max_pause if rate_limit_max_pause is None else rate_limit_max_pause,
+            **({"adaptive": bool(getattr(self.limiter, "adaptive", False))} if isinstance(self.host_gate, SharedHostGate) else {}),
         ) if callable(register) else None
         self._gate_wait_baseline = float(self._gate_snapshot().get("service_wait_seconds", 0.0))
         self._permit_local = threading.local()
@@ -352,6 +362,11 @@ class HttpClient:
         except Exception:
             limiter_snapshot = {}
         payload.setdefault("effective_spacing_seconds", limiter_snapshot.get("effective_delay"))
+        gate_state = self._gate_snapshot()
+        for field in ("wait_source", "server_eligible_at_epoch", "rate_limit_signal_at_epoch"):
+            payload.setdefault(field, gate_state.get(field))
+        payload.setdefault("adaptive_rate_limiting", bool(getattr(self.limiter, "adaptive", False)))
+        payload.setdefault("retry_after_seconds", getattr(self._permit_local, "retry_after_seconds", None))
         payload.setdefault("wire_request_starts", self.metrics_snapshot().get("wire_request_starts", 0))
         self.rate_event_callback(payload)
 
@@ -366,6 +381,7 @@ class HttpClient:
         return dict(value) if isinstance(value, dict) else {}
 
     def _signal_rate_limit(self, status: int, retry_after: float | None, rate_attempt: int, permit=None) -> tuple[float, int, float]:
+        self._permit_local.retry_after_seconds = retry_after
         signal = getattr(self.host_gate, "signal_rate_limit", None)
         if callable(signal):
             if isinstance(self.host_gate, SharedHostGate):
@@ -377,6 +393,19 @@ class HttpClient:
         # protocol. Production SharedHostGate always takes the typed path above.
         wait_seconds = float(self.host_gate.pause_for_rate_limit(retry_after, f"HTTP {status}"))
         return wait_seconds, int(rate_attempt), time.time() + max(0.0, wait_seconds)
+
+    def _rate_wait_description(self) -> str:
+        source = self._gate_snapshot().get("wait_source")
+        return {
+            "server_retry_after": "server Retry-After wait",
+            "fixed_fallback": "fixed retry wait (adaptive off)",
+            "adaptive_fallback": "experimental adaptive cooldown",
+        }.get(source, "shared service wait")
+
+    def _rate_wait_detail(self) -> dict[str, object]:
+        state = self._gate_snapshot()
+        return {field: state.get(field, "" if field == "wait_source" else 0.0)
+                for field in ("wait_source", "server_eligible_at_epoch", "rate_limit_signal_at_epoch")}
 
     def _note_connection_success(self, permit=None, *, recovered: bool = False) -> bool:
         note = getattr(self.host_gate, "note_connection_success", None)
@@ -437,7 +466,7 @@ class HttpClient:
             self.retry_callback(
                 rate_attempt,
                 self.rate_limit_attempts,
-                f"HTTP {status}; Wayback service quota/overload cooldown active",
+                f"HTTP {status}; Wayback service quota/overload cooldown active — {self._rate_wait_description()}",
                 wait_seconds,
             )
         if self.rate_limit_attempts > 0 and rate_attempt >= self.rate_limit_attempts:
@@ -447,6 +476,7 @@ class HttpClient:
                 waited=float(gate_state.get("incident_elapsed", 0.0) or 0.0),
                 eligible_at_epoch=eligible_at_epoch,
                 incident_id=incident_id,
+                **self._rate_wait_detail(),
             )
             self._emit_rate_event("paused", **deferred.to_detail())
             raise deferred
@@ -498,7 +528,7 @@ class HttpClient:
             state = self._gate_snapshot()
             raise RateLimitDeferred("Settling service recovery admissions; queue remains saved",
                                     eligible_at_epoch=state.get("eligible_at_epoch"),
-                                    incident_id=state.get("incident_id"))
+                                    incident_id=state.get("incident_id"), **self._rate_wait_detail())
         except RecoveryDeadlineExceeded as exc:
             elapsed = time.monotonic() - started
             self._metric_add("host_gate_wait_seconds", elapsed)
@@ -514,6 +544,7 @@ class HttpClient:
                 waited=exc.waited,
                 eligible_at_epoch=exc.eligible_at_epoch,
                 incident_id=exc.incident_id,
+                **self._rate_wait_detail(),
             )
             self._emit_rate_event("paused", **deferred.to_detail())
             raise deferred from exc
@@ -688,7 +719,7 @@ class HttpClient:
                         self.retry_callback(
                             rate_attempt,
                             self.rate_limit_attempts,
-                            f"HTTP {status}; Wayback service quota/overload cooldown active",
+                            f"HTTP {status}; Wayback service quota/overload cooldown active — {self._rate_wait_description()}",
                             wait_seconds,
                         )
                     attempts_exhausted = self.rate_limit_attempts > 0 and rate_attempt >= self.rate_limit_attempts
@@ -699,6 +730,7 @@ class HttpClient:
                             waited=float(gate_state.get("incident_elapsed", 0.0) or 0.0),
                             eligible_at_epoch=eligible_at_epoch,
                             incident_id=incident_id,
+                            **self._rate_wait_detail(),
                         )
                         self._emit_rate_event("paused", **deferred.to_detail())
                         raise deferred
@@ -945,7 +977,7 @@ class HttpClient:
                     if self.retry_callback and self.rate_event_callback is None:
                         self.retry_callback(
                             rate_attempt, self.rate_limit_attempts,
-                            f"HTTP {status}; Wayback service quota/overload cooldown active", wait_seconds,
+                            f"HTTP {status}; Wayback service quota/overload cooldown active — {self._rate_wait_description()}", wait_seconds,
                         )
                     attempts_exhausted = self.rate_limit_attempts > 0 and rate_attempt >= self.rate_limit_attempts
                     if attempts_exhausted:
@@ -955,6 +987,7 @@ class HttpClient:
                             waited=float(gate_state.get("incident_elapsed", 0.0) or 0.0),
                             eligible_at_epoch=eligible_at_epoch,
                             incident_id=incident_id,
+                            **self._rate_wait_detail(),
                         )
                         self._emit_rate_event("paused", **deferred.to_detail())
                         raise deferred

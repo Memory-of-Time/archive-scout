@@ -18,8 +18,8 @@ class PatchDeliveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.patch, self.project = self.root / 'patch', self.root / 'project'
         self.patch.mkdir(); self.project.mkdir()
-        self.before = "VERSION = '1.0.9'\nSCHEMA_VERSION = 13\n"
-        self.after = "VERSION = '1.1.0'\nSCHEMA_VERSION = 13\n"
+        self.before = "VERSION = '1.1.0'\nSCHEMA_VERSION = 13\n"
+        self.after = "VERSION = '1.1.1'\nSCHEMA_VERSION = 13\n"
         for base, text in ((self.project,self.before),(self.patch,self.after)):
             (base / 'archive_scout').mkdir()
             (base / 'archive_scout/constants.py').write_text(text)
@@ -29,7 +29,7 @@ class PatchDeliveryTests(unittest.TestCase):
             target = self.project / name
             entries.append({'path':name,'sha256':self.helper.digest(self.patch/name),
                             'base_sha256':self.helper.digest(target) if target.exists() else None})
-        manifest = {'release':'1.1.0','base_release':'1.0.9','deletions':[], 'files':entries}
+        manifest = {'release':'1.1.1','base_release':'1.1.0','deletions':[], 'files':entries}
         (self.patch/'PATCH_MANIFEST.json').write_text(json.dumps(manifest))
         sums = [f"{entry['sha256']}  {entry['path']}" for entry in entries]
         sums.append(self.helper.digest(self.patch/'PATCH_MANIFEST.json')+'  PATCH_MANIFEST.json')
@@ -61,6 +61,34 @@ class PatchDeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'integrity check failed'):
             self.helper.preflight(self.project)
         self.assertEqual((self.project/'archive_scout/constants.py').read_text(),self.before)
+
+    def test_known_source_text_allows_git_line_endings_and_bom(self):
+        manifest_path = self.patch / 'PATCH_MANIFEST.json'
+        manifest = json.loads(manifest_path.read_text())
+        constants = self.project / 'archive_scout/constants.py'
+        manifest['files'][0]['accepted_text_sha256'] = [self.helper.text_digest(constants)]
+        manifest_path.write_text(json.dumps(manifest))
+        sums = (self.patch / 'SHA256SUMS.txt').read_text().splitlines()
+        sums[-1] = self.helper.digest(manifest_path) + '  PATCH_MANIFEST.json'
+        (self.patch / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n')
+        constants.write_bytes(b'\xef\xbb\xbf' + self.before.replace('\n', '\r\n').encode())
+        _, pending = self.helper.preflight(self.project)
+        self.assertIn('archive_scout/constants.py', pending)
+        self.helper.apply(self.project, pending)
+        self.assertEqual(constants.read_text(), self.after)
+
+    def test_text_equivalence_does_not_accept_a_meaningful_local_edit(self):
+        manifest_path = self.patch / 'PATCH_MANIFEST.json'
+        manifest = json.loads(manifest_path.read_text())
+        constants = self.project / 'archive_scout/constants.py'
+        manifest['files'][0]['accepted_text_sha256'] = [self.helper.text_digest(constants)]
+        manifest_path.write_text(json.dumps(manifest))
+        sums = (self.patch / 'SHA256SUMS.txt').read_text().splitlines()
+        sums[-1] = self.helper.digest(manifest_path) + '  PATCH_MANIFEST.json'
+        (self.patch / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n')
+        constants.write_text(self.before + 'LOCAL_CHANGE = True\n')
+        with self.assertRaisesRegex(RuntimeError, 'different/local version'):
+            self.helper.preflight(self.project)
 
     def prior_candidate(self):
         constants = self.project / 'archive_scout/constants.py'

@@ -17,7 +17,7 @@ from .database.connection import open_database
 from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
 from .downloads.downloader import download_archive, download_archive_only, recover_pending_discard_cleanup
-from .downloads.rate_limit import shared_host_gate
+from .downloads.rate_limit import FIXED_SERVICE_RETRY_SECONDS, saved_service_eligibility, shared_host_gate
 from .downloads.retry import retry_error_urls, retry_error_downloads
 from .events import ConnectivityPaused, ProgressEvent, Stopped
 from .media.downloader import download_media, retry_media_errors
@@ -287,6 +287,8 @@ def run_project(
     database.commit()
     original_callback = callback
     owner_thread_id = threading.get_ident()
+    operation_host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause,
+                                           adaptive=config.adaptive_rate_limiting)
     last_progress_write = 0.0
     last_progress_stage = ""
     progress_persist_interval = 5.0 if mode == "download_only" else 0.75
@@ -295,6 +297,10 @@ def run_project(
 
     def operation_callback(event: ProgressEvent) -> None:
         nonlocal last_progress_write, last_progress_stage
+        if threading.get_ident() == owner_thread_id:
+            service_detail = operation_host_gate.service_wait_detail()
+            if service_detail:
+                event.detail = {**(event.detail or {}), **service_detail}
         if config.dashboard_eta_enabled:
             event.detail = {**(event.detail or {}), "operation_run_id": operation_run_id}
             if threading.get_ident() == owner_thread_id:
@@ -344,7 +350,7 @@ def run_project(
         if not config.network.persistent_retries:
             raise exc
         _reset_transient_inflight()
-        gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+        gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
         now_epoch = time.time()
         query_pause = getattr(exc, "scope", "host") == "query"
         if query_pause:
@@ -353,12 +359,18 @@ def run_project(
             reason = "index_response"
             detail = {"reason_code": "index_response_retry", "eligible_at_epoch": eligible_at}
         elif isinstance(exc, RateLimitDeferred):
-            eligible_at = float(exc.eligible_at_epoch or 0.0)
+            eligible_at = saved_service_eligibility(exc.to_detail(), adaptive=config.adaptive_rate_limiting,
+                                                   base_pause=config.rate_limit_base_pause)
             wait_seconds = max(0.0, eligible_at - now_epoch) if eligible_at else max(
-                float(config.rate_limit_base_pause), float(config.network.retry_base_seconds)
+                float(config.rate_limit_base_pause) if config.adaptive_rate_limiting else min(FIXED_SERVICE_RETRY_SECONDS, config.rate_limit_base_pause),
+                float(config.network.retry_base_seconds)
             )
+            if not eligible_at:
+                eligible_at = now_epoch + wait_seconds
             reason = "rate_limit"
             detail = exc.to_detail()
+            detail["eligible_at_epoch"] = eligible_at
+            gate.restore_service_wait(detail)
         else:
             gate.pause_for_connection_outage(float(config.network.connection_retry_seconds))
             wait_seconds = max(gate.remaining(), float(config.network.connection_retry_seconds))
@@ -385,6 +397,11 @@ def run_project(
             if stop_event.is_set():
                 raise Stopped
             remaining = deadline - time.monotonic()
+            if not query_pause:
+                # The host gate owns the live deadline. Healthy in-flight
+                # progress or an opt-out can finish recovery before this
+                # coordinator's original timer; do not wait it a second time.
+                remaining = min(remaining, gate.remaining())
             if remaining <= 0:
                 break
             if stop_event.wait(min(1.0, remaining)):
@@ -453,12 +470,13 @@ def run_project(
             "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_download_errors",
             "media_all", "media_index", "media_download", "media_retry",
         }
-        eligible_at = float(saved_rate_pause_detail.get("eligible_at_epoch") or 0.0)
+        eligible_at = saved_service_eligibility(saved_rate_pause_detail, adaptive=config.adaptive_rate_limiting,
+                                               base_pause=config.rate_limit_base_pause)
         if eligible_at > time.time():
             # Restore the deadline at actual admission, including mixed retries
             # whose local phase can run immediately.
-            shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause).pause_for_rate_limit(
-                eligible_at - time.time(), reason="saved service cooldown")
+            shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause,
+                             adaptive=config.adaptive_rate_limiting).restore_service_wait(saved_rate_pause_detail)
         if mode in network_modes and eligible_at > time.time():
             remaining = max(0.0, eligible_at - time.time())
             _wait_for_archive(
@@ -468,6 +486,9 @@ def run_project(
                     waited=float(saved_rate_pause_detail.get("waited_seconds") or 0.0),
                     eligible_at_epoch=eligible_at,
                     incident_id=(int(saved_rate_pause_detail["incident_id"]) if saved_rate_pause_detail.get("incident_id") is not None else None),
+                    wait_source=str(saved_rate_pause_detail.get("wait_source") or ""),
+                    server_eligible_at_epoch=float(saved_rate_pause_detail.get("server_eligible_at_epoch") or 0.0),
+                    rate_limit_signal_at_epoch=float(saved_rate_pause_detail.get("rate_limit_signal_at_epoch") or 0.0),
                 ),
                 "saved service cooldown",
             )
@@ -855,6 +876,9 @@ def run_project(
             database.execute("UPDATE captures SET state='downloaded_unscanned' WHERE state='scanning'")
             database.execute("UPDATE media_captures SET state='pending' WHERE state='downloading'")
             finish_jobs(database, jobs, "interrupted")
+        service_detail = operation_host_gate.service_wait_detail()
+        if service_detail:
+            update_operation_run(database, operation_run_id, stage="rate_limit_waiting", detail=service_detail)
         finish_operation_run(database, operation_run_id, "interrupted", "Stopped by user")
         database.commit()
         _partial_index_reports()

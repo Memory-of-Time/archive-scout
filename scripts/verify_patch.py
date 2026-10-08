@@ -1,4 +1,4 @@
-"""Verify and apply v1.1.0 files to supplied v1.0.9 or known v1.1.0 source.
+"""Verify and apply v1.1.1 files to supplied v1.1.0 or known v1.1.1 source.
 
 Run this script from the extracted patch, pointing --project at your checkout.
 Only Python's standard library is required. Project databases are never opened.
@@ -23,6 +23,15 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def text_digest(path: Path) -> str | None:
+    """Compare known UTF-8 source across Git's LF/CRLF and optional BOM conversions."""
+    try:
+        value = path.read_bytes().decode('utf-8-sig').replace('\r\n', '\n').replace('\r', '\n')
+    except (OSError, UnicodeDecodeError):
+        return None
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
 def checked_path(root: Path, name: str) -> Path:
     relative = PurePosixPath(name)
     if (not name or "\\" in name or ":" in name or relative.is_absolute()
@@ -41,7 +50,7 @@ def checked_path(root: Path, name: str) -> Path:
 def source_identity(project: Path) -> tuple[str, int]:
     fields = {}
     path = checked_path(project, "archive_scout/constants.py")
-    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+    for node in ast.parse(path.read_text(encoding="utf-8-sig")).body:
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id in {"VERSION", "SCHEMA_VERSION"}:
@@ -51,8 +60,8 @@ def source_identity(project: Path) -> tuple[str, int]:
 
 def preflight(project: Path) -> tuple[dict, list[str]]:
     manifest = json.loads((ROOT / METADATA[0]).read_text(encoding="utf-8"))
-    if manifest.get("release") != "1.1.0" or manifest.get("base_release") != "1.0.9" or manifest.get("deletions"):
-        raise RuntimeError("This helper requires the v1.1.0-over-v1.0.9 replacement manifest")
+    if manifest.get("release") != "1.1.1" or manifest.get("base_release") != "1.1.0" or manifest.get("deletions"):
+        raise RuntimeError("This helper requires the v1.1.1-over-v1.1.0 replacement manifest")
     entries = manifest["files"]
     names = [entry["path"] for entry in entries]
     if len(set(names)) != len(names) or set(names) & set(METADATA):
@@ -69,8 +78,8 @@ def preflight(project: Path) -> tuple[dict, list[str]]:
         path = checked_path(ROOT, name)
         if not path.is_file() or digest(path) != expected:
             raise RuntimeError(f"Patch integrity check failed: {name}")
-    if source_identity(project) not in {("1.0.9", 13), ("1.1.0", 13)}:
-        raise RuntimeError("Target must be the supplied v1.0.9 source or a provided v1.1.0 source candidate")
+    if source_identity(project) not in {("1.1.0", 13), ("1.1.1", 13)}:
+        raise RuntimeError("Target must be the supplied v1.1.0 source or a provided v1.1.1 source candidate")
     pending = []
     for entry in entries:
         name = entry["path"]
@@ -84,7 +93,12 @@ def preflight(project: Path) -> tuple[dict, list[str]]:
         if (not isinstance(prior, list) or any(not isinstance(value, str) or len(value) != 64
                 or any(char not in "0123456789abcdef" for char in value) for value in prior)):
             raise RuntimeError(f"Invalid prior-candidate hash inventory: {name}")
-        if current != entry["base_sha256"] and current not in prior:
+        text_candidates = entry.get('accepted_text_sha256', [])
+        if (not isinstance(text_candidates, list) or any(not isinstance(value, str) or len(value) != 64
+                or any(char not in '0123456789abcdef' for char in value) for value in text_candidates)):
+            raise RuntimeError(f"Invalid source-text hash inventory: {name}")
+        equivalent_text = target.is_file() and text_digest(target) in text_candidates
+        if current != entry["base_sha256"] and current not in prior and not equivalent_text:
             raise RuntimeError(f"Target has a different/local version of {name}; no files were changed")
         pending.append(name)
     # Old release metadata is replaced too, after all source files pass.
@@ -109,7 +123,7 @@ def atomic_copy(source: Path, target: Path) -> None:
 def apply(project: Path, pending: list[str]) -> Path | None:
     if not pending:
         return None
-    backup = Path(tempfile.mkdtemp(prefix="ArchiveScout-v1.1.0-source-backup-", dir=project.parent))
+    backup = Path(tempfile.mkdtemp(prefix="ArchiveScout-v1.1.1-source-backup-", dir=project.parent))
     existing = set()
     for name in pending:
         target = project / name
@@ -138,7 +152,7 @@ def apply(project: Path, pending: list[str]) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", required=True, type=Path, help="Root of supplied v1.0.9 or a provided v1.1.0 source checkout")
+    parser.add_argument("--project", required=True, type=Path, help="Root of supplied v1.1.0 or a provided v1.1.1 source checkout")
     parser.add_argument("--apply", action="store_true", help="Apply after validation, keeping a source-file backup")
     args = parser.parse_args()
     try:

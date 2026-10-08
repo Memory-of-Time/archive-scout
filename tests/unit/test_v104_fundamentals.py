@@ -26,11 +26,11 @@ from archive_scout.utils import hash_text, normalize_search
 
 class V104FundamentalsTests(unittest.TestCase):
     def test_release_identity_workflow_and_schema(self):
-        self.assertEqual(VERSION, "1.1.0")
+        self.assertEqual(VERSION, "1.1.1")
         self.assertEqual(SCHEMA_VERSION, 13)
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
-        self.assertIn("importlib.metadata.version('archive-scout') == '1.1.0'", workflow)
+        self.assertIn("importlib.metadata.version('archive-scout') == '1.1.1'", workflow)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("workflow_dispatch", workflow)
 
