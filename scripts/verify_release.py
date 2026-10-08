@@ -40,7 +40,11 @@ def verify(*, source_only: bool = False) -> dict:
     for name in ("tests.yml", "build-and-release.yml"):
         canonical = ROOT / ".github/workflows" / name
         mirror = ROOT / "github/workflows" / name
-        if not canonical.is_file() or canonical.read_bytes() != mirror.read_bytes():
+        # Git checkout and GitHub's editor can change LF/CRLF or a UTF-8 BOM.
+        # Compare text lines, retaining all meaningful workflow content checks.
+        if (not canonical.is_file() or not mirror.is_file()
+                or canonical.read_text(encoding="utf-8-sig").splitlines()
+                != mirror.read_text(encoding="utf-8-sig").splitlines()):
             raise RuntimeError(f"Missing or different workflow copies: {name}")
         if (ROOT / name).is_file():
             raise RuntimeError(f"Misplaced root workflow: {name}; keep the workflow in .github/workflows")
