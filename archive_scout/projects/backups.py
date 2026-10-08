@@ -89,7 +89,9 @@ def create_project_backup(root: Path, reason: str = "manual", keep: int = 5, max
                 report('backup_verify', verified, total_verify)
         if original_digest.digest() != restored_digest.digest():
             raise RuntimeError("Compressed backup verification failed")
-        with compressed.open("rb") as handle:
+        # Windows fsync requires a writable descriptor; do not truncate the
+        # complete archive whose bytes were already verified above.
+        with compressed.open("r+b") as handle:
             os.fsync(handle.fileno())
         os.replace(compressed, destination)
     finally:
@@ -242,7 +244,7 @@ def restore_project_backup(root: Path, backup_path: Path) -> Path:
                 finally:
                     safety_db.close()
                 _validate_restore_snapshot(safety_temp, project_schema=False)
-                with safety_temp.open("rb") as handle:
+                with safety_temp.open("r+b") as handle:
                     os.fsync(handle.fileno())
                 os.replace(safety_temp, safety)
             current_page_size = destination.execute("PRAGMA page_size").fetchone()[0]

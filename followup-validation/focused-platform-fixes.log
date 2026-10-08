@@ -1,0 +1,21 @@
+test_backup_and_restore_sync_writable_descriptors_without_losing_bytes (tests.unit.test_v109_platform_fixes.PlatformFixTests.test_backup_and_restore_sync_writable_descriptors_without_losing_bytes) ... ok
+test_httpcore_stop_does_not_depend_on_shutdown_waking_the_read (tests.unit.test_v109_platform_fixes.PlatformFixTests.test_httpcore_stop_does_not_depend_on_shutdown_waking_the_read) ... ok
+test_read_polling_honors_full_deadline_and_nonblocking_mode (tests.unit.test_v109_platform_fixes.PlatformFixTests.test_read_polling_honors_full_deadline_and_nonblocking_mode) ... ok
+test_real_fsync_failure_never_publishes_or_prunes_a_backup (tests.unit.test_v109_platform_fixes.PlatformFixTests.test_real_fsync_failure_never_publishes_or_prunes_a_backup) ... ok
+test_short_read_waits_do_not_poison_urllib3_buffer_or_close_reused_socket (tests.unit.test_v109_platform_fixes.PlatformFixTests.test_short_read_waits_do_not_poison_urllib3_buffer_or_close_reused_socket) ... ok
+test_urllib3_stop_does_not_depend_on_shutdown_waking_the_read (tests.unit.test_v109_platform_fixes.PlatformFixTests.test_urllib3_stop_does_not_depend_on_shutdown_waking_the_read) ... ok
+test_different_page_size_restores_through_sqlite (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_different_page_size_restores_through_sqlite) ... ok
+test_different_page_size_with_live_reader_preserves_original_on_lock_failure (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_different_page_size_with_live_reader_preserves_original_on_lock_failure) ... ok
+test_existing_reader_keeps_snapshot_then_sees_restore_without_inode_replacement (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_existing_reader_keeps_snapshot_then_sees_restore_without_inode_replacement) ... ok
+test_interrupted_destination_copy_rolls_back_and_retains_safety (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_interrupted_destination_copy_rolls_back_and_retains_safety) ... ok
+test_invalid_compressed_input_does_not_create_safety_or_leave_temporary_files (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_invalid_compressed_input_does_not_create_safety_or_leave_temporary_files) ... ok
+test_live_wal_selection_pins_a_complete_source_view (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_live_wal_selection_pins_a_complete_source_view) ... ok
+test_newer_schema_input_preserves_current_state_and_backups (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_newer_schema_input_preserves_current_state_and_backups) ... ok
+test_restore_into_empty_project (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_restore_into_empty_project) ... ok
+test_uncompressed_selection_includes_committed_source_wal (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_uncompressed_selection_includes_committed_source_wal) ... ok
+test_writer_lock_times_out_without_discarding_uncommitted_or_current_state (tests.unit.test_v109_reliability.RestoreOwnershipTests.test_writer_lock_times_out_without_discarding_uncommitted_or_current_state) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 1.074s
+
+OK

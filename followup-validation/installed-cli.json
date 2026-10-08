@@ -1,0 +1,15 @@
+{
+  "status": "passed",
+  "files": 300,
+  "elapsed_seconds": 1.353160187999947,
+  "executable": "/workspace/scratch/c998e42fd81f/v109-platform-followup/env312/bin/archive-scout",
+  "encoding_stress": true,
+  "checks": [
+    "clean JSONL",
+    "spawn scanner",
+    "complete source bytes",
+    "all matches",
+    "SQLite reopen",
+    "FTS integrity"
+  ]
+}

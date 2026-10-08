@@ -1,0 +1,7 @@
+{
+  "tests": 3,
+  "failures": 2,
+  "errors": 1,
+  "status": "expected_defects_reproduced",
+  "scope": "Linux with strict writable-descriptor policy and reads unaffected by shutdown; not a native Windows run."
+}
