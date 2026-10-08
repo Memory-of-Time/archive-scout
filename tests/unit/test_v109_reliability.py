@@ -166,7 +166,7 @@ class RestoreOwnershipTests(unittest.TestCase):
         target = self.root / 'archive_scout.sqlite3'
         def interrupt(source, destination):
             path = Path(destination.execute('PRAGMA database_list').fetchone()[2])
-            if path != target:
+            if path.resolve() != target.resolve():
                 return original(source, destination)
             def progress(status, remaining, total):
                 if remaining:
@@ -246,7 +246,7 @@ class RestoreOwnershipTests(unittest.TestCase):
     def test_restore_into_empty_project(self):
         empty = self.root / 'empty'
         result = restore_project_backup(empty, self.backup)
-        self.assertEqual(result, empty / 'archive_scout.sqlite3')
+        self.assertEqual(result, (empty / 'archive_scout.sqlite3').resolve())
         self.assertEqual(self.value(result), 'backup')
         self.assertEqual(list(empty.glob('backups/*before_restore.sqlite3')), [])
 
