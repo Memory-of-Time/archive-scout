@@ -26,7 +26,7 @@ class V101RateAndScrollingAuditTests(unittest.TestCase):
         reset_shared_traffic_state_for_tests()
 
     def test_release_identity_keeps_schema_11(self):
-        self.assertEqual(VERSION, "1.0.9")
+        self.assertEqual(VERSION, "1.1.0")
         self.assertEqual(SCHEMA_VERSION, 13)
 
     def test_text_paged_service_pause_stops_admission_and_preserves_cursor(self):
@@ -102,7 +102,7 @@ class V101RateAndScrollingAuditTests(unittest.TestCase):
 
     def test_coalesced_rate_limit_incident_adapts_spacing_once(self):
         reset_shared_traffic_state_for_tests()
-        limiter = SharedFixedRateLimiter(2.5, key=WAYBACK_INDEX_RATE_KEY)
+        limiter = SharedFixedRateLimiter(2.5, key=WAYBACK_INDEX_RATE_KEY, adaptive=True)
         gate = SharedHostGate()
         applied = []
         clock = [1000.0]

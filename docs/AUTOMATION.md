@@ -35,3 +35,7 @@ Diagnostics and unexpected failures are written to stderr. Never parse human-rea
 
 ## Bot-safety notes
 `status`, `search`, `results`, and `errors` are read-only. They open the project database with SQLite query-only mode. `search` operates on the already-built Research Intelligence index and does not contact an AI provider. `research --ai` and `ai-review` are the only CLI research commands that require external AI credentials.
+
+## Optional adaptive pacing (v1.1.0)
+
+Adaptive rate limiting is experimental, still testing, and off by default. Set `"adaptive_rate_limiting": true` in project JSON or pass `--adaptive-rate-limiting` to `archive-scout run`. Pass `--no-adaptive-rate-limiting` to use fixed spacing, including when resuming a previously adaptive run. The switch controls extra post-throttle request spacing; it does not disable shared request ceilings, recovery, or server-requested waits.

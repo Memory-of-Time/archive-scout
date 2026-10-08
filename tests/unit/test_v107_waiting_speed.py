@@ -160,13 +160,13 @@ class WaitingPolicyTests(unittest.TestCase):
         self.assertEqual(gate.base_pause, 5)
         self.assertFalse(gate._policies)
 
-    def test_closed_slow_limiter_does_not_bake_its_baseline_into_adaptation(self):
+    def test_closed_slow_limiter_does_not_leave_optional_adaptive_debt(self):
         with Clock() as clock:
-            slow = rl.SharedFixedRateLimiter(1, key=rl.WAYBACK_REPLAY_RATE_KEY)
+            slow = rl.SharedFixedRateLimiter(1, key=rl.WAYBACK_REPLAY_RATE_KEY, adaptive=True)
             slow.note_rate_limit(1)
             slow.close()
-            fast = rl.SharedFixedRateLimiter(0.125, key=rl.WAYBACK_REPLAY_RATE_KEY)
-            self.assertEqual(fast.effective_delay, 0.25)
+            fast = rl.SharedFixedRateLimiter(0.125, key=rl.WAYBACK_REPLAY_RATE_KEY, adaptive=True)
+            self.assertEqual(fast.effective_delay, 0.125)
             for _ in range(8):
                 clock.advance(1)
                 fast.note_healthy_response()
@@ -175,7 +175,7 @@ class WaitingPolicyTests(unittest.TestCase):
 
     def test_index_recovers_after_small_sustained_success_sample(self):
         with Clock() as clock:
-            limiter = rl.SharedFixedRateLimiter(2.5, key=rl.WAYBACK_INDEX_RATE_KEY)
+            limiter = rl.SharedFixedRateLimiter(2.5, key=rl.WAYBACK_INDEX_RATE_KEY, adaptive=True)
             limiter.note_rate_limit(1)
             for _ in range(7):
                 clock.advance(5)
@@ -188,7 +188,7 @@ class WaitingPolicyTests(unittest.TestCase):
 
     def test_rapid_single_success_does_not_snap_back(self):
         with Clock():
-            limiter = rl.SharedFixedRateLimiter(0.125, key=rl.WAYBACK_REPLAY_RATE_KEY)
+            limiter = rl.SharedFixedRateLimiter(0.125, key=rl.WAYBACK_REPLAY_RATE_KEY, adaptive=True)
             limiter.note_rate_limit(1)
             for _ in range(8):
                 limiter.note_healthy_response()

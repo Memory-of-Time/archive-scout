@@ -1066,6 +1066,7 @@ class ResilientTransport:
             raise ValueError("network backend must be auto, httpx, urllib3, or curl")
         self.callback = callback
         self.attempt_context_factory = None
+        self._probe_local = threading.local()
         self.lock = threading.Lock()
         self.cooldown_until: dict[str, float] = {}
         self.last_success: str | None = None
@@ -1099,6 +1100,37 @@ class ResilientTransport:
     def set_attempt_context_factory(self, factory) -> None:
         """Install a context factory invoked for every actual backend/hop attempt."""
         self.attempt_context_factory = factory
+
+    @contextlib.contextmanager
+    def recovery_probe(self, url: str, enabled: bool = True):
+        """Let one host-gate-admitted probe test cooled connection methods.
+
+        Backend penalties describe earlier connection failures, not server
+        deadlines. The shared host gate has already enforced those deadlines
+        before this scope is entered. Penalties remain intact until real I/O
+        succeeds, and unrelated workers/origins keep their normal eligibility.
+        """
+        with self.lock:
+            if not hasattr(self, "_probe_local"):
+                self._probe_local = threading.local()
+        previous = getattr(self._probe_local, "origin", "")
+        self._probe_local.origin = urllib.parse.urlsplit(url).netloc.casefold() if enabled else ""
+        try:
+            yield
+        finally:
+            self._probe_local.origin = previous
+
+    def _is_recovery_probe(self, url: str) -> bool:
+        origin = urllib.parse.urlsplit(url).netloc.casefold()
+        return bool(origin and getattr(getattr(self, "_probe_local", None), "origin", "") == origin)
+
+    def backend_ready(self, url: str) -> bool:
+        """Whether an ordinary retry can use a backend without a local wait."""
+        with self.lock:
+            state = self._health_locked(url)
+            now = time.monotonic()
+            return any(state.cooldown_until.get(name, 0.0) <= now and name not in state.probing
+                       for name in self.order)
 
     def _request_backend(self, backend, url, headers, max_bytes, stop_event, redirect_validator=None):
         try:
@@ -1153,7 +1185,8 @@ class ResilientTransport:
     def _claim_backend(self, url: str, name: str) -> bool:
         with self.lock:
             state = self._health_locked(url)
-            if name in state.probing or state.cooldown_until.get(name, 0.0) > time.monotonic():
+            if name in state.probing or (state.cooldown_until.get(name, 0.0) > time.monotonic()
+                                         and not self._is_recovery_probe(url)):
                 return False
             if name in state.cooldown_until:
                 state.probing.add(name)
@@ -1225,7 +1258,8 @@ class ResilientTransport:
             state = self._health_locked(url)
             preferred = state.last_success
             available = [name for name in self.order
-                         if state.cooldown_until.get(name, 0.0) <= now and name not in state.probing]
+                         if (state.cooldown_until.get(name, 0.0) <= now or self._is_recovery_probe(url))
+                         and name not in state.probing]
             eligible_at = min((state.cooldown_until.get(name, now) for name in self.order), default=now)
             recovered = [name for name in available if name in state.cooldown_until]
         if not available:

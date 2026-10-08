@@ -27,8 +27,10 @@ class _SharedRateState:
         self.requested_delay = max(0.0, float(requested_delay))
         self.adaptive_delay = self.requested_delay
         self.adaptive_factor = 1.0
+        self.adaptive_next_request = 0.0
         self.healthy_since = 0.0
         self.registrations: dict[int, float] = {}
+        self.adaptive_registrations: set[int] = set()
         self.last_rate_limit = 0.0
         self.last_rate_signal = 0.0
         self.last_incident_id: int | None = None
@@ -76,17 +78,19 @@ class FixedRateLimiter:
 
 
 class SharedFixedRateLimiter(FixedRateLimiter):
-    """Process-wide spacing and adaptive recovery for one Wayback traffic pool.
+    """Process-wide fixed spacing, with optional experimental adaptive pacing.
 
     Index and replay traffic use separate keys.  Every client sharing a key also
     shares one effective interval, so a faster per-target value cannot silently
     weaken a slower setting selected elsewhere in the same process.  After a
-    genuine live service throttle, the pool temporarily reopens more slowly and
-    eases back toward the requested ceiling only after sustained healthy traffic.
+    genuine live service throttle, opted-in clients temporarily reopen more
+    slowly and ease back after sustained healthy traffic. Fixed-only clients
+    share the mandatory spacing without inheriting those experimental waits.
     """
 
-    def __init__(self, delay: float, key: str = WAYBACK_HOST_GATE_KEY) -> None:
+    def __init__(self, delay: float, key: str = WAYBACK_HOST_GATE_KEY, *, adaptive: bool = False) -> None:
         self.key = str(key or WAYBACK_HOST_GATE_KEY).casefold()
+        self.adaptive = bool(adaptive)
         floor = 0.0
         if self.key == WAYBACK_INDEX_RATE_KEY:
             floor = WAYBACK_INDEX_MIN_INTERVAL
@@ -103,10 +107,11 @@ class SharedFixedRateLimiter(FixedRateLimiter):
             with state.condition:
                 state.floor_delay = max(state.floor_delay, floor)
                 state.registrations[self._registration_id] = self.delay
+                if self.adaptive:
+                    state.adaptive_registrations.add(self._registration_id)
                 # Only *active* clients contribute their requested pacing floor.
-                # Service-driven adaptive recovery remains a separate state so a
-                # throttle survives operation turnover without a closed slow
-                # client permanently constraining a later faster operation.
+                # Adaptive admission has a separate clock: one opted-in client
+                # must never place a fixed-only client behind an adaptive wait.
                 state.requested_delay = max(
                     state.floor_delay,
                     max(state.registrations.values(), default=state.floor_delay),
@@ -126,11 +131,34 @@ class SharedFixedRateLimiter(FixedRateLimiter):
 
     @property
     def effective_delay(self) -> float:
-        return max(self._state.requested_delay, self._state.adaptive_delay)
+        if self.adaptive:
+            return max(self._state.requested_delay, self._state.adaptive_delay)
+        return self._state.requested_delay
 
     @property
     def requested_delay(self) -> float:
         return self.delay
+
+    @contextlib.contextmanager
+    def slot(self, stop_event: threading.Event):
+        while True:
+            with self.condition:
+                if stop_event.is_set():
+                    raise Stopped
+                now = time.monotonic()
+                due = self._state.next_request
+                if self.adaptive:
+                    due = max(due, self._state.adaptive_next_request)
+                wait = max(0.0, due - now)
+                if wait <= 0:
+                    # Mandatory starts remain spaced across every client. The
+                    # optional clock only constrains experimental clients.
+                    self._state.next_request = now + self._state.requested_delay
+                    if self.adaptive:
+                        self._state.adaptive_next_request = now + self.effective_delay
+                    break
+                self.condition.wait(timeout=min(wait, 0.5))
+        yield
 
     def close(self) -> None:
         if self._closed:
@@ -138,11 +166,22 @@ class SharedFixedRateLimiter(FixedRateLimiter):
         self._closed = True
         with self.condition:
             self._state.registrations.pop(self._registration_id, None)
+            self._state.adaptive_registrations.discard(self._registration_id)
             requested = max(
                 self._state.floor_delay,
                 max(self._state.registrations.values(), default=self._state.floor_delay),
             )
             self._state.requested_delay = requested
+            if not self._state.adaptive_registrations:
+                # Opting out (including operation turnover) leaves no inherited
+                # adaptive debt. Live service deadlines belong to SharedHostGate.
+                self._state.adaptive_factor = 1.0
+                self._state.adaptive_next_request = 0.0
+                self._state.last_incident_id = None
+                self._state.last_rate_signal = 0.0
+                self._state.last_rate_limit = 0.0
+                self._state.healthy_starts = 0
+                self._state.healthy_since = 0.0
             self._state.adaptive_delay = requested * self._state.adaptive_factor
             self.condition.notify_all()
 
@@ -153,6 +192,8 @@ class SharedFixedRateLimiter(FixedRateLimiter):
         time-based coalescing path is retained for callers/tests that do not yet
         provide that identifier, but production HTTP clients always do.
         """
+        if not self.adaptive or self._closed:
+            return False
         with self.condition:
             now = time.monotonic()
             if incident_id is not None:
@@ -178,6 +219,8 @@ class SharedFixedRateLimiter(FixedRateLimiter):
             return True
 
     def note_healthy_response(self) -> None:
+        if not self.adaptive or self._closed:
+            return
         with self.condition:
             baseline = self._state.requested_delay
             if self._state.adaptive_delay <= baseline:
@@ -196,12 +239,13 @@ class SharedFixedRateLimiter(FixedRateLimiter):
                 self._state.healthy_starts = 0
                 self.condition.notify_all()
 
-    def snapshot(self) -> dict[str, float | int]:
+    def snapshot(self) -> dict[str, float | int | bool]:
         with self.condition:
             return {
                 "requested_delay": self.delay,
                 "pool_floor_delay": self._state.requested_delay,
                 "effective_delay": self.effective_delay,
+                "adaptive_rate_limiting": self.adaptive,
                 "healthy_starts": self._state.healthy_starts,
                 "last_incident_id": self._state.last_incident_id or 0,
             }
@@ -261,6 +305,7 @@ class SharedHostGate:
         self.recovery_cycle_started = 0.0
         self.connection_outage_cycles = 0
         self.connection_outage_base = 3.0
+        self.connection_outage_generation = -1
         self.reason = ""
         self.generation = 0
         self.probe_required = False
@@ -308,7 +353,8 @@ class SharedHostGate:
                 if stop_event.is_set():
                     raise Stopped
                 now = time.monotonic()
-                if deadline is not None and now >= deadline:
+                if (deadline is not None and now >= deadline
+                        and (self.probe_required or self.probe_inflight or self.blocked_until > now)):
                     waited = max(0.0, now - self.incident_started) if self.incident_started else 0.0
                     raise RecoveryDeadlineExceeded(
                         incident_id=self.incident_id,
@@ -377,6 +423,7 @@ class SharedHostGate:
             self.reason = "connection outage"
             self.probe_required = True
             self._start_wait(now)
+            self.connection_outage_generation = self.generation
             self.generation += 1
             self.condition.notify_all()
 
@@ -398,21 +445,7 @@ class SharedHostGate:
                 return
             self.probe_inflight = False
             if recovered:
-                if self._wait_started is not None:
-                    self._wait_seconds += max(0.0, time.monotonic() - self._wait_started)
-                    self._wait_started = None
-                self.probe_required = False
-                self.blocked_until = 0.0
-                self.blocked_until_wall = 0.0
-                # Retain incident memory; gradual rate recovery belongs to the
-                # corresponding rate pool rather than resetting after one probe.
-                self.incidents = max(0, self.incidents - 1)
-                self.reason = ""
-                self.incident_started = 0.0
-                self.incident_started_wall = 0.0
-                self.recovery_cycle_started = 0.0
-                self.connection_outage_cycles = 0
-                self.generation += 1
+                self._finish_recovery_locked()
             else:
                 # A fresh 5xx/network failure did not prove recovery.  Avoid a
                 # thundering sequence of simultaneous recovery probes.
@@ -424,6 +457,33 @@ class SharedHostGate:
                 self.blocked_until_wall = max(self.blocked_until_wall, time.time() + pause)
                 self.generation += 1
             self.condition.notify_all()
+
+    def defer_request(self, permit: HostPermit) -> None:
+        """Return an unused probe permit without inventing a network failure."""
+        if not permit.probe:
+            return
+        with self.condition:
+            if permit.generation == self.generation and self.probe_inflight:
+                self.probe_inflight = False
+                self.condition.notify_all()
+
+    def _finish_recovery_locked(self) -> None:
+        if self._wait_started is not None:
+            self._wait_seconds += max(0.0, time.monotonic() - self._wait_started)
+            self._wait_started = None
+        self.probe_required = False
+        self.probe_inflight = False
+        self.blocked_until = 0.0
+        self.blocked_until_wall = 0.0
+        # Quota incident memory decays in the optional adaptive rate pool.
+        self.incidents = max(0, self.incidents - 1)
+        self.reason = ""
+        self.incident_started = 0.0
+        self.incident_started_wall = 0.0
+        self.recovery_cycle_started = 0.0
+        self.connection_outage_cycles = 0
+        self.connection_outage_generation = -1
+        self.generation += 1
 
     def wait(self, stop_event: threading.Event) -> None:
         while True:
@@ -551,10 +611,20 @@ class SharedHostGate:
             self.connection_failures += 1
             return self.connection_failures, self.connection_failures >= limit
 
-    def note_connection_success(self) -> None:
+    def note_connection_success(self, *, permit: HostPermit | None = None, recovered: bool = False) -> bool:
         with self.condition:
             self.connection_failures = 0
             self.last_connection_failure = 0.0
+            if (recovered and self.reason == "connection outage" and permit is not None
+                    and (permit.generation == self.connection_outage_generation
+                         or (permit.probe and permit.generation == self.generation))):
+                # Trustworthy progress from a transfer already in flight proves
+                # this connection incident recovered. A stale transfer from an
+                # earlier incident and any live server deadline remain untouched.
+                self._finish_recovery_locked()
+                self.condition.notify_all()
+                return True
+            return False
 
 
 def shared_host_gate(

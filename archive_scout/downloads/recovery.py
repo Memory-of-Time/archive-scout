@@ -1,8 +1,32 @@
 from __future__ import annotations
 
 import time
+import heapq
 
 from ..events import ProgressEvent, Stopped
+
+
+def wake_backend_retries(delayed, ready, client, url_for_row) -> int:
+    """Release only local-backend waits made obsolete by a healthy backend.
+
+    Generic retry deadlines (including Retry-After) retain their original
+    eligibility. The actual worker still passes through the shared host gate.
+    """
+    backend_ready = getattr(type(client), "replay_backend_ready", None)
+    if not callable(backend_ready):
+        return 0
+    pending = []
+    awakened = 0
+    for due, sequence, row, payload, wait_kind in delayed:
+        if wait_kind == "backend_cooldown" and backend_ready(client, url_for_row(row)):
+            ready.append((row, payload))
+            awakened += 1
+        else:
+            pending.append((due, sequence, row, payload, wait_kind))
+    if awakened:
+        delayed[:] = pending
+        heapq.heapify(delayed)
+    return awakened
 
 
 def wait_for_archive(config, gate, stop_event, callback=None, *, stage="download") -> None:

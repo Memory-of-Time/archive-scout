@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- Remove compounded shared-recovery/backend waits and preserve healthy in-flight acquisitions while failed work is deferred.
+- End connection-only recovery on trustworthy current-incident success; preserve server-requested waits, pending captures, and cancellation/resume safety.
+- Make adaptive request spacing opt-in, off by default, and clearly marked experimental/still testing across GUI, CLI, and saved configuration.
+- Preserve the user's adaptive pacing preference on Resume without replacing the saved capture selection or retention policy.
+- Record offline test results and publish validation artifacts from the cross-platform Tests and release workflows. Project schema remains 13.
+
 ## 1.0.9
 
 - Count fresh, validated, manifest-committed saves separately from retries and adoption, with bounded rolling throughput and typed failure counters.

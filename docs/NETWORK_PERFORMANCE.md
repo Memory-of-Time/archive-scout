@@ -6,7 +6,7 @@ The scheduler uses monotonic time and does not accumulate burst credit after idl
 
 ## 429/503 behavior
 
-A live Wayback 429 or service-level 503 closes the shared host gate. Retry-After seconds and HTTP-date forms are treated as minimum deadlines. If no valid header is present, the first coordinated cooldown is at least 60 seconds and any jitter is positive-only. One recovery probe is allowed after the gate reopens; fresh 500/502/504 responses do not count as healthy recovery. Adaptive pacing changes at most once per coalesced service incident, then relaxes gradually after sustained healthy starts instead of snapping immediately back to the fastest configured interval.
+A live Wayback 429 or service-level 503 closes the shared host gate. Retry-After seconds and HTTP-date forms are treated as minimum deadlines. If no valid header is present, the first coordinated cooldown is at least 60 seconds and any jitter is positive-only. One recovery probe is allowed after the gate reopens; fresh 500/502/504 responses do not count as healthy recovery. Optional adaptive pacing changes at most once per coalesced HTTP 429 incident and then relaxes after sustained healthy starts. It is experimental, still testing, and off by default in v1.1.0. Disabled clients always use fixed requested spacing, including when an opted-in client shares the process; closing the last opted-in client clears optional pacing debt. Mandatory host recovery and Retry-After remain active in either mode.
 
 A historical 429/503 reproduced inside an archived replay is different: when the response carries replay/memento context it is treated as an archived origin status rather than evidence that the live Wayback service is throttling Archive Scout.
 
@@ -29,3 +29,11 @@ HTTPX native chunks and urllib3 read1 expose small received prefixes promptly. C
 Text acquisition keeps delayed retries in a bounded coordinator queue, preserving the configured per-capture attempt limit. Workers return between failed attempts rather than sleeping through backoff. Ready fresh captures take precedence when repeated retries would otherwise occupy the pool. Existing pending paths and partial files survive Pause & save; an interrupted invocation resumes under the existing per-invocation retry contract. Media gets the shared transport fixes but retains its current media retry scheduler.
 
 Activity reports delayed retry count. Structured progress also includes scheduled retry seconds and requested/effective request intervals. Scheduled retry time is not worker-blocked time. The existing transport_failures compatibility field counts attempt exceptions, including some service and classification exceptions; it is not a pure count of failed TCP connections. Default timeout values remain unchanged pending controlled latency measurement.
+
+## Recovery and pacing in 1.1.0
+
+An admitted shared recovery probe can requalify an origin's cooled transport without stacking a 30-second backend wait on top of shared recovery. A backend-only scheduling delay is reconsidered after another successful request makes that backend available. This does not shorten a server's Retry-After or ordinary capture retry backoff.
+
+Deferred recovery stops queued admissions while running healthy acquisitions settle normally and commit their results. Trustworthy headers/body prefixes can reset the connection-failure streak and end a matching connection-only outage; they cannot release a server throttle. Final payload validation still determines whether bytes are saved.
+
+Select **Adaptive rate limiting (experimental — still testing)** in the GUI, set `adaptive_rate_limiting` in project JSON, or use `--adaptive-rate-limiting` / `--no-adaptive-rate-limiting` for a CLI run. Resume uses the current switch while preserving saved operation selection, retention, and server eligibility.

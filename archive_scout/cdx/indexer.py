@@ -491,7 +491,7 @@ def _client_for_config(
     callback: Callable[[ProgressEvent], None] | None,
 ) -> HttpClient:
     network = config.network.normalized()
-    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY)
+    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:

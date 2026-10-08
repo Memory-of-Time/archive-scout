@@ -32,11 +32,19 @@ jobs:
       - name: Compile source
         run: python -m compileall -q archive_scout
       - name: Run tests
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+        run: python scripts/run_tests.py --output validation/test-results
       - name: Verify source identity and complete spawned scans
         run: |
           python scripts/verify_release.py --source-only
           python scripts/verify_packaged_scan.py --output validation/source-spawn-smoke.json
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-evidence
+          path: validation/
+          if-no-files-found: warn
 
   windows:
     name: Build Windows x64

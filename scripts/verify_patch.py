@@ -1,4 +1,4 @@
-"""Verify and apply v1.0.9 files to supplied v1.0.8 or known v1.0.9 source.
+"""Verify and apply v1.1.0 files to supplied v1.0.9 or known v1.1.0 source.
 
 Run this script from the extracted patch, pointing --project at your checkout.
 Only Python's standard library is required. Project databases are never opened.
@@ -51,8 +51,8 @@ def source_identity(project: Path) -> tuple[str, int]:
 
 def preflight(project: Path) -> tuple[dict, list[str]]:
     manifest = json.loads((ROOT / METADATA[0]).read_text(encoding="utf-8"))
-    if manifest.get("release") != "1.0.9" or manifest.get("base_release") != "1.0.8" or manifest.get("deletions"):
-        raise RuntimeError("This helper requires the v1.0.9-over-v1.0.8 replacement manifest")
+    if manifest.get("release") != "1.1.0" or manifest.get("base_release") != "1.0.9" or manifest.get("deletions"):
+        raise RuntimeError("This helper requires the v1.1.0-over-v1.0.9 replacement manifest")
     entries = manifest["files"]
     names = [entry["path"] for entry in entries]
     if len(set(names)) != len(names) or set(names) & set(METADATA):
@@ -69,8 +69,8 @@ def preflight(project: Path) -> tuple[dict, list[str]]:
         path = checked_path(ROOT, name)
         if not path.is_file() or digest(path) != expected:
             raise RuntimeError(f"Patch integrity check failed: {name}")
-    if source_identity(project) not in {("1.0.8", 13), ("1.0.9", 13)}:
-        raise RuntimeError("Target must be the supplied v1.0.8 source or a provided v1.0.9 source candidate")
+    if source_identity(project) not in {("1.0.9", 13), ("1.1.0", 13)}:
+        raise RuntimeError("Target must be the supplied v1.0.9 source or a provided v1.1.0 source candidate")
     pending = []
     for entry in entries:
         name = entry["path"]
@@ -109,7 +109,7 @@ def atomic_copy(source: Path, target: Path) -> None:
 def apply(project: Path, pending: list[str]) -> Path | None:
     if not pending:
         return None
-    backup = Path(tempfile.mkdtemp(prefix="ArchiveScout-v1.0.9-source-backup-", dir=project.parent))
+    backup = Path(tempfile.mkdtemp(prefix="ArchiveScout-v1.1.0-source-backup-", dir=project.parent))
     existing = set()
     for name in pending:
         target = project / name
@@ -138,7 +138,7 @@ def apply(project: Path, pending: list[str]) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", required=True, type=Path, help="Root of supplied v1.0.8 or a provided v1.0.9 source checkout")
+    parser.add_argument("--project", required=True, type=Path, help="Root of supplied v1.0.9 or a provided v1.1.0 source checkout")
     parser.add_argument("--apply", action="store_true", help="Apply after validation, keeping a source-file backup")
     args = parser.parse_args()
     try:

@@ -58,11 +58,11 @@ jobs:
         run: >-
           python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.0.9';
+          assert importlib.metadata.version('archive-scout') == '1.1.0';
           print('Archive Scout native accelerator imports and metadata checks passed')"
 
       - name: Run tests
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+        run: python scripts/run_tests.py --output validation/test-results
 
       - name: Verify release identity and workflow placement
         run: python scripts/verify_release.py
@@ -72,4 +72,14 @@ jobs:
 
       - name: Run offline benchmark smoke test
         if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.12'
-        run: python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
+        run: |
+          python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
+          python scripts/benchmark_request_spacing.py --admissions 10000 --output validation/request-spacing.json
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.os }}-python-${{ matrix.python-version }}
+          path: validation/
+          if-no-files-found: warn

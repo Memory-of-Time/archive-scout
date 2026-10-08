@@ -1,30 +1,9 @@
-ARCHIVE SCOUT v1.0.9 PATCH / RELEASE CHECKLIST
+Archive Scout v1.1.0 patch upload
 
-1. Apply to the supplied v1.0.8/schema-13 source, using APPLY_PATCH.md.
-   Verify first with scripts/verify_patch.py; the helper preserves a source backup.
-2. Extract one patch archive. Upload its contents, preserving relative paths;
-   do not upload the archive container or an enclosing patch folder.
-3. Keep .github/workflows/tests.yml in that exact hidden directory. Reveal
-   hidden files in Finder with Command+Shift+Period if necessary.
-4. The plain github/workflows mirror does not activate GitHub Actions.
-   Do not flatten workflow files into the repository root.
-5. Confirm runtime, pyproject and Windows versions are 1.0.9, schema 13.
-   Run python scripts/verify_release.py after installing the package.
-6. Run pip check, source compilation, unittest discovery and the offline
-   benchmark smoke test using the commands in APPLY_PATCH.md.
-7. Confirm optional Dashboard remaining-time estimates default to off;
-   unknown work plans show Estimating rather than a fabricated deadline.
-8. Confirm existing Reports settings select the inventory/fields you need.
-9. No schema migration is introduced. Keep project/source backups and validate
-   reopen/FTS integrity after complete scans. This is source, not an executable update.
-10. Run the GitHub Tests matrix on the actual commit. Local Linux validation
-    does not establish Windows/macOS CI or native installer success.
-11. Create the v1.0.9 tag only after Tests succeeds. Keep the existing Windows
-    signing setup and verify both GUI and CLI in each native release archive,
-    including scripts/verify_packaged_scan.py against the frozen CLI executable.
-12. Smoke-test startup, optional ETA, stop/resume, local search, report
-    regeneration and migration on native packages before publishing.
-
-Default request ceilings, TLS, Retry-After, response/Range validation, and
-text/media classification remain in effect. Completeness takes priority over
-unattainable throughput when a service or workload requires waiting.
+- Start from the supplied v1.0.9 source archive.
+- Use scripts/verify_patch.py preflight and --apply, or copy changed/new files at their exact paths.
+- Keep .github/workflows/tests.yml and build-and-release.yml under .github/workflows. Both mirrors are included.
+- No source deletions, database files, API keys, or binary application packages are included.
+- Run Tests on the upload branch/PR; download its validation artifact for each platform/Python job.
+- Build the desktop executables through the existing Build All Platforms workflow after reviewing tests.
+- Local success is recorded in SOURCE_VALIDATION.txt and docs/VALIDATION_1_1_0.md; hosted jobs for this unpublished patch have not run.

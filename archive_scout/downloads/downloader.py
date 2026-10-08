@@ -45,7 +45,7 @@ from ..database.repositories import (
 )
 from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..text_encoding import decode_prefix, TextDecodingError
-from .recovery import wait_for_archive
+from .recovery import wait_for_archive, wake_backend_retries
 from ..parsing.embeds import extract_embed_candidates_fast
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..scanning.jobs import ScanJob
@@ -1235,7 +1235,8 @@ def _acquire_archive(
         ) or "no stale rows required reclassification"
         callback(ProgressEvent("classification", f"Resource classification preparation complete: {classes}."))
 
-    limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY)
+    limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY,
+                                    adaptive=config.adaptive_rate_limiting)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
     acquisition_cancel = threading.Event()
     worker_stop = _CombinedStopEvent(stop_event, acquisition_cancel)
@@ -1264,7 +1265,7 @@ def _acquire_archive(
     inflight_limit = max(config.workers, config.workers * 3)
     stage_limit = max(64, min(512, config.workers * 16))
     ready_downloads: deque[tuple[dict[str, object], Path]] = deque()
-    delayed_retries: list[tuple[float, int, dict[str, object], Path]] = []
+    delayed_retries: list[tuple[float, int, dict[str, object], Path, str]] = []
     retry_sequence = 0
     futures: dict[concurrent.futures.Future, dict[str, object]] = {}
     rows_exhausted = False
@@ -1658,8 +1659,10 @@ def _acquire_archive(
                 raise Stopped
 
             now = time.monotonic()
+            wake_backend_retries(delayed_retries, ready_downloads, client,
+                                 lambda row: replay_url(str(row["timestamp"]), str(row["original_url"])))
             while delayed_retries and delayed_retries[0][0] <= now:
-                _due, _sequence, item, path = heapq.heappop(delayed_retries)
+                _due, _sequence, item, path, _wait_kind = heapq.heappop(delayed_retries)
                 ready_downloads.append((item, path))
 
             process_discard_scans(0.0)
@@ -1725,6 +1728,9 @@ def _acquire_archive(
                         raise deferred_error
                     wait_for_archive(config, host_gate, stop_event, callback, stage=progress_stage)
                     acquisition_cancel.clear()
+                    resume_admissions = getattr(type(client), "resume_admissions", None)
+                    if callable(resume_admissions):
+                        resume_admissions(client)
                     deferred_error = None
                     continue
                 if rows_exhausted and not ready_downloads and not delayed_retries and not waiting_scan and not scan_futures:
@@ -1815,17 +1821,18 @@ def _acquire_archive(
                     item["retry_attempt"] = exc.attempt_number
                     retry_sequence += 1
                     heapq.heappush(delayed_retries, (
-                        exc.eligible_at, retry_sequence, item, Path(str(item["assigned_path"])),
+                        exc.eligible_at, retry_sequence, item, Path(str(item["assigned_path"])), exc.wait_kind,
                     ))
                 except RateLimitDeferred as exc:
                     # Preserve the original pause reason, stop admitting queued
                     # work, and leave this capture retryable without consuming a
-                    # normal download-attempt budget. Running workers observe the
-                    # internal stop event; already-finalized files are adopted on
-                    # Resume if their DB completion record was not yet flushed.
+                    # normal download-attempt budget. Healthy transfers already
+                    # in flight settle and are committed before recovery.
                     if deferred_error is None:
                         deferred_error = exc
-                        acquisition_cancel.set()
+                        pause_admissions = getattr(type(client), "pause_admissions", None)
+                        if callable(pause_admissions):
+                            pause_admissions(client, exc)
                     ready_downloads.appendleft((item, Path(str(item["assigned_path"]))))
                     with database:
                         database.execute(
@@ -1835,7 +1842,9 @@ def _acquire_archive(
                 except ConnectivityPaused as exc:
                     if deferred_error is None:
                         deferred_error = exc
-                        acquisition_cancel.set()
+                        pause_admissions = getattr(type(client), "pause_admissions", None)
+                        if callable(pause_admissions):
+                            pause_admissions(client, exc)
                     ready_downloads.appendleft((item, Path(str(item["assigned_path"]))))
                     with database:
                         database.execute(
@@ -1865,7 +1874,6 @@ def _acquire_archive(
             emit_progress()
 
             if deferred_error is not None:
-                acquisition_cancel.set()
                 for pending in futures:
                     pending.cancel()
                 flush_results(force=True)

@@ -231,6 +231,8 @@ def run_project(
                     allowed = {item.name for item in fields(ProjectConfig)}
                     snapshot_values = {key: value for key, value in payload.items() if key in allowed}
                     snapshot_values["output_dir"] = config.output_dir
+                    # Pacing is a runtime preference; saved selection and retention stay authoritative.
+                    snapshot_values["adaptive_rate_limiting"] = config.adaptive_rate_limiting
                     config = ProjectConfig(**snapshot_values).normalized()
                 except (TypeError, ValueError, json.JSONDecodeError):
                     # Older operation rows may not contain a complete snapshot.

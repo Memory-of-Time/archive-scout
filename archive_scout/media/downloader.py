@@ -22,6 +22,7 @@ from ..database.repositories import (
 from ..downloads.downloader import make_replay_redirect_validator, replay_url
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_REPLAY_RATE_KEY, shared_host_gate)
 from ..downloads.validation import classify_exception
+from ..downloads.recovery import wake_backend_retries
 from ..content import classify_replay_content, decode_bytes
 from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
@@ -340,7 +341,8 @@ def download_media(
         if callback:
             callback(ProgressEvent("media_download", "No media captures to download.", 0, 0))
         return
-    limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY)
+    limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY,
+                                    adaptive=config.adaptive_rate_limiting)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total_attempts: int, reason: str, wait_seconds: float) -> None:
@@ -406,8 +408,10 @@ def download_media(
             def submit_available() -> None:
                 nonlocal complete, errors, rows_exhausted
                 now_mono = time.monotonic()
+                wake_backend_retries(delayed, ready, client,
+                                     lambda row: replay_url(str(row["timestamp"]), str(row["original_url"])))
                 while delayed and delayed[0][0] <= now_mono:
-                    _due, _seq, row, attempt = heapq.heappop(delayed)
+                    _due, _seq, row, attempt, _wait_kind = heapq.heappop(delayed)
                     ready.append((row, attempt))
                 fresh_hidden = not any(attempt == 1 for _row, attempt in ready)
                 limit = queue_limit + (max_inflight if fresh_hidden else 0)
@@ -506,12 +510,14 @@ def download_media(
                                     promoted_ids.add(promoted)
                     except ReplayRetryScheduled as exc:
                         retry_sequence += 1
-                        heapq.heappush(delayed, (exc.eligible_at, retry_sequence, row, exc.attempt_number))
+                        heapq.heappush(delayed, (exc.eligible_at, retry_sequence, row, exc.attempt_number, exc.wait_kind))
                         continue
                     except (RateLimitDeferred, ConnectivityPaused) as exc:
                         if deferred_error is None:
                             deferred_error = exc
-                            cancel_event.set()
+                            pause_admissions = getattr(type(client), "pause_admissions", None)
+                            if callable(pause_admissions):
+                                pause_admissions(client, exc)
                         for pending in futures:
                             pending.cancel()
                         continue

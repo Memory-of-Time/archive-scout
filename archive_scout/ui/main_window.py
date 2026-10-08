@@ -293,6 +293,7 @@ class ArchiveScoutApp(tk.Tk):
         }
         self.cdx_delay_var = tk.StringVar(value=str(WAYBACK_INDEX_MIN_INTERVAL))
         self.download_delay_var = tk.StringVar(value=str(WAYBACK_REPLAY_MIN_INTERVAL))
+        self.adaptive_rate_limiting_var = tk.BooleanVar(value=False)
         self.rate_limit_base_var = tk.StringVar(value=str(int(WAYBACK_RATE_LIMIT_BASE_PAUSE)))
         self.rate_limit_max_var = tk.StringVar(value=str(int(WAYBACK_RATE_LIMIT_MAX_PAUSE)))
         self.rate_limit_wait_var = tk.StringVar(value="15")
@@ -1444,13 +1445,15 @@ class ArchiveScoutApp(tk.Tk):
             ("Per-capture retry ceiling (seconds)", self.network_retry_max_var),
             ("Failures before shared automatic recovery", self.network_failure_limit_var),
             ("429/503 minimum host cooldown (seconds)", self.rate_limit_base_var),
-            ("429/503 maximum adaptive cooldown (seconds)", self.rate_limit_max_var),
+            ("429/503 maximum host cooldown (seconds)", self.rate_limit_max_var),
         ]
         for row, (label, variable) in enumerate(recovery_rows):
             ttk.Label(recovery, text=label + ":", wraplength=340).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(recovery, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
         ttk.Label(recovery, text="Recommended and enabled by default. A recovery-cycle threshold pauses archive admissions and schedules another shared probe; it does not end the operation. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Checkbutton(recovery, text="Adaptive rate limiting (experimental — still in testing)", variable=self.adaptive_rate_limiting_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 2))
+        ttk.Label(recovery, text="Optional and off by default. Adds slower request spacing after a 429, then recovers toward your configured rate. Fixed shared request ceilings, connection recovery, and server-requested waits always remain active.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         redirect = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
         redirect.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)
@@ -2108,6 +2111,8 @@ class ArchiveScoutApp(tk.Tk):
                 max_file_mb=float(self.max_file_var.get()),
                 cdx_delay=float(self.cdx_delay_var.get()),
                 download_delay=float(self.download_delay_var.get()),
+                adaptive_rate_limiting=(bool(self.__dict__["adaptive_rate_limiting_var"].get())
+                                        if "adaptive_rate_limiting_var" in self.__dict__ else False),
                 rate_limit_base_pause=float(self.rate_limit_base_var.get()),
                 rate_limit_max_pause=float(self.rate_limit_max_var.get()),
                 rate_limit_max_wait=float(self.rate_limit_wait_var.get()) * 60.0,
@@ -3635,6 +3640,7 @@ class ArchiveScoutApp(tk.Tk):
                 variable.set(field in selected)
         self.cdx_delay_var.set(str(config.cdx_delay))
         self.download_delay_var.set(str(config.download_delay))
+        self.adaptive_rate_limiting_var.set(config.adaptive_rate_limiting)
         self.rate_limit_base_var.set(str(config.rate_limit_base_pause))
         self.rate_limit_max_var.set(str(config.rate_limit_max_pause))
         self.rate_limit_wait_var.set(str(config.rate_limit_max_wait / 60.0))

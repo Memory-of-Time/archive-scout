@@ -18,8 +18,8 @@ class PatchDeliveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.patch, self.project = self.root / 'patch', self.root / 'project'
         self.patch.mkdir(); self.project.mkdir()
-        self.before = "VERSION = '1.0.8'\nSCHEMA_VERSION = 13\n"
-        self.after = "VERSION = '1.0.9'\nSCHEMA_VERSION = 13\n"
+        self.before = "VERSION = '1.0.9'\nSCHEMA_VERSION = 13\n"
+        self.after = "VERSION = '1.1.0'\nSCHEMA_VERSION = 13\n"
         for base, text in ((self.project,self.before),(self.patch,self.after)):
             (base / 'archive_scout').mkdir()
             (base / 'archive_scout/constants.py').write_text(text)
@@ -29,7 +29,7 @@ class PatchDeliveryTests(unittest.TestCase):
             target = self.project / name
             entries.append({'path':name,'sha256':self.helper.digest(self.patch/name),
                             'base_sha256':self.helper.digest(target) if target.exists() else None})
-        manifest = {'release':'1.0.9','base_release':'1.0.8','deletions':[], 'files':entries}
+        manifest = {'release':'1.1.0','base_release':'1.0.9','deletions':[], 'files':entries}
         (self.patch/'PATCH_MANIFEST.json').write_text(json.dumps(manifest))
         sums = [f"{entry['sha256']}  {entry['path']}" for entry in entries]
         sums.append(self.helper.digest(self.patch/'PATCH_MANIFEST.json')+'  PATCH_MANIFEST.json')

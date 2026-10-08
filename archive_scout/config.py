@@ -445,6 +445,9 @@ class ProjectConfig:
     page_size: int = 100000
     cdx_delay: float = WAYBACK_INDEX_MIN_INTERVAL
     download_delay: float = WAYBACK_REPLAY_MIN_INTERVAL
+    # Experimental extra pacing after a service throttle; fixed request ceilings
+    # and shared recovery/Retry-After remain mandatory when this is disabled.
+    adaptive_rate_limiting: bool = False
     retries: int = 4
     rate_limit_base_pause: float = WAYBACK_RATE_LIMIT_BASE_PAUSE
     rate_limit_max_pause: float = WAYBACK_RATE_LIMIT_MAX_PAUSE
@@ -582,6 +585,7 @@ class ProjectConfig:
             page_size=min(150000, max(100, int(self.page_size))),
             cdx_delay=max(WAYBACK_INDEX_MIN_INTERVAL, float(self.cdx_delay)),
             download_delay=max(WAYBACK_REPLAY_MIN_INTERVAL, float(self.download_delay)),
+            adaptive_rate_limiting=bool(self.adaptive_rate_limiting),
             retries=min(12, max(1, int(self.retries))),
             rate_limit_base_pause=max(0.01, float(self.rate_limit_base_pause)),
             rate_limit_max_pause=max(0.01, float(self.rate_limit_base_pause), float(self.rate_limit_max_pause)),
@@ -821,6 +825,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         page_size=loaded_page_size,
         cdx_delay=loaded_cdx_delay,
         download_delay=loaded_download_delay,
+        adaptive_rate_limiting=bool(payload.get("adaptive_rate_limiting", False)),
         retries=int(payload.get("retries", 4)),
         rate_limit_base_pause=max(0.01, float(payload.get("rate_limit_base_pause", WAYBACK_RATE_LIMIT_BASE_PAUSE))),
         rate_limit_max_pause=max(0.01, float(payload.get("rate_limit_max_pause", WAYBACK_RATE_LIMIT_MAX_PAUSE))),

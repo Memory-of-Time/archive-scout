@@ -1,14 +1,23 @@
 # Archive Scout
 
-**Archive Scout 1.0.9** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
+**Archive Scout 1.1.0** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
 
 ## Downloads
 
 [**Windows x64**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/ArchiveScout-Windows-x64.zip) · [**macOS Universal**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/ArchiveScout-macOS-Universal.zip) · [**Linux x64**](https://github.com/Memory-of-Time/archive-scout/releases/latest) · [Installation guide](#installation)
 
-These links open the latest published application packages. For Linux, choose the Linux archive under **Assets**; its format may be ZIP or TAR.GZ. The v1.0.9 source changes become an application download after its build is published.
+These links open the latest published application packages. For Linux, choose the Linux archive under **Assets**; its format may be ZIP or TAR.GZ. The v1.1.0 source changes become an application download after its build is published.
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
+
+## 1.1.0 highlights
+
+- Connection recovery probes run when the shared recovery deadline permits, without waiting out a second backend cooldown. Healthy transfers continue and completed captures remain committed while queued work waits.
+- Proven healthy Wayback responses can end a connection-only outage promptly. Explicit server deadlines and service-throttle recovery remain authoritative.
+- **Adaptive rate limiting (experimental — still testing)** is optional and **off by default**. Enable it in Network settings, with `adaptive_rate_limiting: true` in project JSON, or the CLI's `--adaptive-rate-limiting` switch. `--no-adaptive-rate-limiting` turns it off, including on Resume. Fixed request ceilings and server-requested waits apply in either mode.
+- The normal replay ceiling remains eight request starts per second. Actual saved-download throughput depends on responses, payloads, retries, and service availability.
+
+See [v1.1.0 release notes](docs/RELEASE_1_1_0.md) and [validation evidence](docs/VALIDATION_1_1_0.md).
 
 ## 1.0.9 highlights
 

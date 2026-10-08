@@ -106,5 +106,6 @@
     "minimum_relevance": 50,
     "excerpt_chars": 5000,
     "request_timeout": 120.0
-  }
+  },
+  "adaptive_rate_limiting": false
 }

@@ -1,8 +1,13 @@
 {
   "version": "1.0.3",
   "output_dir": "./archive-scout-project",
-  "targets": ["example.com/*"],
-  "keywords": ["video", "archive"],
+  "targets": [
+    "example.com/*"
+  ],
+  "keywords": [
+    "video",
+    "archive"
+  ],
   "from_year": 2000,
   "to_year": 2015,
   "network": {
@@ -20,5 +25,6 @@
     "vector_backend": "local-hash",
     "entity_extraction": true,
     "duplicate_clustering": true
-  }
+  },
+  "adaptive_rate_limiting": false
 }
