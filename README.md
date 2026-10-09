@@ -3,7 +3,7 @@
 **Archive Scout 1.1.2** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
 
 # Downloads
-- Windowx x64
+- Windows x64
 - Linux x64
 - macOS Universial (Intel + Apple Silicon)
 
