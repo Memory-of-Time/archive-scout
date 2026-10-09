@@ -1,7 +1,0 @@
-{
-  "tests": 2,
-  "failures": 2,
-  "errors": 0,
-  "status": "expected_failures_reproduced",
-  "scope": "Real symlink path on Linux; does not claim native macOS execution."
-}

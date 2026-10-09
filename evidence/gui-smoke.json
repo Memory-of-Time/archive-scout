@@ -1,9 +1,0 @@
-{
-  "status": "passed",
-  "checks": [
-    "Tk window construction",
-    "restored navigation",
-    "existing project settings",
-    "no adaptive control"
-  ]
-}
