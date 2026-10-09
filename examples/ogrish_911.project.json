@@ -1,0 +1,110 @@
+{
+  "version": "1.0.0",
+  "output_dir": "ArchiveScout-Ogrish-911",
+  "targets": [
+    "ogrishforum.com/*",
+    "forum.ogrish.com/*"
+  ],
+  "keywords": [
+    "9/11",
+    "World Trade Center",
+    "WTC",
+    "jumpers"
+  ],
+  "keyword_set_name": "Ogrish 9/11 General",
+  "keyword_sets": [
+    {
+      "name": "Ogrish 9/11 General",
+      "selected": true,
+      "rules": [
+        "required: World Trade Center | label=WTC concept",
+        "WTC | label=WTC concept",
+        "high: jumper",
+        "high: jumpers",
+        "exact: impact footage | weight=4",
+        "exclude: base jumping"
+      ]
+    },
+    {
+      "name": "Media filenames",
+      "selected": true,
+      "rules": [
+        "exact: skylight.mov | weight=5",
+        "regex: lol[ _-]?superman | label=LOL Superman | weight=4",
+        "carport",
+        "canopy"
+      ]
+    }
+  ],
+  "from_date": "2005",
+  "to_date": "2007",
+  "cdx_filters": [
+    "statuscode:200"
+  ],
+  "cdx_collapses": [
+    "urlkey"
+  ],
+  "cdx_match_type": "",
+  "cdx_extra_params": [],
+  "workers": 6,
+  "download_scope": "all_text",
+  "minimum_score": 1,
+  "max_file_mb": 25,
+  "page_size": 5000,
+  "cdx_delay": 0.8,
+  "download_delay": 0.25,
+  "network": {
+    "backend": "auto",
+    "trust_environment": true,
+    "endpoint_mode": "auto",
+    "index_strategy": "auto",
+    "page_blocks": 1,
+    "persistent_retries": true,
+    "retry_base_seconds": 5.0,
+    "retry_max_seconds": 300.0,
+    "failure_pause_threshold": 8,
+    "diagnostics": true
+  },
+  "auto_backup": true,
+  "backup_keep": 5,
+  "media": {
+    "enabled": false,
+    "targets": [
+      "ogrishforum.com/*",
+      "forum.ogrish.com/*"
+    ],
+    "include_images": true,
+    "include_videos": true,
+    "include_extensions": [
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".wmv",
+      ".mov",
+      ".mpg",
+      ".mpeg",
+      ".avi",
+      ".mp4",
+      ".flv"
+    ],
+    "exclude_extensions": [
+      ".ico",
+      ".svg"
+    ],
+    "discover_embedded": true,
+    "allow_external_embeds": false,
+    "snapshot_strategy": "earliest",
+    "max_file_mb": 500,
+    "preserve_paths": true
+  },
+  "ai": {
+    "provider": "openai",
+    "model": "gpt-5-mini",
+    "candidate_limit": 200,
+    "batch_size": 8,
+    "minimum_relevance": 50,
+    "excerpt_chars": 5000,
+    "request_timeout": 120.0
+  }
+}
