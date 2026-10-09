@@ -26,9 +26,9 @@ for validation of your checkout.
 
 ## Downloads
 
-- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.1.2/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.1.2/ArchiveScout-Linux-x64.tar.gz)
-- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.1.2/ArchiveScout-macOS-Universal.zip)
+- [Windows x64](https://github.com/memory-of-time/archive-scout/releases/download/v1.1.2/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/memory-of-time/archive-scout/releases/download/v1.1.2/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/memory-of-time/archive-scout/releases/download/v1.1.2/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
