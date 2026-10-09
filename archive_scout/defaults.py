@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+PRESETS = {
+    "General web archive research": {
+        "targets": [],
+        "keywords": [
+            "archive", "mirror", "download", "attachment", "video", "image",
+            "filename", "reupload", "backup", "snapshot",
+        ],
+        "from_year": 2000,
+        "to_year": 2020,
+        "from_date": "2000",
+        "to_date": "2020",
+        "cdx_filters": ["statuscode:200"],
+        "cdx_collapses": ["urlkey"],
+        "cdx_match_type": "",
+        "cdx_extra_params": [],
+    },
+    "Legacy forum research": {
+        "targets": [],
+        "keywords": [
+            "thread", "post", "reply", "attachment", "download", "mirror",
+            "video", "image", "uploaded", "reupload",
+        ],
+        "from_year": 1998,
+        "to_year": 2015,
+        "from_date": "1998",
+        "to_date": "2015",
+        "cdx_filters": ["statuscode:200"],
+        "cdx_collapses": ["urlkey"],
+        "cdx_match_type": "",
+        "cdx_extra_params": [],
+    },
+    "Lost media discovery": {
+        "targets": [],
+        "keywords": [
+            "lost media", "rare footage", "unseen footage", "mirror", "reupload",
+            "filename", "download", "video", "clip", "archive",
+        ],
+        "from_year": 1996,
+        "to_year": 2020,
+        "from_date": "1996",
+        "to_date": "2020",
+        "cdx_filters": ["statuscode:200"],
+        "cdx_collapses": ["urlkey"],
+        "cdx_match_type": "",
+        "cdx_extra_params": [],
+    },
+    "Blank project": {
+        "targets": [],
+        "keywords": [],
+        "from_year": 2000,
+        "to_year": 2010,
+        "from_date": "2000",
+        "to_date": "2010",
+        "cdx_filters": ["statuscode:200"],
+        "cdx_collapses": ["urlkey"],
+        "cdx_match_type": "",
+        "cdx_extra_params": [],
+    },
+}
