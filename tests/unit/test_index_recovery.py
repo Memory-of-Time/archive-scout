@@ -108,7 +108,7 @@ class IndexRecoveryTests(unittest.TestCase):
             self.assertIsNone(state["resume_key"])
             database.close()
 
-    def test_rate_limit_deferral_pauses_without_outer_retry_or_state_degradation(self):
+    def test_rate_limit_deferral_is_retried_without_ending_the_run(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             config = ProjectConfig(
@@ -122,19 +122,16 @@ class IndexRecoveryTests(unittest.TestCase):
                 network=NetworkConfig(index_strategy="resume"),
             ).normalized()
             database = open_database(root)
-            deferred = RateLimitDeferred("server busy", waited=60, eligible_at_epoch=12345, incident_id=7)
             with patch(
                 "archive_scout.cdx.client.HttpClient.get_cdx_any",
-                side_effect=deferred,
-            ) as getter, patch("archive_scout.cdx.indexer.transient_backoff", return_value=0) as backoff:
-                with self.assertRaises(RateLimitDeferred) as caught:
+                side_effect=[RateLimitDeferred("server busy", waited=60), []],
+            ), patch("archive_scout.cdx.indexer.transient_backoff", return_value=0):
+                with self.assertRaises(RateLimitDeferred):
                     index_archive(config, database, threading.Event())
-            self.assertIs(caught.exception, deferred)
-            self.assertEqual(getter.call_count, 1)
-            backoff.assert_not_called()
+                index_archive(config, database, threading.Event())
             state = database.execute("SELECT complete,resume_key FROM index_state").fetchone()
-            self.assertEqual(state["complete"], 0)
-            self.assertIsNotNone(state["resume_key"])
+            self.assertEqual(state["complete"], 1)
+            self.assertIsNone(state["resume_key"])
             self.assertEqual(database.execute("SELECT COUNT(*) FROM errors WHERE resolved=0").fetchone()[0], 0)
             database.close()
 

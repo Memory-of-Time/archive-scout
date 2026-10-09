@@ -99,12 +99,7 @@ class V1061PerformanceHotfixTests(unittest.TestCase):
             original_scan = download_mod._scan_saved_capture
 
             def blocked_scan(*args, **kwargs):
-                # Keep the scanner blocked well beyond the replay-observation
-                # window. Slower Intel macOS CI runners can take materially
-                # longer to schedule worker threads than ARM/Linux runners; the
-                # invariant under test is that replay continues independently,
-                # not that GitHub's host reaches 30 starts inside 1.5 seconds.
-                release_scan.wait(timeout=5)
+                release_scan.wait(timeout=3)
                 return original_scan(*args, **kwargs)
 
             _ImmediateClient.call_times = []
@@ -129,11 +124,7 @@ class V1061PerformanceHotfixTests(unittest.TestCase):
             ):
                 thread = threading.Thread(target=run, daemon=True)
                 thread.start()
-                # 2.75 s keeps this a bounded throughput regression check (a
-                # serialized 0.125 s/request path cannot reach 30 starts in this
-                # window) while avoiding false failures on macOS Intel/Python
-                # 3.11 where thread scheduling is noticeably slower in CI.
-                deadline = time.monotonic() + 2.75
+                deadline = time.monotonic() + 1.5
                 while time.monotonic() < deadline:
                     with _ImmediateClient.lock:
                         count = len(_ImmediateClient.call_times)

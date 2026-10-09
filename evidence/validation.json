@@ -1,0 +1,162 @@
+{
+  "release": "1.1.2",
+  "schema": 13,
+  "base_commit": "665e61dda1a5c724dd10b9de3bb9509548de477d",
+  "source_provenance": {
+    "release": "1.1.2",
+    "ui_baseline": "attached v1.0.0",
+    "network_baseline": "v1.0.2 b23084e405226f2df8dd0f9904161874b62347cb",
+    "compatibility_baseline": "v1.1.1 665e61dda1a5c724dd10b9de3bb9509548de477d"
+  },
+  "patch_replacements": 73,
+  "retired_files": 71,
+  "full_suite": {
+    "release": "1.1.2",
+    "schema": 13,
+    "timestamp_utc": "2026-10-09T00:48:20.474765+00:00",
+    "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "win32",
+    "tests_run": 423,
+    "passed": 423,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "expected_failures": 0,
+    "unexpected_successes": 0,
+    "elapsed_seconds": 44.651,
+    "successful": true,
+    "network_scope": "Mocked service responses and local fixtures; no live Wayback throughput claim."
+  },
+  "release_verification": {
+    "version": "1.1.2",
+    "schema": 13,
+    "workflow_paths": [
+      ".github\\workflows\\tests.yml",
+      ".github\\workflows\\build-and-release.yml"
+    ],
+    "installed_metadata_checked": true,
+    "status": "passed"
+  },
+  "cli_spawn": {
+    "status": "passed",
+    "files": 300,
+    "elapsed_seconds": 7.436999999999898,
+    "executable": "source run_cli.py",
+    "encoding_stress": true,
+    "checks": [
+      "clean JSONL",
+      "spawn scanner",
+      "complete source bytes",
+      "all matches",
+      "SQLite reopen",
+      "FTS integrity"
+    ]
+  },
+  "gui_smoke": {
+    "status": "passed",
+    "checks": [
+      "Tk window construction",
+      "restored navigation",
+      "existing project settings",
+      "no adaptive control"
+    ]
+  },
+  "capacity_current_classification": {
+    "pacing": {
+      "admissions": 1000000,
+      "virtual_seconds": 124999.875,
+      "starts_per_second": 8.0,
+      "minimum_spacing": 0.125,
+      "throttle_signals_changed_spacing": false,
+      "real_downloads": 0
+    },
+    "loopback": {
+      "history_rows": 1000000,
+      "seed_seconds": 19.943,
+      "validated_saves": 240,
+      "elapsed_seconds": 31.606,
+      "validated_saves_per_second": 7.594,
+      "cpu_seconds": 3.969,
+      "windows": [
+        {
+          "phase": "early",
+          "saved_per_second": 7.341
+        },
+        {
+          "phase": "middle",
+          "saved_per_second": 7.683
+        },
+        {
+          "phase": "late",
+          "saved_per_second": 7.774
+        }
+      ],
+      "bytes_per_capture": 16435,
+      "rss_final_mib": 48.96875,
+      "scope": "Healthy local HTTP fixture, real transport/pacing/files/SQLite. No live Wayback or overnight claim.",
+      "rss_first_sample_mib": 119.31640625,
+      "rss_last_sample_mib": 119.7734375,
+      "rss_peak_sample_mib": 120.0859375
+    }
+  },
+  "capacity_stale_classification": {
+    "pacing": {
+      "admissions": 1000000,
+      "virtual_seconds": 124999.875,
+      "starts_per_second": 8.0,
+      "minimum_spacing": 0.125,
+      "throttle_signals_changed_spacing": false,
+      "real_downloads": 0
+    },
+    "loopback": {
+      "history_rows": 1000000,
+      "seed_seconds": 22.722,
+      "validated_saves": 480,
+      "elapsed_seconds": 94.505,
+      "validated_saves_per_second": 5.079,
+      "cpu_seconds": 37.406,
+      "windows": [
+        {
+          "phase": "early",
+          "saved_per_second": 3.012
+        },
+        {
+          "phase": "middle",
+          "saved_per_second": 7.74
+        },
+        {
+          "phase": "late",
+          "saved_per_second": 7.804
+        }
+      ],
+      "bytes_per_capture": 16435,
+      "rss_final_mib": 53.984375,
+      "scope": "Healthy local HTTP fixture, real transport/pacing/files/SQLite. No live Wayback or overnight claim.",
+      "rss_first_sample_mib": 125.33203125,
+      "rss_last_sample_mib": 126.41796875,
+      "rss_peak_sample_mib": 126.734375
+    }
+  },
+  "offline_index_benchmark": {
+    "rows": 100000,
+    "report_rows": 1000,
+    "unchanged_cdx_writes": 0,
+    "log": "evidence/offline-benchmark.log"
+  },
+  "delivery_checks": {
+    "fresh_patch_applied_source_equals_candidate": true,
+    "database_sentinel_unchanged": true,
+    "project_settings_sentinel_unchanged": true,
+    "all_patch_checksums_verified": true,
+    "deletion_and_rollback_fault_tests": "6 passed in full suite"
+  },
+  "validation_scope": "Windows, Python 3.12.14; mocked responses and local HTTP fixtures; source CLI and Tk GUI.",
+  "not_verified": [
+    "Hosted GitHub Actions matrix has not run for these unpushed files.",
+    "Linux/macOS and Python 3.11/other Python versions were not executed locally.",
+    "Frozen application binaries were not built.",
+    "No live Internet Archive download test or days-long sustained throughput run.",
+    "The cause of initial connection failures remains unconfirmed."
+  ],
+  "test_retirement": "Tests for removed adaptive pacing, shared connection recovery, pool renewal, retry heaps, ETA and newer UI/report features were retired with those features. Historical baseline tests, retained safety regressions and new fixed-policy tests run without skips."
+}

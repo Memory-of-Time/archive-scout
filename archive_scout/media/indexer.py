@@ -58,7 +58,7 @@ from ..database.repositories import (
 )
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_INDEX_RATE_KEY, shared_host_gate)
 from ..downloads.validation import classify_exception
-from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
+from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..utils import json_value, parse_cdx_parameter_lines, utc_now
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from .discovery import discover_media, hosts_related, safe_document_text, target_hosts
@@ -696,7 +696,7 @@ def _reuse_completed_main_index_range(
 
 def _wait_seconds(config: ProjectConfig, failures: int) -> float:
     network = config.network.normalized()
-    base = min(network.retry_max_seconds, network.retry_base_seconds * 2 ** min(max(0, failures - 1), 6))
+    base = min(5.0, network.retry_base_seconds)
     return base * random.uniform(0.85, 1.15)
 
 
@@ -749,7 +749,7 @@ def _defer_media_window(
 
     if plan.pending and all(item.failures >= threshold for item in plan.pending):
         error_id = pause_error(f"all remaining media index windows reached the retry threshold: {exc}")
-        raise IndexResponsePaused(
+        raise ConnectivityPaused(
             "Wayback could not answer any remaining combined-media index window. "
             "The exact media queue was saved and can be continued with Resume."
         ) from exc
@@ -759,10 +759,10 @@ def _defer_media_window(
         return error_id
     if not network.persistent_retries and current.failures >= max(3, config.retries):
         error_id = pause_error(f"media indexing retry limit reached: {exc}")
-        raise IndexResponsePaused(f"media indexing retry limit reached; progress was saved: {exc}") from exc
+        raise ConnectivityPaused(f"media indexing retry limit reached; progress was saved: {exc}") from exc
     if current.failures >= threshold:
         error_id = pause_error(f"media index window remained unreachable after {current.failures} recovery cycles: {exc}")
-        raise IndexResponsePaused(
+        raise ConnectivityPaused(
             f"Wayback remained unreachable for this media window after {current.failures} recovery cycles. Progress was saved."
         ) from exc
     wait = _wait_seconds(config, current.failures)
@@ -1142,7 +1142,7 @@ def index_direct_media(
                         callback(
                             ProgressEvent(
                                 "media_index",
-                                f"{target} {label}: {len(successes)}/{len(batch.requested_pages)} pages, received {received:,}, accepted {accepted_count:,}, stored {changed:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                                f"{target} {label}: {len(successes)}/{len(batch.requested_pages)} pages, received {received:,}, accepted {accepted_count:,}, stored {changed:,} â€” network {request_seconds:.1f}s, database {write_seconds:.2f}s",
                                 completed,
                                 total,
                             )
@@ -1194,7 +1194,7 @@ def index_direct_media(
                                 details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                             )
                             persist_state(encode_plan(plan), False, seen, error_id)
-                        raise IndexResponsePaused(
+                        raise ConnectivityPaused(
                             f"{len(current.retry_pages)} Timemap media page(s) remained unavailable after "
                             f"{highest_page_failures} attempts. Successful pages were preserved and only the exact "
                             "failed media-page queue was saved for Resume."
@@ -1258,7 +1258,7 @@ def index_direct_media(
                     callback(
                         ProgressEvent(
                             "media_index",
-                            f"{target} {label}: received {received:,}, accepted {accepted_count:,}, stored {changed:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                            f"{target} {label}: received {received:,}, accepted {accepted_count:,}, stored {changed:,} â€” network {request_seconds:.1f}s, database {write_seconds:.2f}s",
                             completed,
                             total,
                         )
@@ -1319,7 +1319,7 @@ def index_direct_media(
                             ProgressEvent(
                                 "network",
                                 f"Wayback connection setup failed. Retrying the same saved media request in {wait:.1f}s "
-                                f"({connection_failure_streak}/{network.connection_failure_pause_threshold})…",
+                                f"({connection_failure_streak}/{network.connection_failure_pause_threshold})â€¦",
                                 completed,
                                 total,
                             )
@@ -1346,7 +1346,7 @@ def index_direct_media(
                                 retryable=True,
                             )
                             persist_state(encode_plan(plan), False, seen, error_id)
-                        raise IndexResponsePaused(
+                        raise ConnectivityPaused(
                             f"Wayback returned no usable media CDX response after {transient_failure_streak} consecutive recovery attempts. "
                             "The exact media queue was saved instead of looping indefinitely."
                         ) from exc
@@ -2013,13 +2013,13 @@ def index_external_embedded_media(
     if not selected_extensions(config.media):
         raise ValueError("no image or video extensions remain after include/exclude filtering")
     signature = media_query_signature(config)
-    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
+    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if callback:
             if wait_seconds > 0:
-                message = f"{reason}. Retry {attempt}/{total} in {wait_seconds:.1f}s…"
+                message = f"{reason}. Retry {attempt}/{total} in {wait_seconds:.1f}sâ€¦"
             else:
                 message = reason
             callback(ProgressEvent("media_embed", message))
@@ -2034,7 +2034,7 @@ def index_external_embedded_media(
             message = f"Wayback HTTP {status} recovery budget is exhausted; embedded-media progress was saved for Resume."
             stage = "rate_limit_paused"
         else:
-            message = f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; one recovery probe will run next."
+            message = f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; fixed request spacing resumes afterward."
             stage = "rate_limit_waiting"
         callback(ProgressEvent(stage, message, detail=dict(detail)))
 
@@ -2049,16 +2049,13 @@ def index_external_embedded_media(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=config.network.normalized().cdx_workers,
         host_gate=host_gate,
-        rate_limit_base_pause=config.rate_limit_base_pause,
-        rate_limit_max_pause=config.rate_limit_max_pause,
-        rate_limit_attempts=config.rate_limit_attempts,
+        rate_limit_attempts=0 if config.network.persistent_retries else config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
+        persistent_retries=config.network.persistent_retries,
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
         rate_event_callback=on_rate_event,
-        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
-        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
     try:
         index_embedded_media(
@@ -2084,8 +2081,8 @@ def index_media(
         raise ValueError("no image or video extensions remain after include/exclude filtering")
     signature = media_query_signature(config)
     state_signature = media_index_state_signature(config)
-    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
+    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if callback:
@@ -2093,7 +2090,7 @@ def index_media(
                 message = reason
                 stage = "network"
             else:
-                message = f"CDX media request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}s…"
+                message = f"CDX media request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}sâ€¦"
                 stage = "media_index"
             callback(ProgressEvent(stage, message))
 
@@ -2109,7 +2106,7 @@ def index_media(
             stage = "rate_limit_paused"
         else:
             spacing_text = f" Effective index spacing: {float(spacing):.3f}s." if spacing is not None else ""
-            message = f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; one recovery probe will run next.{spacing_text}"
+            message = f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; fixed request spacing resumes afterward.{spacing_text}"
             stage = "rate_limit_waiting"
         callback(ProgressEvent(stage, message, detail=dict(detail)))
 
@@ -2124,16 +2121,13 @@ def index_media(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=config.network.normalized().cdx_workers,
         host_gate=host_gate,
-        rate_limit_base_pause=config.rate_limit_base_pause,
-        rate_limit_max_pause=config.rate_limit_max_pause,
-        rate_limit_attempts=config.rate_limit_attempts,
+        rate_limit_attempts=0 if config.network.persistent_retries else config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
+        persistent_retries=config.network.persistent_retries,
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
         rate_event_callback=on_rate_event,
-        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
-        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
     try:
         index_direct_media(config, database, client, stop_event, callback, signature, state_signature)

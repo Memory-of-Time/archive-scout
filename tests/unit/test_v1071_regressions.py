@@ -408,7 +408,6 @@ class ProjectRegressionTests(unittest.TestCase):
         from archive_scout.downloads.downloader import download_archive
         row = self.capture(1)
         config = ProjectConfig(output_dir=self.root, targets=[], keywords=["needle"], download_delay=0).normalized()
-        config.network.persistent_retries = False
         with mock.patch("archive_scout.downloads.downloader.HttpClient"), mock.patch(
             "archive_scout.downloads.downloader._download_capture", side_effect=RateLimitDeferred("paused")
         ), self.assertRaises(RateLimitDeferred):

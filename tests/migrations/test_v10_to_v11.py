@@ -18,7 +18,6 @@ class V10ToV11MigrationTests(unittest.TestCase):
             db = sqlite3.connect(path)
             db.row_factory = sqlite3.Row
             initialize_schema(db)
-            db.execute("DROP TRIGGER IF EXISTS captures_body_revision_update")
             # Recreate the physical v10 shape from the current schema so this
             # fixture stays small while exercising the real forward migration.
             db.execute("DROP INDEX IF EXISTS captures_classification_idx")

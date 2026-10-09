@@ -4,15 +4,11 @@ import json
 import os
 import shutil
 import sqlite3
-import time
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Iterator, Callable
-
-from ..events import ProgressEvent
+from typing import Iterable, Iterator
 
 from ..config import ProjectConfig
-from ..classification import capture_body_coverage, capture_routing_decision
 from ..downloads.downloader import replay_url
 from ..utils import atomic_write_lines, atomic_write_text, json_value, utc_now
 
@@ -117,48 +113,17 @@ def _summary_lines(values: dict[str, str], fields: list[str]) -> Iterator[str]:
             yield value
 
 
-def _progress_rows(rows, callback, total: int, stage: str):
-    if callback is None:
-        yield from rows
-        return
-    callback(ProgressEvent(stage, "Writing report rows", 0, total))
-    last_emit = time.monotonic()
-    current = 0
-    for current, row in enumerate(rows, 1):
-        yield row
-        now = time.monotonic()
-        if current >= total or now - last_emit >= 0.5:
-            callback(ProgressEvent(stage, "Writing report rows", current, total))
-            last_emit = now
-    if current == 0:
-        callback(ProgressEvent(stage, "Report contains no rows", 0, 0))
-
-
-def _indexed_url_lines(database: sqlite3.Connection, fields: list[str], progress_callback=None) -> Iterator[str]:
+def _indexed_url_lines(database: sqlite3.Connection, fields: list[str]) -> Iterator[str]:
     if not fields:
         return
-    rows = database.execute(
-        """SELECT timestamp,mimetype,resource_class,classification_reason,state,skip_reason,
-                  payload_availability,original_url
-           FROM captures ORDER BY original_url,timestamp"""
-    )
-    total = int(database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]) if progress_callback else 0
-    for row in _progress_rows(rows, progress_callback, total, "report_index"):
+    for row in database.execute(
+        "SELECT timestamp,mimetype,state,original_url FROM captures ORDER BY original_url,timestamp"
+    ):
         yield _tab_line(
             {
                 "timestamp": row["timestamp"],
                 "mime_type": row["mimetype"] or "",
-                "resource_class": row["resource_class"] or "unknown",
-                "classification_reason": row["classification_reason"] or "",
-                "routing_decision": capture_routing_decision(
-                    row["resource_class"], row["state"], row["skip_reason"], row["payload_availability"]
-                ),
-                "body_coverage": capture_body_coverage(
-                    row["resource_class"], row["state"], row["payload_availability"]
-                ),
                 "state": row["state"],
-                "payload_availability": row["payload_availability"] or "",
-                "skip_reason": row["skip_reason"] or "",
                 "original_url": row["original_url"],
             },
             fields,
@@ -203,13 +168,7 @@ def _site_issue_lines(database: sqlite3.Connection, fields: list[str]) -> Iterat
         )
 
 
-def generate_index_reports(
-    config: ProjectConfig,
-    database: sqlite3.Connection,
-    *,
-    index_complete: bool = True,
-    progress_callback: Callable[[ProgressEvent], None] | None = None,
-) -> dict[str, Path]:
+def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) -> dict[str, Path]:
     """Write the user-selected reports for a CDX-only project."""
     report = config.report.normalized()
     root_reports = config.output_dir / "reports"
@@ -223,7 +182,7 @@ def generate_index_reports(
         path = _write_report(
             root_reports,
             "all_indexed_urls",
-            _indexed_url_lines(database, report.fields_for("all_indexed_urls"), progress_callback),
+            _indexed_url_lines(database, report.fields_for("all_indexed_urls")),
         )
         paths["all_indexed_urls"] = path
     else:
@@ -255,11 +214,10 @@ def generate_index_reports(
             "heading": "Archive Scout",
             "generated": f"Generated: {utc_now()}",
             "output_directory": f"Output directory: {config.output_dir}",
-            "operation": "Operation: Index URLs only" + (" (partial; indexing remains unfinished)" if not index_complete else ""),
+            "operation": "Operation: Index URLs only",
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
-            "indexed_captures": f"Indexed captures: {capture_count:,} (" + ("partial URL inventory; Resume continues indexing" if not index_complete else "URL inventory; bodies searched are reported separately") + ")",
-            "bodies_searched": "Bodies searched: 0 (index-only operation; no replay bodies were checked)",
+            "indexed_captures": f"Indexed captures: {capture_count:,}",
             "unresolved_errors": f"Unresolved errors: {error_count:,}",
             "site_issues": f"Open site-specific issues: {issue_count:,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
@@ -278,7 +236,6 @@ def generate_reports(
     config: ProjectConfig,
     database: sqlite3.Connection,
     scan_run_id: int,
-    *, progress_callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     report = config.report.normalized()
     run = database.execute(
@@ -331,7 +288,7 @@ def generate_reports(
     ranked_fields = report.fields_for("matches_ranked")
 
     def consume_match_rows(write_ranked: bool) -> Iterator[str]:
-        for rank, row in enumerate(_progress_rows(database.execute(ranked_query, selection), progress_callback, match_count, "report_matches"), 1):
+        for rank, row in enumerate(database.execute(ranked_query, selection), 1):
             hits = json_value(row["hits_json"], {}) if (need_keyword_counts or "keyword_hits" in ranked_fields) else {}
             fields = json_value(row["fields_json"], {}) if "keyword_hits" in ranked_fields else {}
             snippets = json_value(row["snippets_json"], []) if "snippets" in ranked_fields else []
@@ -402,7 +359,7 @@ def generate_reports(
             if not fields:
                 return
             seen: set[str] = set()
-            for row in _progress_rows(database.execute(url_query, selection), progress_callback, match_count, "report_urls"):
+            for row in database.execute(url_query, selection):
                 value = str(row["original_url"])
                 if value not in seen:
                     seen.add(value)
@@ -420,7 +377,7 @@ def generate_reports(
             if not fields:
                 return
             seen: set[str] = set()
-            for row in _progress_rows(database.execute(url_query, selection), progress_callback, match_count, "report_urls"):
+            for row in database.execute(url_query, selection):
                 value = replay_url(str(row["timestamp"]), str(row["original_url"]))
                 if value not in seen:
                     seen.add(value)
@@ -471,7 +428,7 @@ def generate_reports(
         path = _write_report(
             root_reports,
             "all_indexed_urls",
-            _indexed_url_lines(database, report.fields_for("all_indexed_urls"), progress_callback),
+            _indexed_url_lines(database, report.fields_for("all_indexed_urls")),
             run_dir=run_dir,
         )
         paths["all_indexed_urls"] = path
@@ -514,8 +471,7 @@ def generate_reports(
             "scan_completed": f"Scan completed: {run['completed_at'] or '(not marked complete)'}",
             "targets": f"Targets: {', '.join(config.targets) or '(project database only)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
-            "indexed_captures": f"Indexed captures: {capture_count:,} (URL inventory; bodies searched are reported separately)",
-            "bodies_searched": f"Bodies searched by this scan: {int(run['document_count'] or 0):,}",
+            "indexed_captures": f"Indexed captures: {capture_count:,}",
             "ranked_matches": f"Ranked matches at score >= {config.minimum_score}: {match_count:,}",
             "unresolved_errors": f"Unresolved errors: {unresolved_count:,}",
             "site_issues": f"Open site-specific issues: {site_issue_count:,}",

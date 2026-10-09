@@ -104,8 +104,8 @@ def _lookup_external_assets(
            ORDER BY la.id LIMIT ?""",
         (total,),
     )
-    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
+    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
     workers = min(8, max(1, config.network.normalized().cdx_workers))
 
     def retry_callback(attempt: int, total_attempts: int, reason: str, wait: float) -> None:
@@ -116,8 +116,9 @@ def _lookup_external_assets(
         config.user_agent, stop_event, retry_callback=retry_callback,
         connect_timeout=min(max(config.connect_timeout, 5.0), 30.0),
         read_timeout=min(max(config.read_timeout, 15.0), 60.0), pool_size=workers,
-        host_gate=host_gate, rate_limit_attempts=config.rate_limit_attempts,
+        host_gate=host_gate, rate_limit_attempts=0 if config.network.persistent_retries else config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
+        persistent_retries=config.network.persistent_retries,
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),

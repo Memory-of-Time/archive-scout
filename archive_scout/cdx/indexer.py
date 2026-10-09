@@ -13,7 +13,7 @@ from typing import Callable
 from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_recovery_event, record_site_issue, upsert_captures
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_INDEX_RATE_KEY, shared_host_gate)
-from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
+from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
 from .client import (
@@ -282,20 +282,20 @@ def window_label(start: str, end: str) -> str:
         if start_date.hour == 0 and start_date.minute == 0 and end_date.hour == 23 and end_date.minute == 59:
             return start_date.strftime("%Y-%m-%d")
         if start_date.hour == end_date.hour and start_date.minute == end_date.minute:
-            return f"{start_date:%Y-%m-%d %H:%M:%S}–{end_date:%H:%M:%S}"
-        return f"{start_date:%Y-%m-%d %H:%M}–{end_date:%H:%M}"
+            return f"{start_date:%Y-%m-%d %H:%M:%S}â€“{end_date:%H:%M:%S}"
+        return f"{start_date:%Y-%m-%d %H:%M}â€“{end_date:%H:%M}"
     if start_date.day == 1 and end_date.month == start_date.month:
         last_day = calendar.monthrange(start_date.year, start_date.month)[1]
         if end_date.day == last_day:
             return start_date.strftime("%Y-%m")
     if start_date.month == 1 and start_date.day == 1 and end_date.month == 12 and end_date.day == 31:
         return start_date.strftime("%Y")
-    return f"{start_date:%Y-%m-%d}–{end_date:%Y-%m-%d}"
+    return f"{start_date:%Y-%m-%d}â€“{end_date:%Y-%m-%d}"
 
 
 def transient_backoff(config: ProjectConfig, failures: int) -> float:
     network = config.network.normalized()
-    base = min(network.retry_max_seconds, network.retry_base_seconds * (2 ** min(max(0, failures - 1), 6)))
+    base = min(5.0, network.retry_base_seconds)
     return base * random.uniform(0.85, 1.15)
 
 
@@ -446,7 +446,7 @@ def _defer_transient_window(
 
     threshold = network.failure_pause_threshold
     if plan.pending and all(item.failures >= threshold for item in plan.pending):
-        raise IndexResponsePaused(
+        raise ConnectivityPaused(
             "Wayback could not answer any remaining CDX work after multiple independent connection methods. "
             "Archive Scout saved the exact queue and paused cleanly; Resume will continue from this point."
         ) from exc
@@ -464,7 +464,7 @@ def _defer_transient_window(
         return error_id
 
     if current.failures >= threshold:
-        raise IndexResponsePaused(
+        raise ConnectivityPaused(
             f"Wayback remained unreachable for {window_label(current.start, current.end)} after {current.failures} recovery cycles. "
             "The queue was saved without marking the project failed."
         ) from exc
@@ -491,15 +491,15 @@ def _client_for_config(
     callback: Callable[[ProgressEvent], None] | None,
 ) -> HttpClient:
     network = config.network.normalized()
-    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY, adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
+    limiter = SharedFixedRateLimiter(config.cdx_delay, key=WAYBACK_INDEX_RATE_KEY)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total: int, reason: str, wait_seconds: float) -> None:
         if wait_seconds <= 0:
             message = reason
             stage = "network"
         else:
-            message = f"CDX request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}s…"
+            message = f"CDX request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}sâ€¦"
             stage = "index"
         emit(callback, ProgressEvent(stage, message))
 
@@ -516,12 +516,9 @@ def _client_for_config(
             stage = "rate_limit_paused"
         else:
             spacing_text = f" Effective index spacing: {float(spacing):.3f}s." if spacing is not None else ""
-            source_text = {"server_retry_after": "Server Retry-After wait",
-                           "fixed_fallback": "Fixed retry wait (adaptive off)",
-                           "adaptive_fallback": "Experimental adaptive cooldown"}.get(detail.get("wait_source"), "Shared service wait")
             message = (
-                f"Wayback HTTP {status}: {source_text} active for up to {wait_seconds:.1f}s; "
-                f"one recovery probe will run next.{spacing_text}"
+                f"Wayback HTTP {status} service cooldown active for up to {wait_seconds:.1f}s; "
+                f"fixed request spacing resumes afterward.{spacing_text}"
             )
             stage = "rate_limit_waiting"
         emit(callback, ProgressEvent(stage, message, detail=dict(detail)))
@@ -540,10 +537,9 @@ def _client_for_config(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=network.cdx_workers,
         host_gate=host_gate,
-        rate_limit_base_pause=config.rate_limit_base_pause,
-        rate_limit_max_pause=config.rate_limit_max_pause,
-        rate_limit_attempts=config.rate_limit_attempts,
+        rate_limit_attempts=0 if config.network.persistent_retries else config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
+        persistent_retries=config.network.persistent_retries,
         network_backend=network.backend,
         trust_environment=network.trust_environment,
         network_callback=on_network,
@@ -873,7 +869,7 @@ def index_archive(
                     phase = "combined-range resume traversal"
                 emit(callback, ProgressEvent(
                     "index",
-                    f"{target} • {label} • {phase}; seen {seen:,}",
+                    f"{target} â€¢ {label} â€¢ {phase}; seen {seen:,}",
                     completed_windows, total_windows,
                     {
                         "phase": phase, "target": target, "scope": label,
@@ -968,7 +964,7 @@ def index_archive(
                             callback,
                             ProgressEvent(
                                 "index",
-                                f"{target} {label}: {pages_done}/{len(batch.requested_pages)} pages, received {received:,}, stored {changed:,}, seen {seen:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                                f"{target} {label}: {pages_done}/{len(batch.requested_pages)} pages, received {received:,}, stored {changed:,}, seen {seen:,} â€” network {request_seconds:.1f}s, database {write_seconds:.2f}s",
                                 completed_windows,
                                 total_windows,
                             ),
@@ -1027,7 +1023,7 @@ def index_archive(
                                     details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                                 )
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            raise IndexResponsePaused(
+                            raise ConnectivityPaused(
                                 f"{len(current.retry_pages)} Timemap page(s) remained unavailable after "
                                 f"{highest_page_failures} attempts. Successful pages were preserved and only the exact "
                                 "failed page queue was saved for Resume."
@@ -1089,7 +1085,7 @@ def index_archive(
                         callback,
                         ProgressEvent(
                             "index",
-                            f"{target} {label}: received {received:,}, stored {changed:,}, seen {seen:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                            f"{target} {label}: received {received:,}, stored {changed:,}, seen {seen:,} â€” network {request_seconds:.1f}s, database {write_seconds:.2f}s",
                             completed_windows,
                             total_windows,
                         ),
@@ -1166,7 +1162,7 @@ def index_archive(
                             ProgressEvent(
                                 "network",
                                 f"Wayback connection setup failed. Retrying the same saved request in {wait_seconds:.1f}s "
-                                f"({connection_failure_streak}/{network.connection_failure_pause_threshold})…",
+                                f"({connection_failure_streak}/{network.connection_failure_pause_threshold})â€¦",
                                 completed_windows,
                                 total_windows,
                             ),
@@ -1198,7 +1194,7 @@ def index_archive(
                                 {"streak": transient_failure_streak, "target": target, "window": label},
                             )
                             persist_task_state(encode_plan(plan), False, seen, error_id)
-                        raise IndexResponsePaused(
+                        raise ConnectivityPaused(
                             f"Wayback returned no usable CDX response after {transient_failure_streak} consecutive recovery attempts. "
                             "Archive Scout saved the exact queue and paused instead of looping indefinitely."
                         ) from exc
@@ -1315,6 +1311,6 @@ def index_archive(
                         )
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     raise
-            emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} • {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))
+            emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} â€¢ {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))
     finally:
         client.close()

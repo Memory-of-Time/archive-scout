@@ -1,6 +1,6 @@
 # Development
 
-Archive Scout supports Python 3.11 and newer. The current public package version is 1.0.6.
+Archive Scout supports Python 3.11 and newer. The initial public package version is 1.0.0.
 
 ## Principles
 

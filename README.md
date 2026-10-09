@@ -1,71 +1,47 @@
 # Archive Scout
 
-**Archive Scout 1.1.1** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
+**Archive Scout 1.1.2** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
+
+
+## v1.1.2 rollback
+
+The interface returns to v1.0.0 and CDX indexing, replay acquisition and transport
+fallbacks return to the tagged v1.0.2 implementation. Adaptive request spacing,
+escalating application cooldowns, connection-wide recovery gates, pool renewal,
+backend retry heaps and experimental ETA controls are removed. Fixed request
+spacing remains 2.5 seconds for indexing and 0.125 seconds for replay. A live
+429/503 honors Retry-After, including zero; without that header it waits five
+seconds. Network retries use fixed waits and preserve the durable queue.
+
+Retained corrections protect schema13 projects, complete source decoding,
+archive-only redirect routing, safe backup/restore, immutable imports and
+complete analysis results. Local scanners use bounded memory and can continue
+while replay requests wait. Existing project databases are never downgraded.
+Historical adaptive settings are ignored. Saved server deadlines remain valid.
+
+Local tests and loopback measurements accompany the patch. These do not establish
+overnight Internet Archive consistency or identify the initial connection-failure
+cause. Use `scripts/run_tests.py`, `scripts/verify_release.py` and the Tests workflow
+for validation of your checkout.
 
 ## Downloads
 
-[**Windows x64**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/ArchiveScout-Windows-x64.zip) · [**macOS Universal**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/ArchiveScout-macOS-Universal.zip) · [**Linux x64**](https://github.com/Memory-of-Time/archive-scout/releases/latest) · [Installation guide](#installation)
-
-These links open the latest published application packages. For Linux, choose the Linux archive under **Assets**; its format may be ZIP or TAR.GZ. The v1.1.1 source changes become an application download after its build is published.
+- [Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.1.2/ArchiveScout-Windows-x64.zip)
+- [Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.1.2/ArchiveScout-Linux-x64.tar.gz)
+- [macOS Universal (Intel + Apple Silicon)](https://github.com/DearStrike4940/archive-scout/releases/download/v1.1.2/ArchiveScout-macOS-Universal.zip)
 
 The repository can also be run from source on Python 3.11+. Tagged releases are built by the cross-platform GitHub Actions workflow.
 
-## 1.1.1 highlights
+## 1.1.2 initial-release highlights
 
-- Connection recovery probes run when the shared recovery deadline permits, without waiting out a second backend cooldown. Healthy transfers continue and completed captures remain committed while queued work waits.
-- Proven healthy Wayback responses can end a connection-only outage promptly. Explicit server deadlines and service-throttle recovery remain authoritative.
-- **Adaptive rate limiting (experimental — still testing)** is optional and **off by default**. Enable it in Network settings, with `adaptive_rate_limiting: true` in project JSON, or the CLI's `--adaptive-rate-limiting` switch. `--no-adaptive-rate-limiting` turns it off, including on Resume. Off also disables escalating 429/503 cooldowns: without a server deadline, one retry probe follows a fixed wait of at most five seconds. Fixed request ceilings and server-requested waits apply in either mode.
-- The normal replay ceiling remains eight request starts per second. Actual saved-download throughput depends on responses, payloads, retries, and service availability.
-
-See [v1.1.1 release notes](docs/RELEASE_1_1_1.md), [the complete v1.0.5 speed comparison](docs/V105_DOWNLOAD_SPEED_COMPARISON.md), and [validation evidence](docs/VALIDATION_1_1_1.md).
-
-## 1.0.9 highlights
-
-- Persistent pooled connections can interrupt stalled headers and bodies. Repeated proven connection/protocol failures can renew a drained pool without resetting the service's cooldown or abandoning active files.
-- Payload decoding and validation errors are distinct from network failures. BOMs, recorded encodings, contradictory wide-encoding declarations, and partial multibyte previews share one policy.
-- The displayed download rate counts fresh, validated, manifest-committed saves over the recent minute. Wire attempts, saved-file adoption, retries, typed failures and invocation averages are separate.
-- Retained download-and-scan overlaps bounded local scanning with acquisition. Large local workloads use spawn processes with parent-owned SQLite; regex work is isolated in automatic mode. Worker counts and byte reservations remain configurable, and oversize files are processed completely.
-- Local retry work can proceed during a saved network cooldown. Manual unavailable-capture rechecks are explicit; automatic retries preserve permanent-error eligibility.
-- Imports use immutable content-addressed source files. Integrity, retry selection and duplicate metadata stream or spill to disk. Duplicate threshold searches have complete Hamming-radius recall, and snapshot comparisons use a named linear-work similarity measure.
-- SQLite file mapping is disabled after the audit reproduced corruption in the mapped runtime. Backups are validated and atomically published before older valid snapshots are pruned.
-- Optional dashboard ETA uses measured phase progress and bounded project history. Later phases and unknown discovery totals remain explicit; item-retry telemetry does not restart estimates.
-
-See [release notes and measured limits](docs/RELEASE_1_0_9.md) and [validation scope](docs/VALIDATION_1_0_9.md).
-
-## 1.0.8 highlights
-
-- Retained scans and rescans use small, bounded write batches. Cancellation and failed writes leave durable work available to resume; discard-after-scan keeps its existing commit-before-delete protocol.
-- Literal prefilters share identical native matchers. Database mapping is limited to 64 MiB, matching classification indexes are reused on reopen, and media paging follows the indexed key order.
-- Full-text searches use only the current document token version. Replacements no longer depend on rereading an overwritten payload. Repair and Compact reclaim superseded postings.
-- Hitlist resume verifies the bytes behind its checkpoint, including external edits with unchanged file size and modification time. Existing capture limits, results and human review data are preserved.
-- Acquisition-only retry selection stays in SQLite and works beyond the database's bound-variable limit.
-- Dashboard **Show estimated time remaining** is optional and off by default. It uses measured completed work for the current phase; unknown totals show **Estimating**. Known recovery waits are included once.
-- Schema 12 projects are backed up before migration to schema 13. The existing report output and field settings remain authoritative, including indexed-URL inventory after an index-only run.
-
-See [v1.0.8 release notes](docs/RELEASE_1_0_8.md) for measured results, limits and migration details.
-
-## 1.0.7 highlights
-
-- One shared cooldown deadline survives duplicate failures. Later server deadlines remain authoritative, and only a fresh failed probe escalates fallback waiting.
-- Active projects register and release their recovery policy. A closed slow project no longer leaves its pause or pacing baseline behind.
-- Healthy service responses restore the requested pace after a short sustained sample. HTTP 503 retains service recovery without also applying the HTTP 429 quota pacing penalty.
-- Both text and media retries yield worker capacity to ready URLs. Media recovery preserves the user's stop flag, completed files and exact pending queue.
-- Trustworthy response progress releases the service probe while its body continues. Complete-body, CDX, media and Range checks still determine whether a payload can be accepted.
-- Acquisition progress distinguishes summed worker waits from elapsed shared service-gate time.
-
-The connection and partial-file improvements from 1.0.6 remain included.
-
-The following improvements from 1.0.5 remain included:
-
-- Temporary Wayback outages keep the existing replay worker pool, HTTP client and cumulative progress. Expired recovery cycles can resume while respecting Retry-After and admitting one real recovery probe.
-- Validated text downloads can use the existing curl fallback when eligible Python backends fail.
-- Dashboard **Other outcomes** shows non-text/media exclusions, URL-filter skips, media handoffs, other skips, failed captures and recovered incidents. The current-operation accounting panel and its additional aggregate query have been removed.
-- Reports groups share the focus/wheel router, reflow on narrow screens and reserve clearance above their horizontal scrollbars.
-- Media disposition labels distinguish excluded binaries from an actual media handoff. Retained text descriptors are reported as available for local search.
-- Hitlist resumes preserve unchanged results and revisit bodies that arrived or changed after a checkpoint. Schema **12** adds small coverage records and body revisions; it does not duplicate capture contents.
-- Whole project operations and database restores use a crash-released OS lock. GUI restore runs in the background after existing view reads finish.
-
-The current CDX strategies, request-rate settings, text/media byte classifier and deterministic rule semantics are preserved. The connection recovery improvements from v1.0.7 remain included. See [v1.0.7 release notes](docs/RELEASE_1_0_7.md).
+- Resume-first CDX/Timemap indexing with durable page/window checkpoints and a conservative shared **2.5-second index request-attempt interval (24/minute)**.
+- Independent replay pacing at **0.125 seconds per actual request attempt (8/second)**. Redirect hops, retries, and transport-backend fallbacks are paced and counted at the wire-attempt boundary.
+- Coordinated Wayback 429/503 handling: Retry-After is treated as a minimum, missing headers start with at least a 60-second cooldown, recovery is gradual, and rate-limit pauses remain distinct from connectivity failures.
+- Historical archived-origin 429/503 responses are not misclassified as current Wayback throttling.
+- Durable text/media classification, replay resume, local scanning, reports, review state, Research Intelligence, optional AI relevance, and media workflows.
+- Windows DPI-aware startup, system/dark/high-contrast theme handling, named-font scaling rather than global Tk DPI overrides, screen-clamped geometry, reusable scrolling, and independently scrollable tables.
+- Results/FTS, scan history, error, and site-issue reads execute away from the Tk UI thread with stale-result guards.
+- Optimized deterministic scanner behavior with bounded proximity work, normalization/count reuse, local-rescan file reuse, and malformed-markup handling.
 
 The source still recognizes serialized project identifiers from pre-release development builds so existing project folders can be migrated safely. Those compatibility identifiers are not separate public releases.
 
@@ -268,7 +244,7 @@ Download `ArchiveScout-macOS-Universal.zip`, extract it completely, move `Archiv
 
 ### Linux
 
-Download the Linux archive from the [latest release](https://github.com/Memory-of-Time/archive-scout/releases/latest), extract it, and run the included application or install it with the provided user-local installer. Published archives may use ZIP or TAR.GZ. The installer maps `archive-scout` to the packaged CLI and keeps the GUI in the desktop application menu.
+Download `ArchiveScout-Linux-x64.tar.gz`, extract it, and run the included application or install it with the provided user-local installer. The installer maps `archive-scout` to the packaged CLI and keeps the GUI in the desktop application menu.
 
 ## Source development
 

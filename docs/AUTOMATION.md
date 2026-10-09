@@ -1,6 +1,6 @@
 # Archive Scout automation contract
 
-Archive Scout 1.0.6 ships a separate console executable (`ArchiveScoutCLI`) alongside the desktop GUI. Source installs expose the same interface as `archive-scout`.
+Archive Scout 1.0.0 ships a separate console executable (`ArchiveScoutCLI`) alongside the desktop GUI. Source installs expose the same interface as `archive-scout`.
 
 ## Commands
 
@@ -35,7 +35,3 @@ Diagnostics and unexpected failures are written to stderr. Never parse human-rea
 
 ## Bot-safety notes
 `status`, `search`, `results`, and `errors` are read-only. They open the project database with SQLite query-only mode. `search` operates on the already-built Research Intelligence index and does not contact an AI provider. `research --ai` and `ai-review` are the only CLI research commands that require external AI credentials.
-
-## Optional adaptive pacing (v1.1.1)
-
-Adaptive rate limiting is experimental, still testing, and off by default. Set `"adaptive_rate_limiting": true` in project JSON or pass `--adaptive-rate-limiting` to `archive-scout run`. Pass `--no-adaptive-rate-limiting` to use fixed spacing, including when resuming a previously adaptive run. The switch controls extra post-throttle request spacing and escalating 429/503 fallback cooldowns. Off uses a single probe after a fixed wait of at most five seconds when no server deadline is supplied. It preserves shared request ceilings, connection recovery and server-requested waits. New logs explain the wait source; unlabelled eligibility saved by older versions remains authoritative.

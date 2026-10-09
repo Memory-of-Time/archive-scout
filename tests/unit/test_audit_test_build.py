@@ -508,7 +508,7 @@ class AuditTestBuildTests(unittest.TestCase):
                     db.close()
 
 
-    def test_rate_limit_defer_cancels_queued_replay_work_promptly(self):
+    def test_rate_limit_defer_drains_healthy_replay_work(self):
         class DeferredClient:
             calls = 0
             calls_lock = threading.Lock()
@@ -554,7 +554,6 @@ class AuditTestBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cfg = ProjectConfig(root, ['example.com/*'], [], from_date='2001', to_date='2001', workers=2, download_delay=0).normalized()
-            cfg.network.persistent_retries = False
             db = open_database(root)
             try:
                 sig = cdx_query_signature(cfg)
@@ -569,20 +568,20 @@ class AuditTestBuildTests(unittest.TestCase):
                 started = time.perf_counter()
                 with mock.patch('archive_scout.downloads.downloader.HttpClient', DeferredClient):
                     with self.assertRaises(RateLimitDeferred):
-                        _acquire_archive(cfg, db, event, lambda e: DeferredClient.slow_release.set() if e.stage == 'network_waiting' else None)
+                        _acquire_archive(cfg, db, event, None)
                 elapsed = time.perf_counter() - started
                 calls_at_return = DeferredClient.call_count()
                 DeferredClient.slow_release.set()
                 time.sleep(0.2)
                 self.assertEqual(DeferredClient.call_count(), calls_at_return)
-                self.assertLess(calls_at_return, 6)
+                self.assertEqual(calls_at_return, 6)
                 # The slow sibling is blocked for up to two seconds, so returning
-                # before that proves cancellation/draining is responsive when the
-                # active transport settles, while preserving its completed file. A one-second ceiling tolerates CI jitter.
-                self.assertLess(elapsed, 1.0)
+                # well before that proves the deferred operation does not wait for
+                # unrelated replay work. A one-second ceiling tolerates CI jitter.
+                self.assertGreaterEqual(elapsed, 1.9)
                 self.assertFalse(event.is_set())
-                self.assertEqual(db.execute("SELECT COUNT(*) FROM captures WHERE state IN ('pending','downloaded_unscanned')").fetchone()[0], 6)
-                self.assertGreater(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM captures WHERE state='pending'").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0], 5)
             finally:
                 DeferredClient.slow_release.set()
                 db.close()

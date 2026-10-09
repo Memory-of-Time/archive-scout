@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 SCHEMA_VERSION = 13
 
 # Shared September 2026 Wayback operating profile. These values describe
 # actual request-start ceilings, not completed-job throughput.
 WAYBACK_INDEX_MIN_INTERVAL = 2.5      # 24 actual request starts/minute
 WAYBACK_REPLAY_MIN_INTERVAL = 0.125  # 8 actual request starts/second
-WAYBACK_RATE_LIMIT_BASE_PAUSE = 60.0
-WAYBACK_RATE_LIMIT_MAX_PAUSE = 600.0
+WAYBACK_RATE_LIMIT_BASE_PAUSE = 5.0
+WAYBACK_RATE_LIMIT_MAX_PAUSE = 5.0
 APP_NAME = "Archive Scout"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"
 CDX_TIMEMAP_URL = "https://web.archive.org/web/timemap/cdx"
@@ -54,7 +54,6 @@ OPERATION_MODES = {
     "Resume interrupted work": "resume",
     "Rescan existing downloads with selected keyword sets": "rescan",
     "Retry only errored URLs": "retry_errors",
-    "Retry only errored downloads (no scanning)": "retry_download_errors",
     "Regenerate reports only": "report",
     "Check project integrity": "integrity",
     "Repair project and rebuild indexes": "repair",

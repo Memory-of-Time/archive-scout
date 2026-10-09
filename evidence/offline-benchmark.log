@@ -1,0 +1,63 @@
+{
+  "cdx_rows_inserted": 100000,
+  "database_size_bytes": 61386752,
+  "database_transactions": 4,
+  "duplicate_work": 0,
+  "fixture": {
+    "body_bytes": 1024,
+    "cdx_chunk_rows": 50000,
+    "cdx_rows": 100000,
+    "cdx_upsert_skipped": false,
+    "keyword_patterns": 5000,
+    "keyword_score_runs": 100,
+    "keyword_searches": 1000,
+    "live_network": false,
+    "result_rows": 1000
+  },
+  "http_attempts": 0,
+  "metrics": [
+    {
+      "elapsed_seconds": 2.537794,
+      "name": "parse_cdx_chunks",
+      "peak_memory_bytes": 24247082,
+      "result": 100000
+    },
+    {
+      "elapsed_seconds": 0.791425,
+      "name": "literal_prefilter",
+      "peak_memory_bytes": 5686825,
+      "result": 1
+    },
+    {
+      "elapsed_seconds": 0.759354,
+      "name": "literal_scoring",
+      "peak_memory_bytes": 5487081,
+      "result": 300
+    },
+    {
+      "elapsed_seconds": 14.474581,
+      "name": "parse_and_upsert_cdx_chunks",
+      "peak_memory_bytes": 46480912,
+      "result": 100000
+    },
+    {
+      "elapsed_seconds": 11.724805,
+      "name": "repeat_parse_and_noop_upsert",
+      "peak_memory_bytes": 46099573,
+      "result": 0
+    },
+    {
+      "elapsed_seconds": 0.008876,
+      "name": "browse_500",
+      "peak_memory_bytes": 654344,
+      "result": 500
+    },
+    {
+      "elapsed_seconds": 0.117064,
+      "name": "export_json",
+      "peak_memory_bytes": 1425586,
+      "result": 559356
+    }
+  ],
+  "unchanged_cdx_writes": 0
+}

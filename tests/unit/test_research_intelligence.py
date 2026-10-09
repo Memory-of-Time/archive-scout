@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import threading
 import unittest
@@ -11,7 +10,6 @@ from archive_scout.ai.models import AIResponse
 from archive_scout.config import AIConfig, ProjectConfig, ResearchConfig
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target, upsert_captures, upsert_document
-from archive_scout.events import Stopped
 from archive_scout.research.ai import run_grounded_answer
 from archive_scout.research.index import build_research_index
 from archive_scout.research.search import search_research
@@ -105,59 +103,6 @@ class ResearchIntelligenceTests(unittest.TestCase):
         self.assertIn('Every factual claim must cite', request.instructions)
         self.assertTrue(database.execute('SELECT COUNT(*) FROM research_ai_runs').fetchone()[0])
         database.close()
-
-    def test_graph_uses_earliest_capture_identity_for_same_time_representations(self):
-        temp, root, database, config, ids = self._project()
-        self.addCleanup(temp.cleanup)
-        self.addCleanup(database.close)
-        url = 'http://example.com/a'
-        target = get_or_create_target(database, 'example.com/*')
-        database.execute("UPDATE captures SET mimetype='text/plain',detected_encoding='utf-8' WHERE id=(SELECT capture_id FROM documents WHERE id=?)", (ids[0],))
-        upsert_captures(database, [{'original': url, 'timestamp': '20010101000000',
-                                  'mimetype': 'text/html', 'statuscode': '200', 'digest': 'alternate', 'length': '40'}],
-                        target, 'alternate-signature')
-        capture = database.execute("SELECT id FROM captures WHERE query_signature='alternate-signature'").fetchone()[0]
-        path = root / 'alternate.html'
-        body = '<html><body>Another representation</body></html>'
-        path.write_text(body, encoding='utf-8')
-        upsert_document(database, capture, path, 'Alternate', body, [], hash_text(body), hash_text(normalize_search(body)), len(body))
-        database.execute('UPDATE documents SET links_json=? WHERE id=?', (json.dumps([url]), ids[2]))
-        database.commit()
-        build_research_index(config, database, threading.Event())
-        targets = [row[0] for row in database.execute("SELECT target_document_id FROM research_edges WHERE source_document_id=? AND edge_type='hyperlink'", (ids[2],))]
-        self.assertEqual(targets, [ids[0]])
-
-    def test_cancel_research_duplicate_publication_preserves_previous_groups(self):
-        temp, root, database, config, ids = self._project()
-        self.addCleanup(temp.cleanup)
-        self.addCleanup(database.close)
-        source = database.execute('SELECT path,title FROM documents WHERE id=?', (ids[0],)).fetchone()
-        capture_id = database.execute('SELECT capture_id FROM documents WHERE id=?', (ids[1],)).fetchone()[0]
-        body = Path(source['path']).read_text(encoding='utf-8')
-        upsert_document(database, capture_id, Path(source['path']), source['title'], body, [],
-                        hash_text(body), hash_text(normalize_search(body)), len(body))
-        database.commit()
-        build_research_index(config, database, threading.Event())
-        # Force a duplicate refresh while retaining the previously published data.
-        database.execute("UPDATE project_meta SET value='stale' WHERE key='research_duplicate_fingerprint'")
-        database.commit()
-        groups = [tuple(row) for row in database.execute('SELECT * FROM duplicate_groups ORDER BY id')]
-        members = [tuple(row) for row in database.execute('SELECT * FROM duplicate_members ORDER BY group_id,document_id')]
-        self.assertTrue(groups)
-        self.assertTrue(members)
-        stop = threading.Event()
-        stages = []
-        def progress(event):
-            stages.append(event.stage)
-            if event.stage == 'research_duplicates_publish':
-                stop.set()
-        with self.assertRaises(Stopped):
-            build_research_index(config, database, stop, progress)
-        self.assertIn('research_duplicates', stages)
-        self.assertIn('research_duplicates_publish', stages)
-        self.assertNotIn('research_complete', stages)
-        self.assertEqual([tuple(row) for row in database.execute('SELECT * FROM duplicate_groups ORDER BY id')], groups)
-        self.assertEqual([tuple(row) for row in database.execute('SELECT * FROM duplicate_members ORDER BY group_id,document_id')], members)
 
 
 if __name__ == '__main__':

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
-import heapq
-from collections import deque
 import fnmatch
 import os
 import sqlite3
@@ -12,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from ..cdx.client import HttpClient, RateLimitDeferred, ReplayRetryScheduled
+from ..cdx.client import HttpClient, RateLimitDeferred
 from ..cdx.parameters import cdx_query_signature
 from ..config import ProjectConfig
 from ..database.repositories import (
@@ -22,13 +19,12 @@ from ..database.repositories import (
 from ..downloads.downloader import make_replay_redirect_validator, replay_url
 from ..downloads.rate_limit import (SharedFixedRateLimiter, WAYBACK_REPLAY_RATE_KEY, shared_host_gate)
 from ..downloads.validation import classify_exception
-from ..downloads.recovery import wake_backend_retries
 from ..content import classify_replay_content, decode_bytes
-from ..events import ConnectivityPaused, ProgressEvent, Stopped
+from ..events import ProgressEvent, Stopped
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..storage import url_filename, media_path as storage_media_path, sha256_file
 from ..classification import classify_payload_prefix
-from ..network.transports import PreviewRejected, is_local_storage_error
+from ..network.transports import PreviewRejected
 from ..resource_detection import payload_media_format
 from ..utils import utc_now
 from .indexer import media_query_signature, media_signature_is_date_bound
@@ -269,12 +265,12 @@ def iter_media_download_rows(
 
     def rows():
         last_length = 0
-        last_id = (1 << 63) - 1
+        last_id = 0
         while True:
             batch = database.execute(
                 "SELECT * FROM media_captures WHERE " + where
-                + " AND (length,id)>(?,?)"
-                + " ORDER BY length,id LIMIT ?",
+                + " AND COALESCE(length,0)>0 AND (COALESCE(length,0),id)>(?,?)"
+                + " ORDER BY COALESCE(length,0),id LIMIT ?",
                 [*params, last_length, last_id, max(1, int(batch_size))],
             ).fetchall()
             if not batch:
@@ -341,9 +337,8 @@ def download_media(
         if callback:
             callback(ProgressEvent("media_download", "No media captures to download.", 0, 0))
         return
-    limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY,
-                                    adaptive=config.adaptive_rate_limiting)
-    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
+    limiter = SharedFixedRateLimiter(config.download_delay, key=WAYBACK_REPLAY_RATE_KEY)
+    host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
 
     def on_retry(attempt: int, total_attempts: int, reason: str, wait_seconds: float) -> None:
         if callback:
@@ -351,9 +346,9 @@ def download_media(
             stage = "rate_limit" if rate_limited else "media_retry"
             if rate_limited:
                 limit = f"/{total_attempts}" if total_attempts else ""
-                message = f"{reason}. Shared pause {attempt}{limit} for {wait_seconds:.1f}s; one recovery probe will run next…"
+                message = f"{reason}. Shared pause {attempt}{limit} for {wait_seconds:.1f}s; fixed request spacing resumes afterwardâ€¦"
             else:
-                message = f"{reason}. Retry {attempt}/{total_attempts} in {wait_seconds:.1f}s…"
+                message = f"{reason}. Retry {attempt}/{total_attempts} in {wait_seconds:.1f}sâ€¦"
             callback(ProgressEvent(stage, message))
 
     client = HttpClient(
@@ -367,18 +362,13 @@ def download_media(
         read_timeout=config.read_timeout,
         pool_size=config.workers,
         host_gate=host_gate,
-        rate_limit_base_pause=config.rate_limit_base_pause,
-        rate_limit_max_pause=config.rate_limit_max_pause,
-        rate_limit_attempts=config.rate_limit_attempts,
+        rate_limit_attempts=0 if config.network.persistent_retries else config.rate_limit_attempts,
         rate_limit_max_wait=config.rate_limit_max_wait,
+        persistent_retries=config.network.persistent_retries,
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
-        connection_failure_pause_threshold=config.network.normalized().connection_failure_pause_threshold,
-        connection_retry_seconds=config.network.normalized().connection_retry_seconds,
     )
-    cancel_event = threading.Event()
-    unsettled_ids: set[int] = set()
     deferred_error = None
     complete = errors = 0
     started = time.monotonic()
@@ -387,99 +377,67 @@ def download_media(
     promoted_ids: set[int] = set()
 
     try:
-        with contextlib.ExitStack() as executor_scope:
-            pool = executor_scope.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-media"))
-            executor_scope.callback(cancel_event.set)
-            futures = {}
-            ready = deque()
-            delayed = []
-            retry_sequence = 0
-            rows_exhausted = False
-            queue_limit = max(64, min(512, config.workers * 16))
-
-            def run_attempt(row, attempt):
-                with contextlib.ExitStack() as stack:
-                    for name, argument in (("cancellation_scope", cancel_event), ("replay_attempt", attempt)):
-                        method = getattr(type(client), name, None)
-                        if callable(method):
-                            stack.enter_context(method(client, argument))
-                    return fetch_media(row, config, client)
-
+        with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-media") as pool:
+            futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
+    
             def submit_available() -> None:
-                nonlocal complete, errors, rows_exhausted
-                now_mono = time.monotonic()
-                wake_backend_retries(delayed, ready, client,
-                                     lambda row: replay_url(str(row["timestamp"]), str(row["original_url"])))
-                while delayed and delayed[0][0] <= now_mono:
-                    _due, _seq, row, attempt, _wait_kind = heapq.heappop(delayed)
-                    ready.append((row, attempt))
-                fresh_hidden = not any(attempt == 1 for _row, attempt in ready)
-                limit = queue_limit + (max_inflight if fresh_hidden else 0)
-                while not rows_exhausted and len(ready) + len(delayed) < limit:
-                    if stop_event.is_set():
-                        raise Stopped
+                nonlocal complete, errors
+                if deferred_error is not None:
+                    return
+                slots = max_inflight - len(futures)
+                if slots <= 0:
+                    return
+                rows: list[sqlite3.Row] = []
+                while len(rows) < slots:
                     try:
                         row = next(row_iter)
                     except StopIteration:
-                        rows_exhausted = True
                         break
+                    if stop_event.is_set():
+                        raise Stopped
                     host = host_from_url(str(row["original_url"] or ""))
                     blocked_reason = blocked_hosts.get(host)
                     if blocked_reason:
-                        message = site_issue_message(blocked_reason, str(row["original_url"]), "media download")
+                        message = site_issue_message(
+                            blocked_reason, str(row["original_url"]), "media download"
+                        )
                         with database:
-                            database.execute("UPDATE media_captures SET state='error',updated_at=? WHERE id=?",
-                                             (utc_now(), int(row["id"])))
-                            record_error(database, "media_download", blocked_reason, message,
-                                         media_capture_id=int(row["id"]), retryable=False)
+                            database.execute(
+                                "UPDATE media_captures SET state='error',updated_at=? WHERE id=?",
+                                (utc_now(), int(row["id"])),
+                            )
+                            record_error(
+                                database, "media_download", blocked_reason, message,
+                                media_capture_id=int(row["id"]), retryable=False,
+                            )
                         complete += 1
                         errors += 1
                         if callback:
                             callback(ProgressEvent("site_issue", message))
                         continue
-                    ready.append((row, 1))
-                rows = []
-                while ready and len(futures) + len(rows) < max_inflight:
-                    row, attempt = ready[0]
-                    retry_inflight = sum(value[1] > 1 for value in futures.values()) + sum(value[1] > 1 for value in rows)
-                    fresh_index = next((i for i, (_row, number) in enumerate(ready) if number == 1), None)
-                    if attempt > 1 and fresh_index is not None and retry_inflight >= max(1, config.workers // 4):
-                        ready.rotate(-fresh_index)
-                    rows.append(ready.popleft())
+                    rows.append(row)
                 if not rows:
                     return
+                now = utc_now()
                 with database:
                     database.executemany(
                         "UPDATE media_captures SET state='downloading',download_attempts=download_attempts+1,updated_at=? WHERE id=?",
-                        ((utc_now(), int(row["id"])) for row, attempt in rows if attempt == 1),
+                        ((now, int(row["id"])) for row in rows),
                     )
-                for row, attempt in rows:
-                    unsettled_ids.add(int(row["id"]))
-                    futures[pool.submit(run_attempt, row, attempt)] = (row, attempt)
-
-            while futures or ready or delayed or not rows_exhausted:
+                for row in rows:
+                    futures[pool.submit(fetch_media, row, config, client)] = row
+    
+            submit_available()
+    
+            while futures:
                 if stop_event.is_set():
-                    cancel_event.set()
                     for pending in futures:
                         pending.cancel()
                     raise Stopped
-                if deferred_error is None:
-                    submit_available()
-                if not futures:
-                    if deferred_error is not None:
-                        raise deferred_error
-                    if delayed:
-                        stop_event.wait(min(0.05, max(0.0, delayed[0][0] - time.monotonic())))
-                        continue
-                    if not ready and rows_exhausted:
-                        break
-                    continue
-                done, _ = concurrent.futures.wait(futures, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
-                    row, attempt = futures.pop(future)
+                    row = futures.pop(future)
                     try:
-                        if future.cancelled():
-                            raise Stopped
                         result = future.result()
                         result_kind = str(result.get("kind") or "media")
                         if result_kind == "media":
@@ -508,37 +466,23 @@ def download_media(
                                 promoted = _promote_next_snapshot(database, config, row)
                                 if promoted is not None:
                                     promoted_ids.add(promoted)
-                    except ReplayRetryScheduled as exc:
-                        retry_sequence += 1
-                        heapq.heappush(delayed, (exc.eligible_at, retry_sequence, row, exc.attempt_number, exc.wait_kind))
-                        continue
-                    except (RateLimitDeferred, ConnectivityPaused) as exc:
+                    except RateLimitDeferred as exc:
                         if deferred_error is None:
                             deferred_error = exc
-                            pause_admissions = getattr(type(client), "pause_admissions", None)
-                            if callable(pause_admissions):
-                                pause_admissions(client, exc)
-                        for pending in futures:
-                            pending.cancel()
+                            pause = getattr(client, "pause_admissions", None)
+                            if callable(pause):
+                                pause(exc)
+                        with database:
+                            database.execute(
+                                "UPDATE media_captures SET state='pending',download_attempts=MAX(0,download_attempts-1),updated_at=? WHERE id=?",
+                                (utc_now(), row["id"]),
+                            )
                         continue
                     except Stopped:
-                        if deferred_error is not None:
-                            continue
-                        cancel_event.set()
+                        with database:
+                            database.execute("UPDATE media_captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))
                         raise
                     except Exception as exc:
-                        if is_local_storage_error(exc):
-                            # A local disk/filesystem failure is not a reason to
-                            # rotate HTTP backends or consume every media row.
-                            cancel_event.set()
-                            for pending in futures:
-                                pending.cancel()
-                            with database:
-                                database.execute(
-                                    "UPDATE media_captures SET state='pending',updated_at=? WHERE state='downloading' OR id=?",
-                                    (utc_now(), row["id"]),
-                                )
-                            raise
                         errors += 1
                         category, status, retryable = classify_exception(exc)
                         issue_message = site_issue_message(
@@ -567,7 +511,6 @@ def download_media(
                             blocked_hosts[host_from_url(str(row["original_url"]))] = category
                         if callback and should_surface_site_issue(category):
                             callback(ProgressEvent("site_issue", issue_message))
-                    unsettled_ids.discard(int(row["id"]))
                     complete += 1
                     elapsed = max(0.001, time.monotonic() - started)
                     if callback:
@@ -577,20 +520,12 @@ def download_media(
                             complete, total,
                             {"errors": errors},
                         ))
-            if deferred_error is not None:
-                raise deferred_error
+                    submit_available()
     
     
+        if deferred_error is not None:
+            raise deferred_error
     finally:
-        cancel_event.set()
-        # Completed futures above are committed before recovery. Any interrupted
-        # logical job remains pending; retries do not consume extra job attempts.
-        if unsettled_ids:
-            with database:
-                database.executemany(
-                    "UPDATE media_captures SET state='pending',download_attempts=CASE WHEN download_attempts>0 THEN download_attempts-1 ELSE 0 END,updated_at=? WHERE id=? AND state='downloading'",
-                    ((utc_now(), capture_id) for capture_id in unsettled_ids),
-                )
         client.close()
     if promoted_ids and not stop_event.is_set() and _resolution_depth < 16:
         download_media(
@@ -605,7 +540,7 @@ def retry_media_errors(
     callback: Callable[[ProgressEvent], None] | None = None,
     media_capture_ids: list[int] | None = None,
 ) -> None:
-    clauses = ["resolved=0", "ignored=0", "1=1" if config.retry_include_unavailable else "retryable=1", "media_capture_id IS NOT NULL"]
+    clauses = ["resolved=0", "ignored=0", "retryable=1", "media_capture_id IS NOT NULL"]
     params: list[object] = []
     selected = media_capture_ids if media_capture_ids is not None else config.retry_media_capture_ids
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_retry_selection")
@@ -620,11 +555,15 @@ def retry_media_errors(
         clauses.append(
             "EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=errors.media_capture_id)"
         )
-    database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_retry_work")
-    database.execute("CREATE TEMP TABLE archive_scout_media_retry_work(id INTEGER PRIMARY KEY) WITHOUT ROWID")
-    database.execute("INSERT OR IGNORE INTO archive_scout_media_retry_work SELECT DISTINCT media_capture_id FROM errors WHERE " + " AND ".join(clauses), params)
-    from ..downloads.retry import _RetryCaptureIds
-    ids = _RetryCaptureIds(database, int(database.execute("SELECT COUNT(*) FROM archive_scout_media_retry_work").fetchone()[0]), "archive_scout_media_retry_work")
+    ids = [
+        int(row[0])
+        for row in database.execute(
+            "SELECT DISTINCT media_capture_id FROM errors WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY media_capture_id",
+            params,
+        )
+    ]
     if callback:
         callback(ProgressEvent("media_retry", f"Retrying {len(ids):,} errored media captures"))
     if ids:

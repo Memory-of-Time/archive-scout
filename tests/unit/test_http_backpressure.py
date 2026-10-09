@@ -96,9 +96,9 @@ class BackpressureTests(unittest.TestCase):
     def test_shared_gate_coalesces_simultaneous_429_signals(self) -> None:
         gate = SharedHostGate(base_pause=1, max_pause=10, coalesce_seconds=10)
         first = gate.pause_for_rate_limit(retry_after=2)
-        incidents = gate.incidents
+        incidents = gate.incident_id
         second = gate.pause_for_rate_limit(retry_after=2)
-        self.assertEqual(gate.incidents, incidents)
+        self.assertEqual(gate.incident_id, incidents)
         self.assertGreater(first, 0)
         self.assertGreater(second, 0)
 
@@ -112,7 +112,7 @@ class BackpressureTests(unittest.TestCase):
             gate.blocked_until = time.monotonic() - 0.01
             gate.condition.notify_all()
         probe = gate.acquire_request(stop)
-        self.assertTrue(probe.probe)
+        self.assertFalse(probe.probe)
         self.assertTrue(gate.permit_is_current(probe))
         gate.finish_request(probe, recovered=True)
         normal = gate.acquire_request(stop)

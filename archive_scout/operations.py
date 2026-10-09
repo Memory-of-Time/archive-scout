@@ -4,21 +4,19 @@ import sqlite3
 import json
 import threading
 import time
-from datetime import datetime
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Callable
 
 from .cdx.client import RateLimitDeferred
+from .downloads.rate_limit import shared_host_gate, saved_service_eligibility
 from .cdx.indexer import index_archive
 from .analysis.workflow import run_analysis
 from .config import KeywordSetConfig, ProjectConfig, save_project_config
 from .database.connection import open_database
-from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
 from .downloads.downloader import download_archive, download_archive_only, recover_pending_discard_cleanup
-from .downloads.rate_limit import FIXED_SERVICE_RETRY_SECONDS, saved_service_eligibility, shared_host_gate
-from .downloads.retry import retry_error_urls, retry_error_downloads
+from .downloads.retry import retry_error_urls
 from .events import ConnectivityPaused, ProgressEvent, Stopped
 from .media.downloader import download_media, retry_media_errors
 from .media.indexer import index_external_embedded_media, index_media
@@ -34,12 +32,11 @@ from .projects.merge import merge_projects
 from .reports.text import generate_index_reports, generate_reports
 from .research.index import build_research_index
 from .scanning.jobs import ScanJob
-from .scanning.workers import scanner_options
 from .scanning.rescanner import rescan_keyword_sets
 from .scanning.hitlist import load_hitlist, search_with_hitlist
 
 SUPPORTED_MODES = {
-    "all", "external_media_after_scan", "index", "download_only", "download", "resume", "rescan", "retry_errors", "retry_download_errors", "report", "integrity",
+    "all", "external_media_after_scan", "index", "download_only", "download", "resume", "rescan", "retry_errors", "report", "integrity",
     "repair", "backup", "diagnostics", "import_folder",
     "media_all", "media_index", "media_download", "media_retry",
     "analysis", "research_index", "forum_rebuild", "merge_project", "hitlist", "compact",
@@ -73,14 +70,9 @@ def prepare_scan_jobs(
         if keyword_set_id in seen_keyword_set_ids:
             continue
         seen_keyword_set_ids.add(keyword_set_id)
-        compatible_sources = (mode,) if mode not in {"resume", "download", "all"} else ("all", "external_media_after_scan", "download", "resume", "retry_errors", "rescan")
+        compatible_sources = (mode,) if mode not in {"resume", "download", "all"} else ("all", "download", "resume")
         placeholders = ",".join("?" for _ in compatible_sources)
-        if reuse_completed:
-            statuses = ("interrupted", "failed", "complete")
-        elif mode == "resume":
-            statuses = ("interrupted", "failed")
-        else:
-            statuses = ("interrupted",)
+        statuses = ("interrupted", "complete") if reuse_completed else ("interrupted",)
         status_placeholders = ",".join("?" for _ in statuses)
         existing = database.execute(
             f"""SELECT id FROM scan_runs WHERE keyword_set_id=? AND status IN ({status_placeholders})
@@ -109,10 +101,10 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str) 
         finish_scan_run(database, job.scan_run_id, status)
 
 
-def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob], callback=None) -> dict[str, Path]:
+def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob]) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for index, job in enumerate(jobs, 1):
-        generated = generate_reports(config, database, job.scan_run_id, **({"progress_callback": callback} if config.dashboard_eta_enabled else {}))
+        generated = generate_reports(config, database, job.scan_run_id)
         if index == 1:
             paths.update(generated)
         paths[f"scan_{job.scan_run_id}_folder"] = generated["scan_folder"]
@@ -163,7 +155,6 @@ def _run_standard_media_phase(
     return media_config
 
 
-@guard_project
 def run_project(
     config: ProjectConfig,
     mode: str = "all",
@@ -171,8 +162,6 @@ def run_project(
     callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     config = config.normalized()
-    if config.download_scope == "index_only" and mode in {"all", "external_media_after_scan"}:
-        mode = "index"
     if mode == "external_media_after_scan":
         config.media = replace(
             config.media.normalized(),
@@ -212,17 +201,12 @@ def run_project(
     if mode == "resume":
         previous = database.execute(
             """SELECT mode,retention_policy,config_json,progress_json FROM operation_runs
-               WHERE status IN ('interrupted','paused','failed','blocked_storage') AND mode<>'resume'
+               WHERE status IN ('interrupted','paused') AND mode<>'resume'
                ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         if previous is not None:
             previous_mode = str(previous["mode"] or "")
-            if previous_mode in {
-                "all", "external_media_after_scan", "index", "download_only", "download", "rescan",
-                "retry_errors", "retry_download_errors", "media_all", "media_index",
-                "media_download", "media_retry", "analysis", "research_index",
-                "forum_rebuild", "hitlist",
-            }:
+            if previous_mode in {"all", "external_media_after_scan", "download_only", "download"}:
                 mode = previous_mode
             raw_snapshot = str(previous["config_json"] or "").strip()
             if raw_snapshot:
@@ -231,8 +215,6 @@ def run_project(
                     allowed = {item.name for item in fields(ProjectConfig)}
                     snapshot_values = {key: value for key, value in payload.items() if key in allowed}
                     snapshot_values["output_dir"] = config.output_dir
-                    # Pacing is a runtime preference; saved selection and retention stay authoritative.
-                    snapshot_values["adaptive_rate_limiting"] = config.adaptive_rate_limiting
                     config = ProjectConfig(**snapshot_values).normalized()
                 except (TypeError, ValueError, json.JSONDecodeError):
                     # Older operation rows may not contain a complete snapshot.
@@ -256,7 +238,7 @@ def run_project(
     if not saved_rate_pause_detail:
         paused_row = database.execute(
             """SELECT progress_json FROM operation_runs
-               WHERE status='paused' ORDER BY id DESC LIMIT 1"""
+               WHERE status IN ('paused','interrupted') ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         if paused_row is not None:
             try:
@@ -270,8 +252,6 @@ def run_project(
     # Resume restores the original operation contract before validating it. A
     # download-only resume must not suddenly require keyword sets, while a full
     # scan still must have the keyword sets frozen in its saved snapshot.
-    if config.download_scope == "index_only" and mode in {"all", "external_media_after_scan"}:
-        mode = "index"
     if mode in {"all", "external_media_after_scan", "download", "rescan", "retry_errors"} and not config.selected_keyword_sets():
         database.close()
         raise ValueError("select at least one keyword set")
@@ -285,15 +265,12 @@ def run_project(
         config_json=json.dumps(config.to_payload(), ensure_ascii=False, sort_keys=True),
     )
     database.commit()
+    operation_host_gate = shared_host_gate()
     original_callback = callback
     owner_thread_id = threading.get_ident()
-    operation_host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause,
-                                           adaptive=config.adaptive_rate_limiting)
     last_progress_write = 0.0
     last_progress_stage = ""
     progress_persist_interval = 5.0 if mode == "download_only" else 0.75
-    from .eta import OperationForecast
-    forecast = OperationForecast(database, config, mode) if config.dashboard_eta_enabled else None
 
     def operation_callback(event: ProgressEvent) -> None:
         nonlocal last_progress_write, last_progress_stage
@@ -301,13 +278,7 @@ def run_project(
             service_detail = operation_host_gate.service_wait_detail()
             if service_detail:
                 event.detail = {**(event.detail or {}), **service_detail}
-        if config.dashboard_eta_enabled:
-            event.detail = {**(event.detail or {}), "operation_run_id": operation_run_id}
-            if threading.get_ident() == owner_thread_id:
-                plan = forecast.observe(event)
-                if plan is not None:
-                    event.detail["eta_plan"] = plan
-        if threading.get_ident() == owner_thread_id and event.stage not in {"backup_copy", "backup_compress", "backup_verify", "full_text_rebuild"}:
+        if threading.get_ident() == owner_thread_id:
             now = time.monotonic()
             completed_boundary = (
                 event.current is not None
@@ -338,164 +309,40 @@ def run_project(
 
     callback = operation_callback
 
-    def _reset_transient_inflight() -> None:
-        # Lower-level schedulers already preserve validated completions. This is
-        # a final durable normalization before an archive-wide wait/probe cycle.
-        with database:
-            database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
-            database.execute("UPDATE captures SET state='downloaded_unscanned' WHERE state='scanning'")
-            database.execute("UPDATE media_captures SET state='pending' WHERE state='downloading'")
-
-    def _wait_for_archive(exc: BaseException, stage: str) -> None:
-        if not config.network.persistent_retries:
-            raise exc
-        _reset_transient_inflight()
-        gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause, adaptive=config.adaptive_rate_limiting)
-        now_epoch = time.time()
-        query_pause = getattr(exc, "scope", "host") == "query"
-        if query_pause:
-            wait_seconds = max(0.01, min(float(config.network.retry_base_seconds), float(config.network.retry_max_seconds)))
-            eligible_at = now_epoch + wait_seconds
-            reason = "index_response"
-            detail = {"reason_code": "index_response_retry", "eligible_at_epoch": eligible_at}
-        elif isinstance(exc, RateLimitDeferred):
-            eligible_at = saved_service_eligibility(exc.to_detail(), adaptive=config.adaptive_rate_limiting,
-                                                   base_pause=config.rate_limit_base_pause)
-            wait_seconds = max(0.0, eligible_at - now_epoch) if eligible_at else max(
-                float(config.rate_limit_base_pause) if config.adaptive_rate_limiting else min(FIXED_SERVICE_RETRY_SECONDS, config.rate_limit_base_pause),
-                float(config.network.retry_base_seconds)
-            )
-            if not eligible_at:
-                eligible_at = now_epoch + wait_seconds
-            reason = "rate_limit"
-            detail = exc.to_detail()
-            detail["eligible_at_epoch"] = eligible_at
-            gate.restore_service_wait(detail)
-        else:
-            gate.pause_for_connection_outage(float(config.network.connection_retry_seconds))
-            wait_seconds = max(gate.remaining(), float(config.network.connection_retry_seconds))
-            eligible_at = now_epoch + wait_seconds
-            reason = "connectivity"
-            detail = {"reason_code": "archive_connectivity", "eligible_at_epoch": eligible_at}
-        detail.update({
-            "recovery_stage": stage,
-            "waiting_seconds": wait_seconds,
-        })
-        update_operation_run(
-            database, operation_run_id, message=str(exc),
-            stage="rate_limit_waiting" if reason == "rate_limit" else "network_waiting", detail=detail,
-        )
-        database.commit()
-        until_text = datetime.fromtimestamp(eligible_at).strftime("%H:%M:%S") if eligible_at else "the next probe"
-        emit(callback, ProgressEvent(
-            "rate_limit_waiting" if reason == "rate_limit" else "network_waiting",
-            f"Waiting to retry {'saved CDX work' if query_pause else 'Internet Archive'} — {exc}. Next check at {until_text}. Progress is saved; this run will continue automatically.",
-            detail=detail,
-        ))
-        deadline = time.monotonic() + wait_seconds
-        while True:
-            if stop_event.is_set():
-                raise Stopped
-            remaining = deadline - time.monotonic()
-            if not query_pause:
-                # The host gate owns the live deadline. Healthy in-flight
-                # progress or an opt-out can finish recovery before this
-                # coordinator's original timer; do not wait it a second time.
-                remaining = min(remaining, gate.remaining())
-            if remaining <= 0:
-                break
-            if stop_event.wait(min(1.0, remaining)):
-                raise Stopped
-        if not query_pause:
-            gate.renew_recovery_cycle(getattr(exc, "incident_id", None))
-        emit(callback, ProgressEvent(
-            "network",
-            f"Recovery wait finished; continuing saved {stage} work…",
-            detail=detail,
-        ))
-
-    def _recovering_call(stage: str, function):
-        cycle = 0
+    def _recovering_call(stage, function):
         while True:
             if stop_event.is_set():
                 raise Stopped
             try:
                 return function()
             except (ConnectivityPaused, RateLimitDeferred) as exc:
-                cycle += 1
-                _wait_for_archive(exc, stage)
-                # The exact same durable stage is invoked again. Its queue/checkpoint
-                # determines the remaining work; no new operation or scan lineage is
-                # created here.
-                emit(callback, ProgressEvent("network", f"Automatic archive recovery cycle {cycle:,}: resuming {stage}."))
-
-    def _index_reports(*, complete: bool = True) -> dict[str, Path]:
-        progress = {"progress_callback": original_callback} if config.dashboard_eta_enabled else {}
-        paths = (generate_index_reports(config, database, **progress) if complete
-                 else generate_index_reports(config, database, index_complete=False, **progress))
-        detail = {
-            "report_files": [str(path) for path in paths.values()],
-            "index_complete": complete,
-            "reason_code": "reports_written" if paths else "index_reports_disabled",
-        }
-        if paths:
-            names = ", ".join(path.name for path in paths.values())
-            message = f"{'Index' if complete else 'Partial index'} reports written to {config.output_dir / 'reports'}: {names}"
-        else:
-            message = (
-                "No compatible index report files are enabled. In Reports, enable All indexed URLs, "
-                "Summary, Errors or Site-specific issues. Match reports require a scan."
-            )
-        # Notify the GUI/CLI without replacing the last indexing counts or a
-        # saved service deadline with a report event that has no counters.
-        emit(original_callback, ProgressEvent("report", message, detail=detail))
-        return paths
-
-    def _partial_index_reports() -> None:
-        if mode != "index":
-            return
-        try:
-            _index_reports(complete=False)
-        except Exception as report_error:
-            # An optional inventory snapshot must never replace the original
-            # stop/pause exception or erase its durable operation status.
-            emit(original_callback, ProgressEvent(
-                "report", f"Index progress is saved, but partial reports could not be written: {report_error}",
-                detail={"reason_code": "index_report_write_failed", "index_complete": False},
-            ))
+                if not config.network.persistent_retries:
+                    raise
+                # The saved SQLite checkpoint is the retry queue; no new lineage.
+                with database:
+                    database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
+                    database.execute("UPDATE captures SET state='downloaded_unscanned' WHERE state='scanning'")
+                    database.execute("UPDATE media_captures SET state='pending' WHERE state='downloading'")
+                detail = exc.to_detail() if isinstance(exc, RateLimitDeferred) else {'reason_code': 'connection_retry'}
+                if isinstance(exc, RateLimitDeferred):
+                    operation_host_gate.restore_service_wait(detail)
+                wait = operation_host_gate.remaining() if isinstance(exc, RateLimitDeferred) else 1.0
+                detail['waiting_seconds'] = wait
+                emit(callback, ProgressEvent('network_waiting', f'{exc} Continuing saved {stage} work after {wait:.1f}s.', detail=detail))
+                if stop_event.wait(wait):
+                    raise Stopped
 
     try:
         save_project_config(config)
         network_modes = {
-            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_download_errors",
-            "media_all", "media_index", "media_download", "media_retry",
+            "all", "external_media_after_scan", "index", "download_only", "download", "resume", "retry_errors",
+            "media_all", "media_index", "media_download", "media_retry", "analysis",
         }
-        eligible_at = saved_service_eligibility(saved_rate_pause_detail, adaptive=config.adaptive_rate_limiting,
-                                               base_pause=config.rate_limit_base_pause)
+        eligible_at = saved_service_eligibility(saved_rate_pause_detail)
         if eligible_at > time.time():
-            # Restore the deadline at actual admission, including mixed retries
-            # whose local phase can run immediately.
-            shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause,
-                             adaptive=config.adaptive_rate_limiting).restore_service_wait(saved_rate_pause_detail)
-        if mode in network_modes and eligible_at > time.time():
-            remaining = max(0.0, eligible_at - time.time())
-            _wait_for_archive(
-                RateLimitDeferred(
-                    f"Wayback service cooldown is still active for about {remaining:.0f}s",
-                    status=int(saved_rate_pause_detail.get("http_status") or 429),
-                    waited=float(saved_rate_pause_detail.get("waited_seconds") or 0.0),
-                    eligible_at_epoch=eligible_at,
-                    incident_id=(int(saved_rate_pause_detail["incident_id"]) if saved_rate_pause_detail.get("incident_id") is not None else None),
-                    wait_source=str(saved_rate_pause_detail.get("wait_source") or ""),
-                    server_eligible_at_epoch=float(saved_rate_pause_detail.get("server_eligible_at_epoch") or 0.0),
-                    rate_limit_signal_at_epoch=float(saved_rate_pause_detail.get("rate_limit_signal_at_epoch") or 0.0),
-                ),
-                "saved service cooldown",
-            )
+            operation_host_gate.restore_service_wait(saved_rate_pause_detail)
         if mode == "backup":
-            path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep, max_mb=config.backup_max_mb,
-                                         stop_event=stop_event,
-                                         **({"callback": callback} if config.dashboard_eta_enabled else {}))
+            path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep, max_mb=config.backup_max_mb)
             emit(callback, ProgressEvent("backup", f"Backup written to {path}"))
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
@@ -555,13 +402,13 @@ def run_project(
             database.commit()
             return {"storage_compaction": report}
         if mode == "integrity":
-            path = check_project_integrity(config.output_dir, database, callback, stop_event=stop_event)
+            path = check_project_integrity(config.output_dir, database, callback)
             emit(callback, ProgressEvent("integrity", f"Integrity report written to {path}"))
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
             return {"integrity": path}
         if mode == "analysis":
-            paths = _recovering_call("archive analysis external lookup", lambda: run_analysis(config, database, stop_event, callback, forum_only=False))
+            paths = run_analysis(config, database, stop_event, callback, forum_only=False)
             finish_operation_run(database, operation_run_id, "complete", "Analysis complete")
             database.commit()
             return paths
@@ -574,7 +421,7 @@ def run_project(
             database.commit()
             return {"research_index": report}
         if mode == "forum_rebuild":
-            paths = _recovering_call("forum analysis", lambda: run_analysis(config, database, stop_event, callback, forum_only=True))
+            paths = run_analysis(config, database, stop_event, callback, forum_only=True)
             finish_operation_run(database, operation_run_id, "complete", "Forum rebuild complete")
             database.commit()
             return paths
@@ -596,8 +443,8 @@ def run_project(
             # acquisition uses the same Media-page settings as a full text run,
             # but never creates scan jobs merely to discover embedded media.
             acquisition_config = replace(config, download_scope="all_text")
-            _recovering_call("text indexing", lambda: index_archive(acquisition_config, database, stop_event, callback))
-            stats = _recovering_call("text acquisition", lambda: download_archive_only(
+            _recovering_call("index_archive", lambda: index_archive(acquisition_config, database, stop_event, callback))
+            stats = _recovering_call("download_archive_only", lambda: download_archive_only(
                 acquisition_config, database, stop_event, callback, states=("pending",)
             ))
             paths: dict[str, Path] = {"project": config.output_dir / "project.json"}
@@ -609,7 +456,7 @@ def run_project(
                         "Text acquisition is complete. Starting the standard supplemental-media phase…",
                     ),
                 )
-                media_config = _recovering_call("supplemental media", lambda: _run_standard_media_phase(
+                media_config = _recovering_call("_run_standard_media_phase", lambda: _run_standard_media_phase(
                     config, database, stop_event, callback, external_only=False
                 ))
                 # A media attempt can prove that a candidate is genuine in-scope
@@ -624,10 +471,10 @@ def run_project(
                         "download_only",
                         f"Media validation recovered {recovered:,} in-scope text capture(s); acquiring them before media continues.",
                     ))
-                    _recovering_call("recovered text acquisition", lambda: download_archive_only(
+                    _recovering_call("download_archive_only", lambda: download_archive_only(
                         acquisition_config, database, stop_event, callback, states=("pending",)
                     ))
-                    media_config = _recovering_call("supplemental media", lambda: _run_standard_media_phase(
+                    media_config = _recovering_call("_run_standard_media_phase", lambda: _run_standard_media_phase(
                         config, database, stop_event, callback, external_only=False
                     ))
                 if _pending_media_recovered_text(database, config):
@@ -647,75 +494,54 @@ def run_project(
             finish_operation_run(database, operation_run_id, "complete", "Download-only acquisition complete")
             database.commit()
             return paths
-        if mode == "retry_download_errors":
-            stats = _recovering_call("text acquisition retry", lambda: retry_error_downloads(config, database, stop_event, callback))
-            paths = {"project": config.output_dir / "project.json"}
-            emit(callback, ProgressEvent(
-                "download_retry",
-                f"Acquisition-only retry complete: {int(stats['downloaded']):,} saved; "
-                f"{int(stats['skipped']):,} skipped; {int(stats['errors']):,} errors.",
-                int(stats["queued"]), int(stats["queued"]),
-            ))
-            finish_operation_run(database, operation_run_id, "complete", "Acquisition-only retry complete")
-            database.commit()
-            return paths
         if mode == "index":
-            _recovering_call("text indexing", lambda: index_archive(config, database, stop_event, callback))
-            paths = _index_reports()
+            _recovering_call("index_archive", lambda: index_archive(config, database, stop_event, callback))
+            paths = generate_index_reports(config, database)
             paths["project"] = config.output_dir / "project.json"
             finish_operation_run(database, operation_run_id, "complete", "Index complete")
             database.commit()
             return paths
         if mode == "report":
             existing = latest_scan_run(database)
-            last_text_run = database.execute(
-                """SELECT mode,status FROM operation_runs WHERE id<>?
-                   AND mode IN ('index','all','external_media_after_scan','download','resume','rescan','retry_errors')
-                   ORDER BY id DESC LIMIT 1""",
-                (operation_run_id,),
-            ).fetchone()
-            if last_text_run is not None and last_text_run["mode"] == "index":
-                paths = _index_reports(complete=last_text_run["status"] == "complete")
-            elif existing is None:
-                if database.execute("SELECT 1 FROM captures LIMIT 1").fetchone():
-                    paths = _index_reports()
+            if existing is None:
+                if database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]:
+                    paths = generate_index_reports(config, database)
                 else:
                     raise RuntimeError("this project does not contain indexed captures or a completed scan run")
             else:
-                paths = generate_reports(config, database, existing, **({"progress_callback": callback} if config.dashboard_eta_enabled else {}))
-            if paths:
-                emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
+                paths = generate_reports(config, database, existing)
+            emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
             finish_operation_run(database, operation_run_id, "complete", "Reports regenerated")
             database.commit()
             return paths
         if mode == "media_index":
-            _recovering_call("media indexing", lambda: index_media(config, database, stop_event, callback))
+            _recovering_call("index_media", lambda: index_media(config, database, stop_event, callback))
             paths = generate_media_reports(config, database)
             finish_operation_run(database, operation_run_id, "complete", "Media index complete")
             database.commit()
             return paths
         if mode == "media_download":
-            _recovering_call("media download", lambda: download_media(config, database, stop_event, callback))
+            _recovering_call("download_media", lambda: download_media(config, database, stop_event, callback))
             paths = generate_media_reports(config, database)
             finish_operation_run(database, operation_run_id, "complete", "Media download complete")
             database.commit()
             return paths
         if mode == "media_retry":
-            _recovering_call("media retry", lambda: retry_media_errors(config, database, stop_event, callback))
+            _recovering_call("retry_media_errors", lambda: retry_media_errors(config, database, stop_event, callback))
             paths = generate_media_reports(config, database)
             finish_operation_run(database, operation_run_id, "complete", "Media retry complete")
             database.commit()
             return paths
         if mode == "media_all":
-            _recovering_call("media indexing", lambda: index_media(config, database, stop_event, callback))
-            _recovering_call("media download", lambda: download_media(config, database, stop_event, callback))
+            _recovering_call("index_media", lambda: index_media(config, database, stop_event, callback))
+            _recovering_call("download_media", lambda: download_media(config, database, stop_event, callback))
             paths = generate_media_reports(config, database)
             finish_operation_run(database, operation_run_id, "complete", "Media operation complete")
             database.commit()
             return paths
 
         if mode in {"all", "external_media_after_scan", "resume"}:
-            _recovering_call("text indexing", lambda: index_archive(config, database, stop_event, callback))
+            _recovering_call("index_archive", lambda: index_archive(config, database, stop_event, callback))
 
         # Resume can re-enter after the original text scan already completed but
         # before/during its requested media phase. In that case do not manufacture
@@ -731,28 +557,27 @@ def run_project(
             ).fetchone()[0])
             resume_media_only = unfinished_text == 0 and latest_scan_run(database) is not None
 
-        scan_incomplete = False
         if not resume_media_only:
-            job_mode = "resume" if requested_mode == "resume" else mode
-            jobs = prepare_scan_jobs(database, config, job_mode)
+            jobs = prepare_scan_jobs(database, config, mode)
             primary_run_id = jobs[0].scan_run_id
             if mode in {"all", "external_media_after_scan"}:
-                scan_stats = _recovering_call("text acquisition and scan", lambda: download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs))
-                scan_incomplete = bool(scan_stats and int(scan_stats.get("scan_errors", 0)))
+                _recovering_call("download_archive", lambda: download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs))
             elif mode in {"download", "resume"}:
-                scan_stats = _recovering_call("text acquisition and scan", lambda: download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs))
-                scan_incomplete = bool(scan_stats and int(scan_stats.get("scan_errors", 0)))
+                _recovering_call("download_archive", lambda: download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs))
             elif mode == "rescan":
-                rescan_keyword_sets(database, jobs, stop_event, callback, workers=(config.scan_workers or None), report_config=config.report, **scanner_options(config))
+                rescan_keyword_sets(database, jobs, stop_event, callback, workers=(config.scan_workers or None), report_config=config.report)
             elif mode == "retry_errors":
-                _recovering_call("text retry", lambda: retry_error_urls(config, database, primary_run_id, stop_event, callback, jobs))
+                _recovering_call("retry_error_urls", lambda: retry_error_urls(config, database, primary_run_id, stop_event, callback, jobs))
                 media_error_count = database.execute(
-                    "SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0 AND "
-                    + ("1=1" if config.retry_include_unavailable else "retryable=1") + " AND media_capture_id IS NOT NULL"
+                    "SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0 AND retryable=1 AND media_capture_id IS NOT NULL"
                 ).fetchone()[0]
                 if media_error_count:
-                    _recovering_call("media retry", lambda: retry_media_errors(
-                        config, database, stop_event, callback, config.retry_media_capture_ids or None,
+                    _recovering_call("retry_media_errors", lambda: retry_media_errors(
+                        config,
+                        database,
+                        stop_event,
+                        callback,
+                        config.retry_media_capture_ids or None,
                     ))
 
         media_config: ProjectConfig | None = None
@@ -765,7 +590,7 @@ def run_project(
                 "media_index",
                 "Text acquisition and the committed scan backlog are complete. Starting the standard supplemental-media phase…",
             ))
-            media_config = _recovering_call("supplemental media", lambda: _run_standard_media_phase(
+            media_config = _recovering_call("_run_standard_media_phase", lambda: _run_standard_media_phase(
                 config, database, stop_event, callback,
                 external_only=(mode == "external_media_after_scan"),
             ))
@@ -783,11 +608,11 @@ def run_project(
                     "scan",
                     f"Media validation recovered {recovered:,} in-scope text capture(s); draining that text backlog before media resumes.",
                 ))
-                _recovering_call("recovered text acquisition and scan", lambda: download_archive(
+                _recovering_call("download_archive", lambda: download_archive(
                     config, database, primary_run_id, stop_event, callback,
                     states=("pending",), scan_jobs=jobs,
                 ))
-                media_config = _recovering_call("supplemental media", lambda: _run_standard_media_phase(
+                media_config = _recovering_call("_run_standard_media_phase", lambda: _run_standard_media_phase(
                     config, database, stop_event, callback,
                     external_only=(mode == "external_media_after_scan"),
                 ))
@@ -795,9 +620,9 @@ def run_project(
                 raise RuntimeError("text/media routing did not converge after four bounded recovery cycles")
 
         if jobs:
-            finish_jobs(database, jobs, "interrupted" if scan_incomplete else "complete")
+            finish_jobs(database, jobs, "complete")
             database.commit()
-            paths = generate_job_reports(config, database, jobs, **({"callback": callback} if config.dashboard_eta_enabled else {}))
+            paths = generate_job_reports(config, database, jobs)
         else:
             paths = {}
             existing = latest_scan_run(database)
@@ -820,17 +645,7 @@ def run_project(
                 research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 paths["research_index"] = research_report
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-        if scan_incomplete:
-            finish_operation_run(
-                database, operation_run_id, "interrupted",
-                "Acquisition completed, but one or more scan items remain retryable; Resume continues the same scan lineage.",
-            )
-            emit(callback, ProgressEvent(
-                "scan",
-                "Acquisition completed, but scan coverage is incomplete. Progress and existing matches were preserved; use Resume to retry the remaining scan items.",
-            ))
-        else:
-            finish_operation_run(database, operation_run_id, "complete", "Operation complete")
+        finish_operation_run(database, operation_run_id, "complete", "Operation complete")
         database.commit()
         return paths
     except ConnectivityPaused as exc:
@@ -841,7 +656,6 @@ def run_project(
             finish_jobs(database, jobs, "interrupted")
         finish_operation_run(database, operation_run_id, "paused", str(exc))
         database.commit()
-        _partial_index_reports()
         emit(callback, ProgressEvent("network_paused", str(exc)))
         raise
     except RateLimitDeferred as exc:
@@ -860,12 +674,11 @@ def run_project(
         )
         finish_operation_run(database, operation_run_id, "paused", str(exc))
         database.commit()
-        _partial_index_reports()
         emit(
             callback,
             ProgressEvent(
                 "rate_limit_paused",
-                f"Archive recovery was configured for one-shot deferral. Progress was saved; use Resume later. {exc}",
+                f"Wayback stayed rate limited beyond the wait budget. Progress was saved; use Resume later. {exc}",
                 detail=detail,
             ),
         )
@@ -881,7 +694,6 @@ def run_project(
             update_operation_run(database, operation_run_id, stage="rate_limit_waiting", detail=service_detail)
         finish_operation_run(database, operation_run_id, "interrupted", "Stopped by user")
         database.commit()
-        _partial_index_reports()
         emit(callback, ProgressEvent("stopped", "Stopped. Progress was saved and can be resumed."))
         raise
     except Exception as exc:
@@ -901,8 +713,6 @@ def run_project(
         # Once worker pools have drained, checkpoint WAL so a clean Pause & Save
         # or normal shutdown has a small, self-contained durable database.
         try:
-            if forecast is not None:
-                forecast.persist()
             database.commit()
             database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:

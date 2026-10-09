@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -31,6 +32,8 @@ def main() -> int:
     parser.add_argument('--output', type=Path, default=ROOT / 'validation/test-results')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    args.output = args.output.resolve()
+    os.chdir(ROOT)
     started = time.perf_counter()
     suite = unittest.defaultTestLoader.discover(str(ROOT / 'tests'), pattern='test_*.py')
     with (args.output / 'tests.log').open('w', encoding='utf-8') as log:

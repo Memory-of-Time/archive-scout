@@ -107,7 +107,7 @@ class HttpPoolTests(unittest.TestCase):
         )
         try:
             url = f"http://127.0.0.1:{server.server_port}/data"
-            with patch("archive_scout.downloads.rate_limit.random.uniform", return_value=1.0):
+            with patch("archive_scout.downloads.rate_limit.FIXED_SERVICE_RETRY_SECONDS", 1.0):
                 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                     results = list(pool.map(lambda _: client.get(url, 100)["data"], range(3)))
             self.assertEqual(results, [b"ok", b"ok", b"ok"])

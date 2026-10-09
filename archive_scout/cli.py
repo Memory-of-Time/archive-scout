@@ -195,10 +195,6 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction, default=None,
         help="Follow archived replay redirects whose embedded original host is outside the project scope. Live redirects remain blocked.",
     )
-    run.add_argument(
-        "--adaptive-rate-limiting", action=argparse.BooleanOptionalAction, default=None,
-        help="Experimental, still in testing: add increasing cooldowns and slower request spacing after throttles. Off by default; fixed ceilings and server waits remain active. Applies on resume too.",
-    )
 
     status = sub.add_parser("status", help="Read project/queue status without modifying it")
     _add_project(status)
@@ -248,19 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--download-external-redirect-destinations", action="store_true",
         help="Persist permission to follow archived redirects to original hosts outside the project scope.",
     )
-    init.add_argument(
-        "--adaptive-rate-limiting", action=argparse.BooleanOptionalAction, default=False,
-        help="Enable experimental increasing cooldowns and adaptive request spacing (still in testing, default off). Fixed ceilings and server waits always remain active.",
-    )
     init.add_argument("--format", choices=FORMATS, default="text")
     return parser
 
 
 def _run_command(args: argparse.Namespace) -> int:
     config = _load(args.project)
-    adaptive_override = getattr(args, "adaptive_rate_limiting", None)
-    if adaptive_override is not None:
-        config = replace(config, adaptive_rate_limiting=bool(adaptive_override)).normalized()
     retention = getattr(args, "retention", None)
     if retention and args.mode != "resume":
         config = replace(config, text_retention=retention).normalized()
@@ -385,7 +374,6 @@ def cli_main(argv: list[str] | None = None) -> int:
                 research=ResearchConfig(vector_backend=args.research_backend, auto_build=not args.no_auto_research),
                 text_retention=args.retention,
                 download_external_redirects=bool(args.download_external_redirect_destinations),
-                adaptive_rate_limiting=bool(args.adaptive_rate_limiting),
             ).normalized()
             project_path.parent.mkdir(parents=True, exist_ok=True)
             project_path.write_text(json.dumps(config.to_payload(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

@@ -47,11 +47,11 @@ def client_for(transport, limiter=None):
 
 class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
     def test_initial_release_identity_and_safe_rate_floors(self):
-        self.assertEqual(VERSION, "1.1.1")
+        self.assertEqual(VERSION, "1.1.2")
         config = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(config.cdx_delay, 2.5)
         self.assertEqual(config.download_delay, 0.125)
-        self.assertGreaterEqual(config.rate_limit_base_pause, 60.0)
+        self.assertEqual(config.rate_limit_base_pause, 5.0)
 
     def test_faster_target_override_cannot_weaken_shared_pool(self):
         config = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
@@ -114,7 +114,7 @@ class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
             def request(self, url, headers, max_bytes, stop_event):
                 calls.append(self.name)
                 if self.fails:
-                    raise httpx.ConnectError("connection setup rejected after wire admission")
+                    raise httpx.ReadError("connection reset after request was sent")
                 return TransportResponse(200, {}, url, b"ok", self.name, 0)
 
             def close(self):
@@ -130,11 +130,11 @@ class V100RateAndWindowsGuiAuditTests(unittest.TestCase):
         finally:
             client.close()
 
-    def test_headerless_rate_limit_starts_at_at_least_sixty_seconds(self):
+    def test_headerless_rate_limit_is_fixed_at_five_seconds(self):
         with mock.patch("archive_scout.downloads.rate_limit.time.monotonic", return_value=1000.0), \
-             mock.patch("archive_scout.downloads.rate_limit.random.uniform", return_value=1.0):
-            gate = SharedHostGate(adaptive=True)
-            self.assertGreaterEqual(gate.pause_for_rate_limit(), 60.0)
+             mock.patch("archive_scout.downloads.rate_limit.time.time", return_value=1000.0):
+            gate = SharedHostGate()
+            self.assertEqual(gate.pause_for_rate_limit(), 5.0)
 
     def test_retry_after_is_never_shortened_by_generic_retry_jitter(self):
         client = client_for(mock.MagicMock())

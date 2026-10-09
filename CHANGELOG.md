@@ -1,88 +1,13 @@
+# v1.1.2 — stable engine rollback
+
+- Restore the v1.0.0 interface and the tagged v1.0.2 indexing/download engines.
+- Remove adaptive pacing, escalating headerless cooldowns and recent global connection recovery machinery.
+- Honor server Retry-After; use fixed short retries and preserve pending work.
+- Drain healthy replay transfers after recoverable pauses. Continue the same operation automatically.
+- Keep current schema13, encoding, routing, backup/restore and bounded local-scanner corrections.
+- Replace tests for retired experimental behavior with fixed-policy and retained-evidence regressions.
+
 # Changelog
-
-## 1.1.0
-
-- Remove compounded shared-recovery/backend waits and preserve healthy in-flight acquisitions while failed work is deferred.
-- End connection-only recovery on trustworthy current-incident success; preserve server-requested waits, pending captures, and cancellation/resume safety.
-- Make adaptive request spacing opt-in, off by default, and clearly marked experimental/still testing across GUI, CLI, and saved configuration.
-- Preserve the user's adaptive pacing preference on Resume without replacing the saved capture selection or retention policy.
-- Record offline test results and publish validation artifacts from the cross-platform Tests and release workflows. Project schema remains 13.
-
-## 1.0.9
-
-- Count fresh, validated, manifest-committed saves separately from retries and adoption, with bounded rolling throughput and typed failure counters.
-- Interrupt stalled request-owned sockets, preserve curl prefixes and renew unhealthy pools only after active owners drain, retaining service cooldowns and pacing.
-- Share strict full-body/preview decoding and propagate the recorded encoding through local scanning, research, analysis and excerpts.
-- Overlap retained scanning with acquisition; use bounded spawn workers for large/regex scans, consistent worker controls and complete oversize-file handling.
-- Run saved-body retries before network admission, offer explicit manual unavailable-capture rechecks and keep retry selections in SQLite.
-- Preserve imported source versions with hash-addressed files; stream Integrity and maintenance work; validate and atomically publish backups before pruning.
-- Restore through SQLite with committed source WAL, validated safety snapshots and preserved active readers; roll back interrupted copies instead of replacing live project files.
-- Replace incomplete near-duplicate candidate cutoffs with exact Hamming-radius search and use a named linear snapshot-difference measure with complete change counts.
-- Keep future ETA phases explicit, bound measured history, propagate analysis cancellation and use UTF-8 structured CLI output.
-- Disable writer mapping to reduce mapping exposure, retain schema 13 and add source/frozen CLI completeness checks to the platform workflows; the excluded conflicting-WAL fixture's origin remains unproven.
-
-## 1.0.8
-
-- Bound retained-scan/rescan write batches by count, memory and elapsed time; commit before progress and flush received work on cancellation. Preserve discard-after-scan durability.
-- Share identical literal automatons, reduce SQLite mapping to 64 MiB, reuse matching classification indexes and align media keysets with the acquisition index.
-- Replace contentless FTS updates with transactionally versioned current postings; use the same portable rebuild in Repair, Compact and Merge.
-- Verify actual saved bytes and content identity during Hitlist resume, including external same-size/same-mtime edits, and reconcile changed coverage without expanding the saved corpus boundary.
-- Select acquisition-only error retries through SQLite temporary tables instead of giant bound-variable lists.
-- Collapse repeated equal SimHash comparisons while retaining cluster membership and transitive near groups.
-- Add optional, bounded Dashboard estimated time remaining for measured current phases, including known network waits, backup, report and FTS-rebuild progress. Keep it disabled by default and tag AI worker events with their project identity.
-- Migrate to schema 13 with a pre-migration backup; preserve capture files, notes, reviews, scores and existing report settings.
-- Add release/workflow-placement verification and an integrity-checked replacement-file apply helper. No new runtime dependencies or higher request ceilings.
-
-## 1.0.6
-
-- Requalify pooled Python transports after temporary fallback, one real request at a time. Late curl completions cannot demote a recovered primary.
-- Keep response stalls, body resets and local pool pressure separate from connection setup failures; attribute failed external redirects to the contacted host.
-- Preserve small replay prefixes on HTTPX, urllib3 and curl failures for validated Range resumption. Incomplete responses never become complete captures.
-- Handle curl live 429/503 and redirects from headers before reading stalled bodies; validate binary prefixes early and preserve existing partial files during throttle deferral.
-- Schedule text-acquisition retry backoff outside worker threads in a bounded queue; fresh captures can proceed while isolated failures wait. Cancellation leaves durable pending work.
-- Bound urllib3 pool acquisition and distinguish curl local file-write errors from network failures.
-- Keep schema 12, current scanner/classifier, request ceilings and shared automatic recovery. No new runtime dependencies.
-
-## 1.0.5
-
-- Keep replay workers and backend health through temporary outages; renew expired recovery cycles without bypassing server cooldowns. Drain attempts before reuse.
-- Restore validated curl fallback for text.
-- Remove the current-operation accounting panel and default aggregate; show compact project skip, media-handoff, failure and recovery counts.
-- Coordinate Reports scrolling, reserve bottom clearance and reflow fields.
-- Correct media disposition labels and retained descriptor availability.
-- Resume Hitlist by body revision, preserve unchanged hits and reconcile changed-body coverage. Schema 12 adds compact Hitlist coverage; existing payloads and review data are preserved.
-- Serialize project operations/restores with a crash-released OS lock; restore runs off the GUI thread.
-
-
-## 1.0.3 — Recovery correctness, project identity, and network integrity
-
-- Tagged GUI operations, asynchronous views, row maps, and mutations with canonical project identity so stale data from one project cannot alter another.
-- Preserved failed operation/scan lineage through Resume, including download-only recovery without keywords and acquisition-only error retry.
-- Added header-first 429/503 handling, typed transport/storage diagnostics, coordinated replay/media outage pauses, backend cooldown enforcement, and release of inactive-client pacing floors.
-- Added the **Download external redirect destinations** policy, blocked live replay escapes, and protected partial Range downloads from cross-representation redirects.
-- Separated deterministic snippets from editable Notes and added bounded, read-only, paginated/copyable detail views across Errors, Results, AI relevance, Research Intelligence, and Scan history.
-- Made Dashboard auto refresh honor the selected interval during active work, use consistent bounded read snapshots, and report query failures as unavailable instead of zero.
-- Made moved project manifests resolve to the folder selected by the user.
-- Keeps project schema 11 and preserves existing v1.0.2 acquisition/scanning semantics outside the audited fixes.
-
-## 1.0.2 — Interface outlines and per-target correctness
-
-- Added explicit cross-platform outlines for multiline text-entry areas and labeled Media input groups.
-- Fixed target-specific CDX signatures/date scopes being lost when the text replay and scan selectors used only the global project signature.
-- Made per-target replay worker and delay overrides effective during text acquisition.
-- Normalized Configure current target keys and surfaced the active override summary in Sites and paths, including Simple mode.
-- Project schema remains 11.
-
-## 1.0.1 — Rate-limit and scrolling corrective release
-
-- Propagates an exhausted Wayback service pause unchanged to the operation boundary instead of shrinking, splitting, rotating, or retrying the pending request.
-- Stops paged text/media admission on the first service-wide deferral, cancels queued sibling work, commits already-validated successes, and leaves unfinished pages pending without ordinary failure inflation.
-- Enforces one shared absolute recovery deadline, including time spent behind another worker's cooldown, and preserves server Retry-After eligibility across restart.
-- Applies adaptive pacing once per coalesced service incident and keeps healthy automatic indexing on resume-key traversal rather than re-fetching a dense prefix through paged mode.
-- Persists typed rate-limit state and operation progress so GUI/CLI consumers can distinguish cooldown, resumable service pause, connectivity failure, and user cancellation.
-- Prevents focus changes on already-visible controls from moving scrollable pages and reveals off-screen keyboard focus only by the minimum necessary amount.
-- Uses one interpreter-wide wheel router, pointer-target routing, stable high-resolution residuals, and prevents the same wheel event from scrolling both a native child and its parent at a boundary.
-- Keeps schema 11 and all v1.0.0 project data compatible.
 
 ## 1.0.0 — Initial public release
 

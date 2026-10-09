@@ -1,235 +1,106 @@
-"""Deterministic offline request-admission benchmark for Archive Scout 1.1.1.
+"""Fixed pacing simulation and optional validated loopback save benchmark.
 
-This exercises the real shared limiter and host gate using a virtual clock.
-It makes NO HTTP calls, performs NO downloads, and measures scheduled starts,
-not completed snapshots or live Internet Archive performance.
+Loopback results are local capacity measurements, never a live-service guarantee.
 """
 from __future__ import annotations
-
-import argparse
-import hashlib
-import importlib.util
-import json
-import math
-import sys
-import threading
-import time
+import argparse, ctypes, hashlib, json, math, os, sys, tempfile, threading, time
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+from archive_scout.downloads import rate_limit as rate
 
-
-class VirtualClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-        self.wait_calls = 0
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def wait(self, timeout: float | None = None) -> bool:
-        if timeout is None or timeout <= 0:
-            raise AssertionError("virtual wait requires a positive bounded timeout")
-        self.wait_calls += 1
-        self.now += timeout
-        return False
-
-
-def scenario(rate_module, *, admissions: int, adaptive: bool, throttle_every: int,
-             server_wait: float | None = 60.0) -> dict:
-    rate_module.reset_shared_traffic_state_for_tests()
-    virtual = VirtualClock()
-    stop = threading.Event()
-    first_start = None
-    previous_start = None
-    smallest_spacing = math.inf
-    largest_spacing = 0.0
-    incidents = 0
-    optional_rate_changes = 0
-    probe_starts = 0
-    waiting_seconds = 0.0
-    checked_server_deadlines = 0
-    next_server_deadline = None
-    checked_followup_spacing = 0
-    check_next = False
-    wall_started = time.perf_counter()
-    with patch.object(rate_module.time, "monotonic", virtual.monotonic), patch.object(
-        rate_module.random, "uniform", return_value=1.0
-    ):
-        limiter = rate_module.SharedFixedRateLimiter(
-            0.125, rate_module.WAYBACK_REPLAY_RATE_KEY, adaptive=adaptive
-        )
-        gate = rate_module.SharedHostGate(base_pause=60.0, max_pause=600.0, adaptive=adaptive)
-        limiter.condition.wait = virtual.wait
-        gate.condition.wait = virtual.wait
-        try:
-            for index in range(admissions):
-                if throttle_every and index and index % throttle_every == 0:
-                    incidents += 1
-                    pause, incident_id, _eligible_at, _new = gate.signal_rate_limit(
-                        server_wait, reason="HTTP 429"
-                    )
-                    waiting_seconds += pause
-                    next_server_deadline = virtual.now + (server_wait if server_wait is not None else pause)
-                    optional_rate_changes += int(limiter.note_rate_limit(incident_id))
-                permit = gate.acquire_request(stop)
-                with limiter.slot(stop):
-                    started = virtual.now
-                    if first_start is None:
-                        first_start = started
-                    if previous_start is not None:
-                        spacing = started - previous_start
-                        if spacing < 0.125 - 1e-9:
-                            raise AssertionError(f"request-start burst: spacing={spacing}")
-                        smallest_spacing = min(smallest_spacing, spacing)
-                        largest_spacing = max(largest_spacing, spacing)
-                        if check_next:
-                            checked_followup_spacing += 1
-                            check_next = False
-                    previous_start = started
-                    if permit.probe:
-                        if next_server_deadline is None or started < next_server_deadline - 1e-9:
-                            raise AssertionError("recovery probe started before the server deadline")
-                        checked_server_deadlines += 1
-                        next_server_deadline = None
-                        probe_starts += 1
-                        check_next = True
-                # Only an injected successful response closes the recovery gate.
-                # This is fixture evidence; no HTTP response is obtained.
-                gate.finish_request(permit, recovered=True)
-                limiter.note_healthy_response()
-            elapsed = virtual.now - float(first_start)
-            if not adaptive and optional_rate_changes:
-                raise AssertionError("disabled adaptive pacing applied a rate reduction")
-            if incidents != probe_starts:
-                raise AssertionError("expected exactly one recovery probe per fixture incident")
-            if checked_followup_spacing != incidents:
-                raise AssertionError("expected a post-recovery no-burst check for every incident")
-            if checked_server_deadlines != incidents:
-                raise AssertionError("expected a server deadline check for every incident")
-            if not adaptive:
-                expected = (admissions - 1) * 0.125 + incidents * max(0.0, (server_wait if server_wait is not None else 5.0) - 0.125)
-                if not math.isclose(elapsed, expected, abs_tol=1e-9):
-                    raise AssertionError(f"fixed schedule drift: {elapsed} versus {expected}")
-            snapshot = limiter.snapshot()
-        finally:
-            limiter.close()
-    return {
-        "admissions": admissions,
-        "adaptive_rate_limiting": adaptive,
-        "fixture_throttle_every_admissions": throttle_every or None,
-        "fixture_server_wait_seconds": server_wait if throttle_every else None,
-        "incidents": incidents,
-        "single_recovery_probe_starts": probe_starts,
-        "post_recovery_no_burst_checks": checked_followup_spacing,
-        "server_deadline_checks": checked_server_deadlines if server_wait is not None else 0,
-        "fixed_fallback_deadline_checks": checked_server_deadlines if server_wait is None else 0,
-        "recovery_deadline_kind": "server_retry_after" if server_wait is not None else "fixed_fallback",
-        "optional_adaptive_rate_changes": optional_rate_changes,
-        "virtual_scheduled_span_seconds": elapsed,
-        "virtual_request_start_rate_per_second": (admissions - 1) / elapsed,
-        "minimum_start_spacing_seconds": smallest_spacing,
-        "maximum_start_spacing_seconds": largest_spacing,
-        "fixture_requested_server_wait_seconds": waiting_seconds,
-        "final_effective_delay_seconds": snapshot["effective_delay"],
-        "virtual_condition_wait_calls": virtual.wait_calls,
-        "benchmark_execution_seconds": time.perf_counter() - wall_started,
-        "checks_passed": True,
-    }
-
-
-def reference_comparison(rate_module, reference_tree: Path, admissions: int) -> dict:
-    """Load only the inspected v1.0.5 pacing module, never the old app/database."""
-    reference = reference_tree / 'archive_scout/downloads/rate_limit.py'
-    spec = importlib.util.spec_from_file_location('archive_scout.downloads.v105_pacing_reference', reference)
-    old = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = old
-    spec.loader.exec_module(old)
-    virtual = VirtualClock()
-    stop = threading.Event()
-    with patch.object(old.time, 'monotonic', virtual.monotonic):
-        limiter = old.SharedFixedRateLimiter(.125)
-        limiter.condition.wait = virtual.wait
-        first = virtual.now
-        previous = None
-        for _ in range(admissions):
+def pacing(count):
+    rate.reset_shared_traffic_state_for_tests()
+    clock=[1000.0]
+    def wait(timeout): clock[0]+=timeout
+    stop=threading.Event(); first=previous=None; smallest=math.inf
+    with patch.object(rate.time,'monotonic',lambda:clock[0]):
+        limiter=rate.SharedFixedRateLimiter(.125,rate.WAYBACK_REPLAY_RATE_KEY)
+        limiter.condition.wait=wait
+        for i in range(count):
             limiter.wait(stop)
-            if previous is not None and virtual.now - previous < .125 - 1e-9:
-                raise AssertionError('reference fixed pacing burst')
-            previous = virtual.now
-        old_span = virtual.now - first
-    expected = (admissions - 1) * .125
-    if not math.isclose(old_span, expected, abs_tol=1e-9):
-        raise AssertionError('reference pacing drift')
-    # Repeat failed probes in one incident. No real requests or responses.
-    recovery = {}
-    for name, module, adaptive in (('v1.0.5', old, False), ('v1.1.1_off', rate_module, False), ('v1.1.1_on', rate_module, True)):
-        virtual = VirtualClock()
-        with patch.object(module.time, 'monotonic', virtual.monotonic), patch.object(module.random, 'uniform', return_value=1.0):
-            gate = module.SharedHostGate(**({'adaptive': adaptive} if module is rate_module else {}))
-            pauses = []
-            for _ in range(4):
-                gate.acquire_request(stop)
-                # Production calls pass the current permit; the legacy method
-                # has no permit argument. Keep its exact original policy.
-                permit = module.HostPermit(gate.generation, gate.probe_inflight)
-                pause = (gate.pause_for_rate_limit() if module is old else gate.signal_rate_limit(permit=permit)[0])
-                pauses.append(pause)
-                virtual.now += pause
-            recovery[name] = pauses
-    return {'reference_module_sha256': hashlib.sha256(reference.read_bytes()).hexdigest(),
-            'reference_version': '1.0.5', 'healthy_admissions': admissions,
-            'reference_healthy_span_seconds': old_span, 'expected_fixed_span_seconds': expected,
-            'reference_request_start_rate_per_second': (admissions - 1) / old_span,
-            'consecutive_headerless_throttle_waits_seconds': recovery,
-            'http_attempts': 0, 'checks_passed': True}
+            if first is None:first=clock[0]
+            if previous is not None:smallest=min(smallest,clock[0]-previous)
+            previous=clock[0]
+            if i%1000==0:limiter.note_rate_limit(i)
+            assert limiter.effective_delay==.125
+        limiter.close()
+    return {'admissions':count,'virtual_seconds':clock[0]-first,'starts_per_second':(count-1)/(clock[0]-first),
+            'minimum_spacing':smallest,'throttle_signals_changed_spacing':False,'real_downloads':0}
 
+def rss():
+    if os.name!='nt':
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/(1024*1024 if sys.platform=='darwin' else 1024)
+    from ctypes import wintypes
+    class Counters(ctypes.Structure):
+        _fields_=[('cb',wintypes.DWORD),('faults',wintypes.DWORD)]+[(n,ctypes.c_size_t) for n in ('peak','working','a','b','c','d','e','f')]
+    c=Counters();c.cb=ctypes.sizeof(c)
+    process=ctypes.windll.kernel32.GetCurrentProcess;process.restype=wintypes.HANDLE
+    measure=ctypes.windll.psapi.GetProcessMemoryInfo;measure.argtypes=[wintypes.HANDLE,ctypes.POINTER(Counters),wintypes.DWORD]
+    return c.working/(1024*1024) if measure(process(),ctypes.byref(c),c.cb) else None
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-tree", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--admissions", type=int, default=2_000_000)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--reference-tree", type=Path, help="Optional extracted complete v1.0.5 source for fixed-pacing comparison")
-    arguments = parser.parse_args()
-    if arguments.admissions < 4:
-        parser.error("--admissions must be at least four")
-    source = arguments.source_tree.resolve()
-    if not (source / "archive_scout" / "downloads" / "rate_limit.py").is_file():
-        parser.error("--source-tree must contain the Archive Scout source package")
-    sys.path.insert(0, str(source))
-    from archive_scout.downloads import rate_limit
+def saves(count,history):
+    from archive_scout.cdx.client import HttpClient
+    from archive_scout.cdx.parameters import cdx_query_signature
+    from archive_scout.config import ProjectConfig
+    from archive_scout.database.connection import open_database
+    from archive_scout.downloads.downloader import download_archive_only
+    from archive_scout.utils import utc_now
+    body=b'<html><body>complete needle evidence '+b'x'*16384+b'</body></html>'
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        def log_message(self,*args):pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    local=f'http://127.0.0.1:{server.server_port}/capture'
+    class LocalClient(HttpClient):
+        def download_to_path(self,url,*args,**kwargs):
+            kwargs.pop('redirect_validator',None)
+            result=super().download_to_path(local,*args,**kwargs);result['final_url']=url;return result
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);cfg=ProjectConfig(root,['example.com/*'],[],from_date='2001',to_date='2001').normalized()
+            cfg.network.trust_environment=False
+            db=open_database(root);signature=cdx_query_signature(cfg);now=utc_now()
+            sql="INSERT INTO captures(original_url,timestamp,query_signature,mimetype,statuscode,length,state,resource_class,resource_classifier_revision,created_at,updated_at,classifier_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,2)"
+            seed_start=time.perf_counter()
+            with db:
+                for start in range(0,history,10000):
+                    db.executemany(sql,((f'http://example.com/history/{i}','19950101000000',signature,'image/jpeg','200',1,'skipped','image',3,now,now) for i in range(start,min(start+10000,history))))
+                db.executemany(sql,((f'http://example.com/current/{i}.html','20010101000000',signature,'text/html','200',len(body),'pending','text',3,now,now) for i in range(count)))
+            seeded=time.perf_counter()-seed_start; samples=[];started=time.perf_counter();cpu=time.process_time()
+            def progress(event):
+                if event.detail and event.detail.get('downloaded'):
+                    samples.append({'seconds':time.perf_counter()-started,'saved':int(event.detail['downloaded']),'rss_mib':rss()})
+            rate.reset_shared_traffic_state_for_tests()
+            with patch('archive_scout.downloads.downloader.HttpClient',LocalClient):
+                result=download_archive_only(cfg,db,threading.Event(),progress)
+            elapsed=time.perf_counter()-started
+            rows=db.execute("SELECT local_path,state FROM captures WHERE timestamp='20010101000000'").fetchall()
+            digest=hashlib.sha256(body).digest()
+            for row in rows:
+                assert row['state']=='downloaded_unscanned'
+                assert hashlib.sha256(Path(row['local_path']).read_bytes()).digest()==digest
+            assert result['downloaded']==count and result['errors']==0
+            windows=[]
+            for label,low,high in [('early',0,count//3),('middle',count//3,2*count//3),('late',2*count//3,count)]:
+                a=next((x for x in samples if x['saved']>=low),None) if low else {'seconds':0,'saved':0}
+                b=next((x for x in samples if x['saved']>=high),None)
+                windows.append({'phase':label,'saved_per_second':round((b['saved']-a['saved'])/(b['seconds']-a['seconds']),3) if a and b and b['seconds']>a['seconds'] else None})
+            db.close()
+            return {'history_rows':history,'seed_seconds':round(seeded,3),'validated_saves':count,'elapsed_seconds':round(elapsed,3),
+                    'validated_saves_per_second':round(count/elapsed,3),'cpu_seconds':round(time.process_time()-cpu,3),
+                    'samples':samples,'windows':windows,'bytes_per_capture':len(body),'rss_final_mib':rss(),
+                    'scope':'Healthy local HTTP fixture, real transport/pacing/files/SQLite. No live Wayback or overnight claim.'}
+    finally:server.shutdown();server.server_close();thread.join(timeout=3)
 
-    # Keep both normal and repeated-pause tests at the requested scale, then
-    # compare opt-in versus fixed-only recovery using a smaller identical sample.
-    sample = min(arguments.admissions, 20_000)
-    interval = max(2, sample // 4)
-    results = {
-        "validation_kind": "deterministic_offline_virtual_request_admission",
-        "limitations": [
-            "No HTTP attempts and no snapshots downloaded.",
-            "Virtual scheduled request starts are not a live completion rate.",
-            "Single-thread fixture verifies spacing and recovery deadlines; concurrency is covered by regression tests.",
-            "Server throttles and successful recovery responses are injected fixtures.",
-        ],
-        "http_attempts": 0,
-        "scenarios": [
-            scenario(rate_limit, admissions=arguments.admissions, adaptive=False, throttle_every=0),
-            scenario(rate_limit, admissions=arguments.admissions, adaptive=False,
-                     throttle_every=max(2, arguments.admissions // 20)),
-            scenario(rate_limit, admissions=sample, adaptive=False, throttle_every=interval),
-            scenario(rate_limit, admissions=sample, adaptive=True, throttle_every=interval),
-            scenario(rate_limit, admissions=sample, adaptive=False, throttle_every=interval, server_wait=None),
-        ],
-    }
-    if arguments.reference_tree:
-        results['v105_reference_comparison'] = reference_comparison(rate_limit, arguments.reference_tree.resolve(), arguments.admissions)
-    serialized = json.dumps(results, indent=2, allow_nan=False) + "\n"
-    if arguments.output:
-        arguments.output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.output.write_text(serialized, encoding="utf-8")
-    print(serialized, end="")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def main():
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--admissions',type=int,default=10000);p.add_argument('--captures',type=int,default=0);p.add_argument('--history',type=int,default=0);p.add_argument('--output',type=Path,default=ROOT/'validation/request-spacing.json');a=p.parse_args()
+    if a.admissions<2 or a.captures<0 or a.history<0:p.error('invalid workload size')
+    report={'status':'passed','pacing':pacing(a.admissions)}
+    if a.captures:report['loopback']=saves(a.captures,a.history)
+    a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8');print(json.dumps(report,indent=2))
+if __name__=='__main__':main()

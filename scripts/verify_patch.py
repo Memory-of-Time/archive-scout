@@ -1,4 +1,4 @@
-"""Verify and apply v1.1.1 files to supplied v1.1.0 or known v1.1.1 source.
+"""Verify and apply v1.1.2 rollback files to known v1.1.1 source.
 
 Run this script from the extracted patch, pointing --project at your checkout.
 Only Python's standard library is required. Project databases are never opened.
@@ -37,11 +37,15 @@ def checked_path(root: Path, name: str) -> Path:
     if (not name or "\\" in name or ":" in name or relative.is_absolute()
             or any(part in {".", "..", ""} for part in name.split("/"))):
         raise RuntimeError(f"Unsafe patch path: {name!r}")
+    if relative.suffix.lower() in {'.sqlite3', '.sqlite', '.db', '.wal', '.shm'} or name == 'project.json' or relative.parts[0] in {'captures', 'media', 'reports', 'backups'}:
+        raise RuntimeError(f'Refusing a project/evidence file in source patch: {name}')
     path = root
     for part in relative.parts:
         path = path / part
         if path.is_symlink():
             raise RuntimeError(f"Refusing a symlink in patch path: {name}")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise RuntimeError(f"Patch path resolves outside the repository: {name}")
     if path.exists() and not path.is_file():
         raise RuntimeError(f"Patch file path is occupied by a directory: {name}")
     return path
@@ -60,10 +64,14 @@ def source_identity(project: Path) -> tuple[str, int]:
 
 def preflight(project: Path) -> tuple[dict, list[str]]:
     manifest = json.loads((ROOT / METADATA[0]).read_text(encoding="utf-8"))
-    if manifest.get("release") != "1.1.1" or manifest.get("base_release") != "1.1.0" or manifest.get("deletions"):
-        raise RuntimeError("This helper requires the v1.1.1-over-v1.1.0 replacement manifest")
+    if manifest.get("release") != "1.1.2" or manifest.get("base_release") != "1.1.1":
+        raise RuntimeError("This helper requires the v1.1.2-over-v1.1.1 rollback manifest")
     entries = manifest["files"]
     names = [entry["path"] for entry in entries]
+    deletions = manifest.get("deletions", [])
+    all_names = names + [entry["path"] for entry in deletions]
+    if len(set(all_names)) != len(all_names):
+        raise RuntimeError("Duplicate replacement/deletion path")
     if len(set(names)) != len(names) or set(names) & set(METADATA):
         raise RuntimeError("Duplicate or invalid metadata entry in patch manifest")
     checksums = {}
@@ -78,8 +86,8 @@ def preflight(project: Path) -> tuple[dict, list[str]]:
         path = checked_path(ROOT, name)
         if not path.is_file() or digest(path) != expected:
             raise RuntimeError(f"Patch integrity check failed: {name}")
-    if source_identity(project) not in {("1.1.0", 13), ("1.1.1", 13)}:
-        raise RuntimeError("Target must be the supplied v1.1.0 source or a provided v1.1.1 source candidate")
+    if source_identity(project) not in {("1.1.1", 13), ("1.1.2", 13)}:
+        raise RuntimeError("Target must be the known v1.1.1 source or already applied v1.1.2 source")
     pending = []
     for entry in entries:
         name = entry["path"]
@@ -101,6 +109,14 @@ def preflight(project: Path) -> tuple[dict, list[str]]:
         if current != entry["base_sha256"] and current not in prior and not equivalent_text:
             raise RuntimeError(f"Target has a different/local version of {name}; no files were changed")
         pending.append(name)
+    for entry in deletions:
+        name = entry['path']
+        target = checked_path(project, name)
+        if not target.exists():
+            continue
+        if digest(target) not in entry['accepted_sha256'] and text_digest(target) not in entry['accepted_text_sha256']:
+            raise RuntimeError(f'Target has a different/local version of retired {name}; no files were changed')
+        pending.append(name)
     # Old release metadata is replaced too, after all source files pass.
     for name in METADATA:
         target = checked_path(project, name)
@@ -120,10 +136,10 @@ def atomic_copy(source: Path, target: Path) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def apply(project: Path, pending: list[str]) -> Path | None:
+def apply(project: Path, pending: list[str], manifest: dict) -> Path | None:
     if not pending:
         return None
-    backup = Path(tempfile.mkdtemp(prefix="ArchiveScout-v1.1.1-source-backup-", dir=project.parent))
+    backup = Path(tempfile.mkdtemp(prefix="ArchiveScout-v1.1.2-source-backup-", dir=project.parent))
     existing = set()
     for name in pending:
         target = project / name
@@ -132,10 +148,14 @@ def apply(project: Path, pending: list[str]) -> Path | None:
             saved = backup / name
             saved.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target, saved)
+    deleted_names = {entry["path"] for entry in manifest.get("deletions", [])}
     written = []
     try:
         for name in pending:
-            atomic_copy(ROOT / name, project / name)
+            if name in deleted_names:
+                checked_path(project, name).unlink()
+            else:
+                atomic_copy(ROOT / name, project / name)
             written.append(name)
     except Exception as exc:
         try:
@@ -152,13 +172,13 @@ def apply(project: Path, pending: list[str]) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", required=True, type=Path, help="Root of supplied v1.1.0 or a provided v1.1.1 source checkout")
+    parser.add_argument("--project", required=True, type=Path, help="Root of a known v1.1.1 source checkout")
     parser.add_argument("--apply", action="store_true", help="Apply after validation, keeping a source-file backup")
     args = parser.parse_args()
     try:
         project = args.project.expanduser().resolve(strict=True)
         manifest, pending = preflight(project)
-        backup = apply(project, pending) if args.apply else None
+        backup = apply(project, pending, manifest) if args.apply else None
     except (OSError, ValueError, KeyError, RuntimeError, SyntaxError) as exc:
         parser.exit(1, f"Patch verification failed: {exc}\n")
     print(json.dumps({"status": "applied" if args.apply and pending else "verified",

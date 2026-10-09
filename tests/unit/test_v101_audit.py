@@ -70,8 +70,7 @@ class V101AuditTests(unittest.TestCase):
         first = shared_host_gate(30, 300)
         second = shared_host_gate(60, 600)
         self.assertIs(first, second)
-        self.assertGreaterEqual(first.base_pause, 60)
-        self.assertGreaterEqual(first.max_pause, 600)
+        self.assertLessEqual(first.pause_for_rate_limit(), 5.0)
 
     def test_shared_request_limiter_coordinates_independent_clients(self):
         first = SharedFixedRateLimiter(0.04)

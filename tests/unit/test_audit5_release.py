@@ -63,7 +63,7 @@ class PrefixClient:
 
 class Audit5ReleaseTests(unittest.TestCase):
     def test_release_identity_and_historical_healthy_cdx_default(self):
-        self.assertEqual(VERSION, "1.1.1")
+        self.assertEqual(VERSION, "1.1.2")
         cfg = ProjectConfig(Path("."), ["example.com/*"], []).normalized()
         self.assertEqual(cfg.cdx_delay, 2.5)
         self.assertEqual(cfg.network.cdx_workers, 10)
@@ -164,7 +164,7 @@ class Audit5ReleaseTests(unittest.TestCase):
             result = fetch_media(row, cfg, PrefixClient(HTML, "text/html"))
             self.assertEqual(result["kind"], "recovered_text")
 
-    def test_auto_healthy_resume_keeps_resume_key_without_switching_to_paged(self):
+    def test_auto_resume_does_not_switch_strategy_after_dense_page(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cfg = ProjectConfig(
@@ -178,15 +178,16 @@ class Audit5ReleaseTests(unittest.TestCase):
             ]
             calls = []
             def fake_resume(_client, _cfg, _target, current):
-                calls.append(("resume", current.resume_key))
-                if current.resume_key is None:
-                    current.resume_key = "next"
-                    return list(rows), False
-                return [], True
+                calls.append("resume")
+                current.resume_key = "next"
+                return list(rows), True
+            def fake_paged(*_args, **_kwargs):
+                calls.append("paged")
+                return PagedBatch([], [], True)
             with mock.patch("archive_scout.cdx.indexer._request_resume", side_effect=fake_resume), \
-                 mock.patch("archive_scout.cdx.indexer._request_paged_batch", side_effect=AssertionError("healthy resume must not switch to paged")):
+                 mock.patch("archive_scout.cdx.indexer._request_paged_batch", side_effect=fake_paged):
                 index_archive(cfg, db, threading.Event())
-            self.assertEqual(calls, [("resume", None), ("resume", "next")])
+            self.assertEqual(calls, ["resume"])
             event = db.execute("SELECT COUNT(*) FROM recovery_events WHERE category='auto_dense_paged'").fetchone()[0]
             self.assertEqual(event, 0)
             db.close()
@@ -317,8 +318,7 @@ class Audit5ReleaseTests(unittest.TestCase):
             root=Path(temp)
             cfg=ProjectConfig(root,["example.com/*"],["needle"],from_date="2001",to_date="2001",
                 media=MediaConfig(enabled=True,include_images=True,include_extensions=["jpg"]),
-                network=NetworkConfig(persistent_retries=False),
-                research=ResearchConfig(enabled=False,auto_build=False)).normalized()
+                network=NetworkConfig(persistent_retries=False), research=ResearchConfig(enabled=False,auto_build=False)).normalized()
             fake_job=SimpleNamespace(scan_run_id=1,name="k")
             media=mock.Mock()
             with mock.patch("archive_scout.operations.index_archive"),                  mock.patch("archive_scout.operations.prepare_scan_jobs",return_value=[fake_job]),                  mock.patch("archive_scout.operations.download_archive",side_effect=RateLimitDeferred("paused",status=429,waited=0)),                  mock.patch("archive_scout.operations._run_standard_media_phase",media),                  mock.patch("archive_scout.operations.finish_jobs"):
