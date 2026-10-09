@@ -1,7 +1,7 @@
 {
   "status": "passed",
   "files": 300,
-  "elapsed_seconds": 11.563000000009197,
+  "elapsed_seconds": 9.625,
   "executable": "source run_cli.py",
   "encoding_stress": true,
   "checks": [

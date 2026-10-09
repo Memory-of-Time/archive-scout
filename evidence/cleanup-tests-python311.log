@@ -1,0 +1,14 @@
+test_apply_backup_idempotence_and_project_preservation (test_cleanup.CleanupTests.test_apply_backup_idempotence_and_project_preservation) ... ok
+test_corrupt_manifest_blocks_preflight (test_cleanup.CleanupTests.test_corrupt_manifest_blocks_preflight) ... ok
+test_crlf_and_bom_do_not_accept_meaningful_local_edits (test_cleanup.CleanupTests.test_crlf_and_bom_do_not_accept_meaningful_local_edits) ... ok
+test_deletion_failure_restores_all_prior_deletions (test_cleanup.CleanupTests.test_deletion_failure_restores_all_prior_deletions) ... ok
+test_duplicate_or_unsafe_paths_are_rejected (test_cleanup.CleanupTests.test_duplicate_or_unsafe_paths_are_rejected) ... ok
+test_modified_retained_source_blocks_preflight (test_cleanup.CleanupTests.test_modified_retained_source_blocks_preflight) ... ok
+test_modified_retired_file_blocks_entire_preflight (test_cleanup.CleanupTests.test_modified_retired_file_blocks_entire_preflight) ... ok
+test_optional_cleanup_requires_explicit_flag (test_cleanup.CleanupTests.test_optional_cleanup_requires_explicit_flag) ... ok
+test_wrong_release_is_rejected (test_cleanup.CleanupTests.test_wrong_release_is_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.222s
+
+OK

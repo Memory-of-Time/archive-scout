@@ -1,0 +1,10 @@
+{
+  "version": "1.1.2",
+  "schema": 13,
+  "workflow_paths": [
+    ".github\\workflows\\tests.yml",
+    ".github\\workflows\\build-and-release.yml"
+  ],
+  "installed_metadata_checked": true,
+  "status": "passed"
+}

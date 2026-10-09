@@ -1,0 +1,10 @@
+{
+  "source": "C:\\Users\\cuhc5\\Documents\\Codex\\2026-10-08\\github-plugin-github-openai-curated-remote-2\\work\\v112-ci-current\\archive-scout-219b2e3ec0dba12504425542ae624e6b7d793ab2",
+  "target": "C:\\Users\\cuhc5\\Documents\\Codex\\2026-10-08\\github-plugin-github-openai-curated-remote-2\\work\\v112-ci-fixed",
+  "deleted": 71,
+  "optional_remaining": 18,
+  "unchanged_retained_files": 382,
+  "database_unchanged": true,
+  "settings_unchanged": true,
+  "idempotent": true
+}

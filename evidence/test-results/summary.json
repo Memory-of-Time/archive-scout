@@ -1,0 +1,17 @@
+{
+  "release": "1.1.2",
+  "schema": 13,
+  "timestamp_utc": "2026-10-09T22:45:06.893128+00:00",
+  "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "win32",
+  "tests_run": 423,
+  "passed": 423,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "expected_failures": 0,
+  "unexpected_successes": 0,
+  "elapsed_seconds": 47.756,
+  "successful": true,
+  "network_scope": "Mocked service responses and local fixtures; no live Wayback throughput claim."
+}
