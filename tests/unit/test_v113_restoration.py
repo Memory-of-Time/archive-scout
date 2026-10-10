@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import closing
 import tempfile
 import threading
 import unittest
@@ -109,23 +110,23 @@ class RestorationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cfg = ProjectConfig(root, ["example.com/*"], [], from_date="2001", to_date="2001", workers=1).normalized()
-            db = open_database(root)
-            self.addCleanup(db.close)
-            now = utc_now()
-            with db:
-                db.executemany("""INSERT INTO captures(original_url,timestamp,query_signature,mimetype,
-                    statuscode,length,state,created_at,updated_at)
-                    VALUES(?,'20010101000000',?,'text/html','200',100,'pending',?,?)""",
-                    [(f"http://example.com/{i}", cdx_query_signature(cfg), now, now) for i in range(2)])
-            events = []
-            with patch("archive_scout.downloads.downloader.HttpClient", Client):
-                result = download_archive_only(cfg, db, threading.Event(), events.append)
-            self.assertEqual(result["downloaded"], 2)
-            details = [event.detail for event in events if event.stage == "download_only"]
-            self.assertEqual(details[-1]["fresh_committed"], 2)
-            self.assertEqual(details[-1]["fresh_committed_bytes"], 2 * len(b"<html><body>archive body</body></html>"))
-            self.assertGreater(details[-1]["fresh_save_rate_60s"], 0)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0], 2)
+            # Windows cannot delete an open SQLite file during TemporaryDirectory cleanup.
+            with closing(open_database(root)) as db:
+                now = utc_now()
+                with db:
+                    db.executemany("""INSERT INTO captures(original_url,timestamp,query_signature,mimetype,
+                        statuscode,length,state,created_at,updated_at)
+                        VALUES(?,'20010101000000',?,'text/html','200',100,'pending',?,?)""",
+                        [(f"http://example.com/{i}", cdx_query_signature(cfg), now, now) for i in range(2)])
+                events = []
+                with patch("archive_scout.downloads.downloader.HttpClient", Client):
+                    result = download_archive_only(cfg, db, threading.Event(), events.append)
+                self.assertEqual(result["downloaded"], 2)
+                details = [event.detail for event in events if event.stage == "download_only"]
+                self.assertEqual(details[-1]["fresh_committed"], 2)
+                self.assertEqual(details[-1]["fresh_committed_bytes"], 2 * len(b"<html><body>archive body</body></html>"))
+                self.assertGreater(details[-1]["fresh_save_rate_60s"], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0], 2)
 
     @unittest.skipUnless(os.environ.get("DISPLAY") or os.name == "nt", "Tk display not available")
     def test_wide_form_is_accessible_and_focus_does_not_jump_when_visible(self):
