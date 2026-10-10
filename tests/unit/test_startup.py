@@ -11,7 +11,7 @@ class StartupRegressionTests(unittest.TestCase):
         self.assertIs(main_window.CoalescingEventQueue, CoalescingEventQueue)
 
     def test_public_version_is_official_release(self):
-        self.assertEqual(main_window.VERSION, "1.1.2")
+        self.assertEqual(main_window.VERSION, "1.1.3")
 
 
 if __name__ == "__main__":

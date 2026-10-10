@@ -195,8 +195,10 @@ def apply_theme(root: tk.Tk, requested: str = "system", font_scale: float = 1.0)
     style.configure("SidebarActive.TButton", background=colors["accent"], foreground=accent_text, borderwidth=0, anchor="w", padding=(14, 9), font=(default.actual("family"), abs(int(default.actual("size"))), "bold"))
     style.map("SidebarActive.TButton", background=[("active", colors["accent_active"])])
     style.configure("Status.TLabel", background=colors["panel"], foreground=colors["text"], padding=(8, 5))
-    style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["text"], insertcolor=colors["text"], bordercolor=colors["border"])
-    style.configure("TCombobox", fieldbackground=colors["input"], foreground=colors["text"], background=colors["panel"], arrowcolor=colors["text"])
+    style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["text"], insertcolor=colors["text"], bordercolor=colors["border"], lightcolor=colors["border"], darkcolor=colors["border"], relief="solid", borderwidth=1, padding=(4, 4))
+    style.map("TEntry", bordercolor=[("focus", colors["accent"]), ("!focus", colors["border"])], lightcolor=[("focus", colors["accent"])])
+    style.configure("TCombobox", fieldbackground=colors["input"], foreground=colors["text"], background=colors["panel"], arrowcolor=colors["text"], bordercolor=colors["border"], relief="solid", borderwidth=1, padding=(3, 3))
+    style.map("TCombobox", bordercolor=[("focus", colors["accent"]), ("!focus", colors["border"])])
     style.map("TCombobox", fieldbackground=[("readonly", colors["input"])], foreground=[("readonly", colors["text"])])
     style.configure("Treeview", background=colors["panel"], fieldbackground=colors["panel"], foreground=colors["text"], rowheight=line_height, bordercolor=colors["border"])
     style.map("Treeview", background=[("selected", colors["accent"])], foreground=[("selected", accent_text)])
@@ -215,7 +217,8 @@ def apply_text_theme(widget: tk.Misc, colors: dict[str, str]) -> None:
             try:
                 child.configure(background=colors["input"], foreground=colors["text"], insertbackground=colors["text"],
                                 selectbackground=colors["accent"], selectforeground="#ffffff",
-                                highlightbackground=colors["border"], highlightcolor=colors["accent"], relief="flat")
+                                highlightbackground=colors["border"], highlightcolor=colors["accent"],
+                                highlightthickness=1, borderwidth=1, relief="solid")
             except tk.TclError:
                 pass
         elif isinstance(child, tk.Canvas):

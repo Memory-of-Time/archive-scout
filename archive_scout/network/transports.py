@@ -830,6 +830,7 @@ class ResilientTransport:
         self.lock = threading.Lock()
         self.cooldown_until: dict[str, float] = {}
         self.last_success: str | None = None
+        self._fallback_successes = 0
         factories = {
             "httpx": lambda: HttpxBackend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
             "urllib3": lambda: Urllib3Backend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
@@ -901,6 +902,12 @@ class ResilientTransport:
         with self.lock:
             preferred = self.last_success
             available = [name for name in self.order if self.cooldown_until.get(name, 0.0) <= now]
+            # After a backend fallback, periodically try the primary pooled
+            # transport on a real request. A healthy primary resumes normal
+            # reuse without a separate probe request or a forced connection.
+            if (getattr(self, "_fallback_successes", 0) >= 32 and self.order
+                    and self.order[0] in available):
+                preferred = self.order[0]
         if not available:
             # All backends are cooling down. Try all of them instead of blocking
             # forever; the caller owns retry/backoff and can save progress.
@@ -928,6 +935,8 @@ class ResilientTransport:
                 with self.lock:
                     changed = self.last_success != name
                     self.last_success = name
+                    self._fallback_successes = (0 if name == self.order[0]
+                                                else min(32, getattr(self, "_fallback_successes", 0) + 1))
                     self.cooldown_until.pop(name, None)
                 if changed and self.callback:
                     self.callback(f"Network backend: {name}")
@@ -946,6 +955,8 @@ class ResilientTransport:
                 failures.append((name, exc))
             with self.lock:
                 self.cooldown_until[name] = time.monotonic() + 1.0
+                if name == self.order[0]:
+                    self._fallback_successes = 0
             last_error = failures[-1][1]
             if is_transport_read_timeout(last_error):
                 # Once a server has accepted the connection and stalled while
@@ -991,6 +1002,8 @@ class ResilientTransport:
                 with self.lock:
                     changed = self.last_success != name
                     self.last_success = name
+                    self._fallback_successes = (0 if name == self.order[0]
+                                                else min(32, getattr(self, "_fallback_successes", 0) + 1))
                     self.cooldown_until.pop(name, None)
                 if changed and self.callback:
                     self.callback(f"Network backend: {name}")
@@ -1009,9 +1022,14 @@ class ResilientTransport:
             # Range header to another backend: the client must calculate the
             # new offset for its next bounded retry.
             if destination.exists() and destination.stat().st_size:
+                with self.lock:
+                    if name == self.order[0]:
+                        self._fallback_successes = 0
                 break
             with self.lock:
                 self.cooldown_until[name] = time.monotonic() + 1.0
+                if name == self.order[0]:
+                    self._fallback_successes = 0
             last_error = failures[-1][1]
             if is_transport_read_timeout(last_error):
                 if self.callback:

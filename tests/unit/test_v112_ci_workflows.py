@@ -51,12 +51,12 @@ class WorkflowVerificationTests(unittest.TestCase):
             self.verifier.verify(source_only=True)
     def test_stale_workflow_release_assertion_is_rejected(self):
         path = self.root / '.github/workflows/tests.yml'
-        path.write_bytes(path.read_bytes().replace(b"== '1.1.2'", b"== '1.1.1'"))
+        path.write_bytes(path.read_bytes().replace(b"== '1.1.3'", b"== '1.1.1'"))
         with self.assertRaisesRegex(RuntimeError, 'workflow package version'):
             self.verifier.verify(source_only=True)
     def test_release_identity_checks_stay_enforced(self):
         path = self.root / 'pyproject.toml'
-        path.write_bytes(path.read_bytes().replace(b'1.1.2', b'1.0.9'))
+        path.write_bytes(path.read_bytes().replace(b'1.1.3', b'1.0.9'))
         with self.assertRaisesRegex(RuntimeError, 'runtime VERSION disagree'):
             self.verifier.verify(source_only=True)
 

@@ -1,6 +1,6 @@
-# v1.1.2 request control and Windows GUI
+# v1.1.3 request control and Windows GUI
 
-This document describes the retained Windows GUI safeguards and fixed request policy in v1.1.2.
+This document describes the retained Windows GUI safeguards and fixed request policy in v1.1.3.
 
 ## Request control
 

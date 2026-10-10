@@ -1,0 +1,192 @@
+{
+  "release": "1.1.3",
+  "baseline": "1.1.2",
+  "schema_version": 13,
+  "baseline_zip_sha256": "7784b85e5a23d01d51d04d2c79809b5885dc12484de0efafbf086891133e8e92",
+  "file_count": 26,
+  "changes": [
+    {
+      "path": ".github/workflows/tests.yml",
+      "baseline_sha256": "678454c68bee5f685c4ea3675e6ec66c30d1a25d5ebc209f81ed82abb679dee4",
+      "patched_sha256": "b81bc3f728581c838cceea9a31e0e1005cd13a8d945377631138112353795a6a",
+      "bytes": 3124,
+      "action": "replace"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "baseline_sha256": "9da8671b0d99558b1b6feb0922f34239161e1c00b80fba5b2d58c81b22413da3",
+      "patched_sha256": "690a66fc72817037e6494822c63bdee8d7919f253a63e42e69c2dfd3964cdbc5",
+      "bytes": 2522,
+      "action": "replace"
+    },
+    {
+      "path": "README.md",
+      "baseline_sha256": "82265a9ea9476ddfd6104463cbdc46b67a8ce704d3810dffef7f5138e03ca5b9",
+      "patched_sha256": "65a291a59077f8f10a547023aa601c1a7c73a404ecdcab947c89e0e847dad32f",
+      "bytes": 21101,
+      "action": "replace"
+    },
+    {
+      "path": "RELEASE_NOTES.md",
+      "baseline_sha256": "a659fb1a2fbfdcb5de1e41c2b3eab01c052124a08b904f56cc211e29e861a03d",
+      "patched_sha256": "76fc9bf9b4c4fb89fe04521327eef797cebc9a6bbea60d6108fdcda22bf030d7",
+      "bytes": 2939,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/config.py",
+      "baseline_sha256": "468db1f743c89099738ca1044815cda148377b3e992fb14023cacb2157e4cee1",
+      "patched_sha256": "a1b3907759ada9da4d66f61c6152c353beb27ad95a109078b89d2838726bbfec",
+      "bytes": 46767,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/constants.py",
+      "baseline_sha256": "f2825482eb3c1e3c8f8aad57a6648fbb026181c2dfdb6f242789734c5d2766d2",
+      "patched_sha256": "549833e53c643aedef14afdfe9cc1f8e387aa83e29a5845d2342313852283c0b",
+      "bytes": 3656,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/downloads/downloader.py",
+      "baseline_sha256": "c982020b0b693750f9ae4a26368a9980feefdb2e76ad441ce8d1aa4f0050b3af",
+      "patched_sha256": "4ca7b389f887fd8fcce27202517df8d9cc56ec050c702adbb5fbac2191c190db",
+      "bytes": 101442,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/network/transports.py",
+      "baseline_sha256": "e5a761900af7fa8b55b7396bf90136d17716f7d2d008615c8e3b02dec2c5c72a",
+      "patched_sha256": "0f7b3e96c0f967510d141f8d604280a4ad5aa274c21b432a59542258302c0cfb",
+      "bytes": 47015,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/ui/main_window.py",
+      "baseline_sha256": "d73b57261665d23152921f56e50a09e9cf7b03e50b875faf06091517cb72abe4",
+      "patched_sha256": "bcb809324223cb8833d1bfd201e1b3ba6c847b19e867e60c5ff1d43c1304ab6a",
+      "bytes": 178663,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/ui/theme.py",
+      "baseline_sha256": "ed2fc14d0d11342b74aabd8869af488b62126e94a2bddaaefc0d761a31edae36",
+      "patched_sha256": "51328ebfba978b8f841af45a57bd9a7f795dd1b25d80080e777f5a98203ef7ac",
+      "bytes": 12305,
+      "action": "replace"
+    },
+    {
+      "path": "archive_scout/ui/widgets.py",
+      "baseline_sha256": "03bfc8bc7ad4d61e17a7d84bf193c7abc903a3129670b8a240bc252c88f04d3c",
+      "patched_sha256": "d0ea4bb528401cb68100e6ea0969c7e079632a83424eff81355da874f5c5bdc1",
+      "bytes": 11944,
+      "action": "replace"
+    },
+    {
+      "path": "docs/GITHUB_SETUP.md",
+      "baseline_sha256": "948e00cfd670f8008aa93a18f019fb07bb8350107303d09aacf9c07cac4347d0",
+      "patched_sha256": "c85ebd91b6199c1a83c4a4088abbbb1916fa0db8a5a61dee71fdc7d0617899c2",
+      "bytes": 998,
+      "action": "replace"
+    },
+    {
+      "path": "docs/RATE_LIMITS_AND_WINDOWS_GUI.md",
+      "baseline_sha256": "d1154ce47522f67cbb8bb46d7f69936a8885bef88a251a61f37d85136721a033",
+      "patched_sha256": "423b6889c4b4d7f1ee485bef3b0316a169a6f80c836ff8f37254d4919af712f6",
+      "bytes": 2137,
+      "action": "replace"
+    },
+    {
+      "path": "packaging/windows/version_info.txt",
+      "baseline_sha256": "14104c292fab6b94243d86f40f2a22ee2e25c92313766945a93dd46eea0eabaf",
+      "patched_sha256": "6a705b87b7be5deabe74ac374dfb208e154934cd611a3bbd32ca5331a905150a",
+      "bytes": 888,
+      "action": "replace"
+    },
+    {
+      "path": "pyproject.toml",
+      "baseline_sha256": "acb102132405545a8515e3c40ec1085bb5ffdf8fa1d641347e1a996bfffaa92f",
+      "patched_sha256": "578a2a6c155983542905fb9b963cbc30d3839c6f7a61417e6e06ceceebab5771",
+      "bytes": 1139,
+      "action": "replace"
+    },
+    {
+      "path": "scripts/benchmark_scan_pipeline.py",
+      "baseline_sha256": "48d078fc2c1ea55911991d330a9da462ad79be75b9f5f335937a83bd8c356960",
+      "patched_sha256": "f3a161124bcf1392cb319159fac8c88523fced066f3731bcde08d5b99fff8437",
+      "bytes": 4512,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_audit5_release.py",
+      "baseline_sha256": "7d8a24318ceabee594ae9bedc92424393f6afe13aaa28e3ea8f9b3873005ef87",
+      "patched_sha256": "5b40ce2e3dc4af05d0ee2c81db1c3adc873d51ee85d9a56df4f0bfd04295b339",
+      "bytes": 19934,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_cli_automation.py",
+      "baseline_sha256": "cc46ea50bbbe41125d3c6f95dfb0e4a0b4915289f69db0bce275e11b8ba5d1ae",
+      "patched_sha256": "02a1643f0a11bd9d3efe156e7b9f6920c1d4647af10d56160396e2848f5cf621",
+      "bytes": 3027,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_startup.py",
+      "baseline_sha256": "6cfcdf2d2f64fc9b55c2afd8ba2dbd3cec3251872b5167a74baf0c337c5c819b",
+      "patched_sha256": "a07a78094f78996eaf4735c67538ad986780f2f8db2a5e75eb91888897d13f95",
+      "bytes": 505,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v100_rate_gui_audit.py",
+      "baseline_sha256": "b273f13994a9c4843ad50c68060788a002de9615aed0176fb57a29f9f0075cb3",
+      "patched_sha256": "2887bcadf8e5c6eadfc0002719f0b81172ecb83ad6c427bd6a8b4045d884269c",
+      "bytes": 7724,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v1062_download_only.py",
+      "baseline_sha256": "27568559e33aba9ebeb81f28b53f94668364924b80d322d8986846cab3d600a9",
+      "patched_sha256": "6520b020b53e7f9dc3c959233818785418a519bc765db27ef340c699d52c8b23",
+      "bytes": 9721,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v106_release.py",
+      "baseline_sha256": "68cf892d2903eb36ffff6e5003aa19257842ba68bdeb39097e62829a430360c9",
+      "patched_sha256": "bfc808407093f575b8b6ab54118e38681bacd670af18351ed50e4dcec16bff05",
+      "bytes": 11843,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v108_release.py",
+      "baseline_sha256": "406eade11271320c0f4c28e31dfa5b390985f1c5637eeda0a2d674cc65d7f5a3",
+      "patched_sha256": "b64b59db3c6bf86bebefc816473ad412ff842f5801e0e8168169d49824bdd1ee",
+      "bytes": 5364,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v112_ci_workflows.py",
+      "baseline_sha256": "46c4bc18a20d5836cade9e4e556f094787a283f4b4330aa03f6cac040a18f3fa",
+      "patched_sha256": "1ab6ae1ddc1d2d2daf1d2ca1f894064a0e1559b59f96a4714c02c08678e1522c",
+      "bytes": 4811,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v112_fixed_engine.py",
+      "baseline_sha256": "d496d90d90001d4b1aad9c9dacbdb6fd9ede477165f46c05a1b27f2e45e8221d",
+      "patched_sha256": "1bb536a4d0b0cba3eb4a265ba4c52388b011d28bd1bd1e95ce4af716dcaedb27",
+      "bytes": 10607,
+      "action": "replace"
+    },
+    {
+      "path": "tests/unit/test_v113_restoration.py",
+      "baseline_sha256": null,
+      "patched_sha256": "3328a04e8ac225311d2e0db8d55c4f78a1a8f2343b81ef8afd67c609c2a6d0d7",
+      "bytes": 7693,
+      "action": "add"
+    }
+  ],
+  "instructions": "Apply these root-relative files over the audited complete v1.1.2 repository. Do not replace data/project folders."
+}

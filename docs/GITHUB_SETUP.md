@@ -18,6 +18,6 @@ Platform outputs:
 
 Tagged Windows releases require the configured Artifact Signing variables/secrets. A manual build may create an unsigned Windows test package when signing is disabled; that package is not intended to substitute for an official signed tagged release.
 
-For v1.1.2, create tag `v1.1.2` only after the complete test matrix and native package smoke tests succeed on the exact release commit.
+For v1.1.3, create tag `v1.1.3` only after the complete test matrix and native package smoke tests succeed on the exact release commit.
 
 Canonical GitHub configuration lives only under `.github/`; no `github/` mirror is needed.

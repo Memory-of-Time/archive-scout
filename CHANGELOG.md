@@ -1,4 +1,12 @@
-# v1.1.2 — stable engine rollback
+# v1.1.3 — selective performance and GUI restoration
+
+- Acquire-first as the default for new retained scans, with compatible explicit overlap and discard handling.
+- Restored workable sidebar width, horizontally accessible pages, wheel/focus handling and visible input borders; tabular copy support.
+- Measured-window post-commit fresh-save metrics and periodic return to pooled backend after a fallback.
+- Spawn-safe scanner pipeline benchmark and expanded regression/CI checks.
+- No schema migration or adaptive rate limiter; existing v1.1.2 projects and settings remain compatible.
+
+# v1.1.3 — stable engine rollback
 
 - Restore the v1.0.0 interface and the tagged v1.0.2 indexing/download engines.
 - Remove adaptive pacing, escalating headerless cooldowns and recent global connection recovery machinery.

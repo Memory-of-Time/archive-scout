@@ -87,21 +87,23 @@ class WheelRouter:
 
     def _units(self, event) -> int:
         if getattr(event, "num", None) == 4:
-            return -3
+            return -1
         if getattr(event, "num", None) == 5:
-            return 3
+            return 1
         delta = float(getattr(event, "delta", 0) or 0)
         if not delta:
             return 0
-        if sys.platform == "darwin":
-            return -1 if delta > 0 else 1
+        # Smooth macOS trackpads emit many tiny deltas, while Windows wheels
+        # typically deliver +/-120 per notch. Aggregate fractions rather than
+        # turning every touchpad event into a full canvas unit.
+        scale = 3.0 if sys.platform == "darwin" else 120.0
         key = id(getattr(event, "widget", self.root))
-        accumulated = self._wheel_residual.get(key, 0.0) + (-delta / 120.0)
+        accumulated = self._wheel_residual.get(key, 0.0) + (-delta / scale)
         if abs(accumulated) < 1.0:
             self._wheel_residual[key] = accumulated
             return 0
-        units = int(accumulated)
-        self._wheel_residual[key] = accumulated - units
+        units = max(-3, min(3, int(accumulated)))
+        self._wheel_residual[key] = max(-0.99, min(0.99, accumulated - units))
         return units
 
     def _wheel(self, event):
@@ -142,50 +144,90 @@ class WheelRouter:
 
 
 class ScrollablePage(ttk.Frame):
-    """A responsive page body with a persistent vertical scrollbar.
+    """Responsive vertical page, with horizontal access to wide controls.
 
-    Footer/status bars live outside this widget.  The canvas window always
-    follows viewport width, while content height expands naturally.
+    Respect the width of the viewport when content fits; preserve its requested
+    width when it does not. A horizontal scrollbar then exposes the entire
+    form instead of silently clipping controls off the right edge.
     """
     def __init__(self, master, *, padding=10, frame_style: str | None = None, **kwargs) -> None:
         super().__init__(master, **kwargs)
-        self.columnconfigure(0, weight=1); self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vbar.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew"); self.vbar.grid(row=0, column=1, sticky="ns")
+        self.hbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vbar.set, xscrollcommand=self.hbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.hbar.grid(row=1, column=0, sticky="ew")
+        self.hbar.grid_remove()
         self.body = ttk.Frame(self.canvas, padding=padding, style=frame_style or "TFrame")
-        self._window = self.canvas.create_window((0,0), window=self.body, anchor="nw")
+        self._window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
         self.canvas._archive_scout_scroll_owner = self  # type: ignore[attr-defined]
         self.body._archive_scout_scroll_owner = self  # type: ignore[attr-defined]
         self.body.bind("<Configure>", self._queue_region, add=True)
         self.canvas.bind("<Configure>", self._viewport, add=True)
-        WheelRouter.ensure(self)
         self._region_job = None
+        WheelRouter.ensure(self)
+
     def _viewport(self, event=None) -> None:
-        width = max(1, int(getattr(event, "width", self.canvas.winfo_width())))
-        self.canvas.itemconfigure(self._window, width=width); self._queue_region()
+        self._queue_region()
+
     def _queue_region(self, _event=None) -> None:
         if self._region_job is not None:
-            try: self.after_cancel(self._region_job)
-            except tk.TclError: pass
+            try:
+                self.after_cancel(self._region_job)
+            except tk.TclError:
+                pass
         self._region_job = self.after_idle(self._update_region)
+
     def _update_region(self) -> None:
-        self._region_job = None; self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-    def can_scroll_y(self, units: int) -> bool:
+        self._region_job = None
         try:
-            first, last = self.canvas.yview()
-            return first > 1e-6 if units < 0 else last < 1.0 - 1e-6
+            width = max(1, self.canvas.winfo_width())
+            requested = self.body.winfo_reqwidth()
+            content_width = max(width, requested)
+            self.canvas.itemconfigure(self._window, width=content_width)
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            if content_width > width + 1:
+                self.hbar.grid()
+            else:
+                self.hbar.grid_remove()
+                self.canvas.xview_moveto(0)
         except tk.TclError:
-            return False
-    def can_scroll_x(self, units: int) -> bool: return False
-    def scroll_y(self, units: int) -> None: self.canvas.yview_scroll(int(units), "units")
-    def scroll_x(self, units: int) -> None: return None
+            pass
+
+    def can_scroll_y(self, units: int) -> bool:
+        return WheelRouter._view_can_move(self.canvas, units)
+
+    def can_scroll_x(self, units: int) -> bool:
+        return WheelRouter._view_can_move(self.canvas, units, horizontal=True)
+
+    def scroll_y(self, units: int) -> None:
+        self.canvas.yview_scroll(int(units), "units")
+
+    def scroll_x(self, units: int) -> None:
+        self.canvas.xview_scroll(int(units), "units")
+
     def reveal(self, widget: tk.Misc) -> None:
+        # Focus changes must not move a control that is already visible.
         try:
-            self.update_idletasks(); y = widget.winfo_rooty()-self.body.winfo_rooty(); total=max(1,self.body.winfo_reqheight())
-            self.canvas.yview_moveto(max(0.0,min(1.0,y/total)))
-        except tk.TclError: pass
+            if not widget.winfo_ismapped():
+                return
+            self.update_idletasks()
+            top = widget.winfo_rooty() - self.canvas.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            available = self.canvas.winfo_height()
+            margin = 6
+            if top >= margin and bottom <= available - margin:
+                return
+            scrollheight = max(1, self.body.winfo_height())
+            delta = (top - margin) if top < margin else (bottom - available + margin)
+            first = self.canvas.yview()[0]
+            self.canvas.yview_moveto(max(0.0, min(1.0, first + delta / scrollheight)))
+        except (tk.TclError, AttributeError):
+            pass
 
 
 class ScrollableTree(ttk.Frame):

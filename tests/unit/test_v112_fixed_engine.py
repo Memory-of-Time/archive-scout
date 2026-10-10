@@ -118,7 +118,7 @@ class FixedEngineTests(unittest.TestCase):
                 if self.calls==2:blocked.set();release.wait(3)
                 Path(path).write_bytes(body);return {'headers':{'content-type':'text/html'},'preview':body,'bytes':len(body),'content_hash':'','status':200,'final_url':url}
         with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);cfg=ProjectConfig(root,['example.com/*'],['needle'],from_date='2001',to_date='2001',workers=1,scan_workers=1,scan_backend='thread').normalized()
+            root=Path(temp);cfg=ProjectConfig(root,['example.com/*'],['needle'],from_date='2001',to_date='2001',workers=1,scan_workers=1,scan_backend='thread',scan_overlap=True).normalized()
             db=open_database(root);now=utc_now();sig=cdx_query_signature(cfg)
             with db:
                 db.executemany("INSERT INTO captures(original_url,timestamp,query_signature,mimetype,statuscode,length,state,created_at,updated_at) VALUES(?,'20010101000000',?,'text/html','200',100,'pending',?,?)",[(f'http://example.com/{i}',sig,now,now) for i in range(2)])

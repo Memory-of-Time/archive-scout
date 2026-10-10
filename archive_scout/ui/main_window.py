@@ -408,6 +408,9 @@ class ArchiveScoutApp(tk.Tk):
         self.sidebar_page = ScrollablePage(workspace, padding=(6, 10), frame_style="Sidebar.TFrame")
         self.sidebar_page.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
         self.sidebar_page.configure(width=212)
+        self.sidebar_page.grid_propagate(False)
+        self.sidebar_page.canvas.configure(width=192)
+        workspace.columnconfigure(0, minsize=212, weight=0)
         self.sidebar = self.sidebar_page.body
         self.sidebar.columnconfigure(0, weight=1)
         ttk.Label(self.sidebar, text="WORKSPACE", style="Sidebar.TLabel", font="TkHeadingFont").pack(fill="x", padx=10, pady=(0, 8))
@@ -433,6 +436,10 @@ class ArchiveScoutApp(tk.Tk):
         self.create_history_tab()
         self.create_errors_tab()
         self.create_activity_tab()
+        for tree in (self.results_tree, self.ai_results_tree, self.research_results_tree,
+                     self.history_tree, self.errors_tree, self.site_issues_tree):
+            tree.bind("<Control-c>", lambda _e, t=tree: self.copy_tree_selection(t), add=True)
+            tree.bind("<Command-c>", lambda _e, t=tree: self.copy_tree_selection(t), add=True)
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self.update_navigation_selection())
         self.refresh_navigation()
 
@@ -1541,11 +1548,25 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(bottom, text="Copy URL", command=self.copy_selected_research_url).grid(row=1, column=1, sticky="w", padx=5, pady=(6, 0))
         pane.add(bottom, weight=1)
 
+    def copy_tree_selection(self, tree: ttk.Treeview) -> str:
+        """Copy visible, selected cells including full URLs and error messages."""
+        columns = list(tree["columns"])
+        rows = []
+        for item in tree.selection():
+            values = [str(tree.set(item, column)).replace("\t", " ").replace("\n", " ")
+                      for column in columns]
+            rows.append("\t".join(values))
+        if rows:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(rows))
+        return "break"
+
     def create_history_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=8)
+        page = ScrollablePage(self.notebook, padding=8)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        self.notebook.add(tab, text="Scan history")
+        self.notebook.add(page, text="Scan history")
         columns = ("id", "set", "status", "started", "documents", "matches", "seconds", "operation")
         self.history_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="extended")
         for column in columns:
@@ -1566,11 +1587,12 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(buttons, text="Compare two scans", command=self.compare_selected_scans).grid(row=0, column=4, padx=2)
 
     def create_errors_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=8)
+        page = ScrollablePage(self.notebook, padding=8)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=2)
-        tab.rowconfigure(3, weight=1)
-        self.notebook.add(tab, text="Errors")
+        tab.rowconfigure(4, weight=1)
+        self.notebook.add(page, text="Errors")
 
         controls = ttk.Frame(tab)
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 6))

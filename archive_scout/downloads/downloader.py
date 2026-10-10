@@ -1200,8 +1200,9 @@ def _acquire_archive(
 
     Full scans and download-only operations intentionally share this exact path.
     Download-only avoids parsing, scoring, media extraction and report work.
-    Full modes can overlap bounded local scanning with replay acquisition. Final files are atomic and the
-    manifest is updated in bounded batches so acquisition remains network-bound.
+    Retained scans run after acquisition by default, keeping CPU-heavy local work
+    off the healthy replay path. Explicit overlap and discard spool scans remain
+    bounded. Final files are atomic and manifest updates are batched.
     """
     if config.download_scope == "index_only":
         if callback:
@@ -1266,6 +1267,10 @@ def _acquire_archive(
     success_buffer: list[tuple[str, str, str, str, str, int, str, int, int, int, str]] = []
     skipped_buffer: list[tuple[int, str]] = []
     error_buffer: list[tuple[int, dict[str, object], BaseException]] = []
+    fresh_buffer: dict[int, int] = {}
+    # One compact event per committed batch; no extra database reads or threads.
+    commit_windows: deque[tuple[float, int, int]] = deque()
+    fresh_committed = fresh_bytes_committed = 0
 
     local_scan_mode = bool(scan_jobs) and (discard_mode or config.scan_overlap)
     scan_budget = ScanByteBudget(config.scan_memory_mb)
@@ -1323,7 +1328,7 @@ def _acquire_archive(
         }
 
     def flush_results(force: bool = False) -> None:
-        nonlocal last_flush
+        nonlocal last_flush, fresh_committed, fresh_bytes_committed
         pending_count = len(success_buffer) + len(skipped_buffer) + len(error_buffer)
         if not pending_count:
             return
@@ -1392,6 +1397,17 @@ def _acquire_archive(
                         ),
                         target=str(item["original_url"]), http_status=status,
                     )
+        # The transaction above completed successfully: never count staged or
+        # adopted files as a new committed remote save.
+        committed_count = len(fresh_buffer)
+        committed_bytes = sum(fresh_buffer.values())
+        if committed_count:
+            fresh_committed += committed_count
+            fresh_bytes_committed += committed_bytes
+            commit_windows.append((time.monotonic(), committed_count, committed_bytes))
+        while commit_windows and commit_windows[0][0] < time.monotonic() - 300.0:
+            commit_windows.popleft()
+        fresh_buffer.clear()
         success_buffer.clear()
         skipped_buffer.clear()
         error_buffer.clear()
@@ -1571,6 +1587,14 @@ def _acquire_archive(
         scheduled_rate_pause = float(metrics["rate_limit_wait_seconds"])
         network_seconds = float(metrics.get("network_seconds", 0.0))
         network_bytes = int(metrics.get("network_bytes", 0))
+        while commit_windows and commit_windows[0][0] < now - 300.0:
+            commit_windows.popleft()
+        def committed_rate(seconds: int) -> float:
+            # Short initial windows use actual elapsed time; subsequent ones
+            # include idle periods, revealing stalls rather than hiding them.
+            count = sum(n for stamp, n, _ in commit_windows if stamp >= now - seconds)
+            return count / max(0.001, min(float(seconds), elapsed))
+        rate10, rate60, rate300 = (committed_rate(seconds) for seconds in (10, 60, 300))
         label = "Download-only" if progress_stage == "download_only" else "Acquisition"
         discard_detail = (
             f"; scanned {scan_completed:,}; scan errors {scan_failures:,}; spool {spool_bytes / (1024*1024):.1f} MiB; "
@@ -1580,8 +1604,9 @@ def _acquire_archive(
         callback(ProgressEvent(
             progress_stage,
             f"{label}: wire request starts {starts:,} ({starts/elapsed:.1f}/s); "
-            f"responses {completions:,}; transport failures {request_failures:,}; "
-            f"saved {downloaded:,} ({downloaded/elapsed:.1f}/s); retries {retries:,}; "
+            f"responses {completions:,}; request failures (HTTP/transport) {request_failures:,}; "
+            f"saved {downloaded:,} (fresh committed {fresh_committed:,}, "
+            f"10/60/300s {rate10:.2f}/{rate60:.2f}/{rate300:.2f}/s); retries {retries:,}; "
             f"worker waits {worker_wait_seconds:.1f}s; scheduled rate pauses {scheduled_rate_pause:.1f}s; "
             f"skipped {skipped + metadata_skipped + url_skipped:,}; errors {failures:,}; {settled:,}/{total:,}" + discard_detail,
             min(settled, total), total,
@@ -1591,13 +1616,19 @@ def _acquire_archive(
                 "replay_start_rate": starts / elapsed,
                 "http_completions": completions,
                 "network_retries": retries,
-                "transport_failures": request_failures,
+                "transport_failures": request_failures,  # legacy consumer key; includes HTTP responses
+                "request_failures": request_failures,
                 "worker_wait_seconds": worker_wait_seconds,
                 "scheduled_rate_pause_seconds": scheduled_rate_pause,
                 "network_seconds": network_seconds,
                 "network_bytes": network_bytes,
                 "downloaded": downloaded,
                 "download_rate": downloaded / elapsed,
+                "fresh_committed": fresh_committed,
+                "fresh_committed_bytes": fresh_bytes_committed,
+                "fresh_save_rate_10s": rate10,
+                "fresh_save_rate_60s": rate60,
+                "fresh_save_rate_300s": rate300,
                 "skipped": skipped + metadata_skipped + url_skipped,
                 "failures": failures,
                 "pending": max(0, total - settled),
@@ -1744,6 +1775,8 @@ def _acquire_archive(
                         CLASSIFIER_REVISION, capture_id, str(result.get("encoding") or ""),
                     ))
                     downloaded += 1
+                    if not adopted_existing:
+                        fresh_buffer[capture_id] = int(result["bytes_saved"])
                     if local_scan_mode:
                         scan_item = dict(item)
                         scan_item.update(result)

@@ -1,38 +1,44 @@
 # Archive Scout
 
-**Archive Scout 1.1.2** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
+**Archive Scout 1.1.3** is a cross-platform desktop research workspace for indexing, downloading, searching, reviewing, reconstructing, and analyzing public captures from the Internet Archive's Wayback Machine. The GUI and automation CLI share the same durable SQLite project engine. The current internal project schema is **13**.
 
 # Downloads
 - [Windows x64](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-Windows-x64.zip)
 - [Linux x64](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-Linux-x64.zip)
 - [macOS Universial (Intel + Apple Silicon)](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-macOS-Universal.zip)
 
-## v1.1.2 rollback
+## v1.1.3 selective restoration
 
-The interface returns to v1.0.0 and CDX indexing, replay acquisition and transport
-fallbacks return to the tagged v1.0.2 implementation. Adaptive request spacing,
-escalating application cooldowns, connection-wide recovery gates, pool renewal,
-backend retry heaps and experimental ETA controls are removed. Fixed request
-spacing remains 2.5 seconds for indexing and 0.125 seconds for replay. A live
-429/503 honors Retry-After, including zero; without that header it waits five
-seconds. Network retries use fixed waits and preserve the durable queue.
+Builds on the **v1.1.2 selective rollback** (v1.0.0-style GUI and v1.0.2 fixed-rate
+indexing/replay foundation) without reintroducing adaptive rate limiting, escalating
+application cooldowns or long-lived recovery cycles. Index requests still use
+at least 2.5 seconds between attempts and replay attempts at least 0.125 seconds.
+Server Retry-After deadlines remain binding; a live 429/503 without one still
+uses the established fixed five-second fallback.
 
-Retained corrections protect schema13 projects, complete source decoding,
-archive-only redirect routing, safe backup/restore, immutable imports and
-complete analysis results. Local scanners use bounded memory and can continue
-while replay requests wait. Existing project databases are never downgraded.
-Historical adaptive settings are ignored. Saved server deadlines remain valid.
+**New retained text operations acquire first and then scan the durable backlog by
+default.** Projects that explicitly saved `scan_overlap=true` retain it, and
+scan-and-discard still uses bounded local scans to reclaim its spool. The GUI
+now has a constrained sidebar, accessible wide forms, moderated wheel handling,
+clearer field borders and copyable table selections. Network fallback
+periodically rechecks the pooled primary on a real request after 32 fallback
+successes. The acquisition progress reports rolling, post-commit fresh saves
+separately from existing/adopted files.
 
-Local test evidence accompanies this complete source delivery separately. These do not establish
-overnight Internet Archive consistency or identify the initial connection-failure
-cause. Use `scripts/run_tests.py`, `scripts/verify_release.py` and the Tests workflow
-for validation of your checkout.
+No schema migration is required (schema 13). The existing Aho/regex scanner,
+text/media routing, stored evidence, full-text indexing, project settings,
+per-target overrides, and GUI/CLI contracts remain intact. The release has
+local regression coverage and GitHub Actions workflows, but **not** a proven
+multi-day live Wayback throughput result.
 
-## Run this complete source repository
+## Apply the v1.1.3 patch to v1.1.2
 
-Extract into a new, empty directory and use Python 3.11 or newer. Keep existing
-research project folders separate. The source ZIP already contains the cleanup;
-no old patch files or cleanup helpers are required.
+Use the v1.1.2 complete repository as the base. Extract the v1.1.3 patch ZIP
+into the repository root, preserving its directory structure and replacing only
+matching source files. Do **not** extract these files into an Archive Scout
+research project directory or delete your existing saved project databases.
+
+Install in a fresh environment with Python 3.11+ and run:
 
 ```powershell
 python -m pip install .
@@ -43,10 +49,12 @@ python scripts/verify_packaged_scan.py --encoding-stress
 python run_app.py
 ```
 
-The CLI entry point is `python run_cli.py --help`. Windows/Linux/macOS release
-builds are configured under `.github/workflows/build-and-release.yml`.
+The CLI entry point is `python run_cli.py --help`. The `.github/workflows/tests.yml`
+workflow covers Ubuntu, Windows, and macOS with Python 3.11/3.12; it must be
+run on your release commit before publishing a native build. Review
+`RELEASE_NOTES.md` for changes and remaining validation limits.
 
-## v1.1.2 features
+## v1.1.3 features
 
 - Resume-first CDX/Timemap indexing with durable page/window checkpoints and a conservative shared **2.5-second index request-attempt interval (24/minute)**.
 - Independent replay pacing at **0.125 seconds per actual request attempt (8/second)**. Redirect hops, retries, and transport-backend fallbacks are paced and counted at the wire-attempt boundary.

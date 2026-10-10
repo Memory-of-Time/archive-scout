@@ -428,7 +428,7 @@ class ProjectConfig:
     workers: int = 10
     scan_workers: int = 0
     scan_backend: str = "auto"
-    scan_overlap: bool = True
+    scan_overlap: bool = False
     scan_memory_mb: float = 256.0
     download_scope: str = "all_text"
     text_retention: str = "keep"
@@ -790,7 +790,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         workers=loaded_workers,
         scan_workers=int(payload.get("scan_workers", 0)),
         scan_backend=str(payload.get("scan_backend", "auto")),
-        scan_overlap=bool(payload.get("scan_overlap", True)),
+        scan_overlap=bool(payload.get("scan_overlap", False)),
         scan_memory_mb=float(payload.get("scan_memory_mb", 256.0)),
         download_scope=str(payload.get("download_scope", "all_text")),
         text_retention=str(payload.get("text_retention", "keep")),
