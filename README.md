@@ -4,7 +4,7 @@
 
 # Downloads
 - [Windows x64](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-Windows-x64.zip)
-- [Linux x64](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-Linux-x64.zip)
+- [Linux x64](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-Linux-x64.tar.gz)
 - [macOS Universial (Intel + Apple Silicon)](https://github.com/Memory-of-Time/archive-scout/releases/download/latest/ArchiveScout-macOS-Universal.zip)
 
 ## v1.1.3 selective restoration
