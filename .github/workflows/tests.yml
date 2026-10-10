@@ -61,7 +61,7 @@ jobs:
         run: >-
           python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.1.2';
+          assert importlib.metadata.version('archive-scout') == '1.1.3';
           print('Archive Scout native accelerator imports and metadata checks passed')"
 
       - name: Run tests
@@ -78,6 +78,7 @@ jobs:
         run: |
           python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
           python scripts/benchmark_request_spacing.py --admissions 10000 --output validation/request-spacing.json
+          python scripts/benchmark_scan_pipeline.py . --count 48 --repeat 1 --output validation/scan-spawn-smoke.json
 
       - name: Upload validation evidence
         if: always()
