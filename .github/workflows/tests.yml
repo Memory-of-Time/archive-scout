@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-15]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip check
+      - name: Compile
+        run: python -m compileall -q archive_scout tests scripts
+      - name: Verify release
+        run: python scripts/verify_release.py
+      - name: Run tests
+        run: python scripts/run_tests.py --output validation/test-results
+      - name: GUI layout and page regression tests (Linux virtual display)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb
+          fi
+          xvfb-run -a -s '-screen 0 1280x800x24' python -m unittest \
+            tests.unit.test_v123_ci_layout \
+            tests.unit.test_v123_restoration.GuiRestorationTests \
+            tests.unit.test_v122_cdx_gui_speed.GUIThemeTests -v
+      - name: Offline benchmark smoke test
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.12'
+        run: python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ matrix.os }}-${{ matrix.python-version }}
+          path: validation/
+          if-no-files-found: warn
