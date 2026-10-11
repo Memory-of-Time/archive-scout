@@ -6,7 +6,7 @@
 
 | Windows | macOS | Linux |
 |---|---|---|
-| [**Download for Windows (x64)**](https://github.com/Memory-of-Time/archive-scout-testing/releases/latest/download/Scout-Windows-x64.zip) | [**Download for macOS (Universal)**](https://github.com/Memory-of-Time/archive-scout-testing/releases/latest/download/Scout-macOS-Universal.zip) | [**Download for Linux (x64)**](https://github.com/Memory-of-Time/archive-scout-testing/releases/latest/download/Scout-Linux-x64.tar.gz) |
+| [**Download for Windows (x64)**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/Scout-Windows-x64.zip) | [**Download for macOS (Universal)**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/Scout-macOS-Universal.zip) | [**Download for Linux (x64)**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/Scout-Linux-x64.tar.gz) |
 
 [All releases](https://github.com/Memory-of-Time/archive-scout-testing/releases) · [Report an issue](https://github.com/Memory-of-Time/archive-scout-testing/issues)
 
