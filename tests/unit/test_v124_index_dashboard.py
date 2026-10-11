@@ -99,6 +99,35 @@ class IndexingIdentityTests(unittest.TestCase):
 
 
 class DashboardManualTests(unittest.TestCase):
+    def test_real_app_refresh_does_not_require_nonexistent_project_identity(self):
+        """A lightweight UI fake must not mask missing ArchiveScoutApp methods."""
+        class Var:
+            def __init__(self, value=''): self.value=value
+            def get(self): return self.value
+            def set(self, value): self.value=value
+        class Events:
+            def __init__(self): self.calls=[]
+            def put(self, event): self.calls.append(event)
+        class ThreadStub:
+            def __init__(self, target, **_kwargs): self.target=target
+            def start(self): self.target()
+        class FakeApp:
+            def __init__(self):
+                self.output_var=Var('/tmp/scout-dashboard-hotfix')
+                self.dashboard_project_var=Var()
+                self.dashboard_last_refresh_var=Var()
+                self.dashboard_refresh=DashboardRefreshController(mode='auto')
+                self.events=Events()
+            # Intentionally NO project_identity() method: actual Tk app lacks it.
+        app=FakeApp()
+        for manual in (True, False):
+            app.dashboard_refresh.switch_project()
+            with patch('archive_scout.ui.main_window.threading.Thread', ThreadStub), \
+                 patch('archive_scout.ui.main_window.read_dashboard_counts', return_value={'captures': 10}):
+                ArchiveScoutApp.refresh_dashboard(app, manual=manual)
+            self.assertEqual(app.events.calls[-1][0], 'dashboard')
+            self.assertIn('Refreshing', app.dashboard_last_refresh_var.get())
+
     def test_explicit_refresh_has_generous_deadline_without_polling(self):
         class Var:
             def __init__(self,value): self.v=value
