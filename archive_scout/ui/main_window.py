@@ -214,7 +214,7 @@ class ArchiveScoutApp(tk.Tk):
         self.workers_var = tk.StringVar(value="10")
         self.max_file_var = tk.StringVar(value="25")
         self.minimum_score_var = tk.StringVar(value="1")
-        self.cdx_delay_var = tk.StringVar(value="2.5")
+        self.cdx_delay_var = tk.StringVar(value="1.5")
         self.download_delay_var = tk.StringVar(value="0.125")
         self.rate_limit_base_var = tk.StringVar(value="5")
         self.rate_limit_max_var = tk.StringVar(value="5")
@@ -1107,7 +1107,7 @@ class ArchiveScoutApp(tk.Tk):
             
             
             ("Maximum text-page budget (MB)", self.max_file_var),
-            ("Index/CDX spacing (2.5 sec = 24/min shared ceiling)", self.cdx_delay_var),
+            ("Index/CDX spacing (1.5 sec = 24/min shared ceiling)", self.cdx_delay_var),
             ("Replay spacing (0.125 sec = 8/sec shared ceiling)", self.download_delay_var),
         ]
         for row, (label, variable) in enumerate(perf_rows):
