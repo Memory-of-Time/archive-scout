@@ -25,7 +25,7 @@ from archive_scout.utils import atomic_write_bytes
 class LeanRebuildTests(unittest.TestCase):
     def test_default_clocks_and_parallel_index_settings(self):
         config = ProjectConfig(Path('.'), text_collapse_scope="year", targets=['example.com/*'], keywords=['needle']).normalized()
-        self.assertEqual(config.cdx_delay, 2.5)
+        self.assertEqual(config.cdx_delay, 1.5)
         self.assertEqual(config.download_delay, 0.125)
         self.assertEqual(config.network.cdx_workers, 10)
         self.assertEqual(config.workers, 10)

@@ -33,7 +33,7 @@ class FeatureRestorationTests(unittest.TestCase):
 
     def test_automatic_resume_preserves_existing_paged_work_and_fixed_policy(self):
         config = ProjectConfig(output_dir=Path('.'), targets=['example.com/*'], keywords=['text']).normalized()
-        self.assertEqual(config.cdx_delay, 2.5)
+        self.assertEqual(config.cdx_delay, 1.5)
         self.assertEqual(config.download_delay, 0.125)
         self.assertEqual(preferred_index_strategy(config, 'example.com/*'), 'resume')
         old = PendingWindow('20010101000000', '20011231235959', strategy='paged', page=740,

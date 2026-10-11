@@ -25,7 +25,7 @@ class V105ReleaseTests(unittest.TestCase):
         self.assertEqual(preferred_index_strategy(config, 'example.com/*'), 'resume')
         self.assertEqual(config.network.page_blocks, 0)
         self.assertEqual(config.network.cdx_workers, 10)
-        self.assertEqual(config.cdx_delay, 2.5)
+        self.assertEqual(config.cdx_delay, 1.5)
         self.assertIn('/web/timemap/json', cdx_paged_endpoints(config)[0])
         self.assertEqual(effective_page_workers(10, 9), 10)
 

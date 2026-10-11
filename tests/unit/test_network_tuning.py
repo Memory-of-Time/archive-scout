@@ -14,11 +14,18 @@ class NetworkTuningTests(unittest.TestCase):
     def test_new_projects_use_safe_edge_network_defaults(self):
         config = ProjectConfig(output_dir=Path("."), targets=["example.com/*"], keywords=[]).normalized()
         self.assertEqual(config.page_size, 100000)
-        self.assertEqual(config.cdx_delay, 2.5)
+        self.assertEqual(config.cdx_delay, 1.5)
         self.assertEqual(config.network.page_blocks, 0)
         self.assertEqual(config.network.cdx_workers, 10)
         self.assertEqual(config.workers, 10)
         self.assertEqual(config.download_delay, 0.125)
+
+    def test_explicit_per_project_cdx_spacing_override_is_preserved(self):
+        config = ProjectConfig(
+            output_dir=Path('.'), targets=['example.com/*'], keywords=[],
+            cdx_delay=2.5,
+        ).normalized()
+        self.assertEqual(config.cdx_delay, 2.5)
 
     def test_paged_and_resume_requests_use_larger_batches(self):
         config = ProjectConfig(
@@ -112,7 +119,7 @@ class NetworkTuningTests(unittest.TestCase):
             self.assertEqual(config.page_size, 100000)
             self.assertEqual(config.network.page_blocks, 9)
             self.assertEqual(config.network.cdx_workers, 10)
-            self.assertEqual(config.cdx_delay, 2.5)
+            self.assertEqual(config.cdx_delay, 1.5)
 
     def test_earlier_custom_network_settings_are_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -132,7 +139,7 @@ class NetworkTuningTests(unittest.TestCase):
             self.assertEqual(config.page_size, 25000)
             self.assertEqual(config.network.page_blocks, 5)
             self.assertEqual(config.network.cdx_workers, 4)
-            self.assertEqual(config.cdx_delay, 2.5)
+            self.assertEqual(config.cdx_delay, 1.5)
 
 
 if __name__ == "__main__":
