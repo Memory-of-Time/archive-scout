@@ -415,7 +415,7 @@ class ProjectConfig:
     minimum_score: int = 1
     max_file_mb: float = 25.0
     page_size: int = 100000
-    cdx_delay: float = 2.5
+    cdx_delay: float = 1.5
     download_delay: float = 0.125
     retries: int = 4
     rate_limit_base_pause: float = 5.0
