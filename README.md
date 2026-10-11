@@ -10,8 +10,6 @@
 
 [All releases](https://github.com/Memory-of-Time/archive-scout-testing/releases) · [Report an issue](https://github.com/Memory-of-Time/archive-scout-testing/issues)
 
-> These download links resolve once the first GitHub release with matching assets is published. They currently target the verified development repository. If Scout is moved to a new public repository, update the three links and the adjacent links before publishing. The release workflow automatically creates these exact filenames.
-
 ## What Scout does
 
 - Index Wayback CDX inventories with restartable resume-key and paged traversal, query compatibility, and durable checkpoints.
