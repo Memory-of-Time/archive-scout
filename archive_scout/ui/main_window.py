@@ -615,8 +615,6 @@ class ArchiveScoutApp(tk.Tk):
         self._refresh_dashboard_media_policy_summary()
 
     def refresh_dashboard(self, manual: bool = True) -> None:
-        if self.__dict__.get("project_restore_identity") == self.project_identity():
-            return
         root = Path(self.output_var.get()).expanduser()
         self.dashboard_project_var.set(str(root))
         token = self.dashboard_refresh.begin(time.monotonic(), manual=manual)
