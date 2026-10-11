@@ -1,0 +1,24 @@
+{
+  "version": "1.0.5",
+  "output_dir": "./archive-scout-project",
+  "targets": ["example.com/*"],
+  "keywords": ["video", "archive"],
+  "from_year": 2000,
+  "to_year": 2015,
+  "network": {
+    "index_strategy": "auto",
+    "page_blocks": 0,
+    "cdx_workers": 10
+  },
+  "ai": {
+    "provider": "openai",
+    "model": "gpt-5-mini"
+  },
+  "research": {
+    "enabled": true,
+    "auto_build": true,
+    "vector_backend": "local-hash",
+    "entity_extraction": true,
+    "duplicate_clustering": true
+  }
+}
