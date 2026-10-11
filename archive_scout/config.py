@@ -615,7 +615,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     network_payload = payload.get("network") or {}
     report_payload = payload.get("report") or {}
     loaded_page_size = int(payload.get("page_size", 100000))
-    loaded_cdx_delay = float(payload.get("cdx_delay", 2.5))
+    loaded_cdx_delay = float(payload.get("cdx_delay", 1.5))
     loaded_page_blocks = int(network_payload.get("page_blocks", 0))
     loaded_cdx_workers = int(network_payload.get("cdx_workers", 10))
     loaded_workers = int(payload.get("workers", 10))
