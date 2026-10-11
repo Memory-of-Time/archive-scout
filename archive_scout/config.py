@@ -676,7 +676,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     # Migrate only historical untouched 0.75-second defaults; an explicit
     # custom interval other than that historical default is preserved.
     if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) != VERSION:
-        loaded_cdx_delay = 2.5
+        loaded_cdx_delay = 1.5
     # v1.0.3 shipped conservative replay defaults (4 workers, 0.5 s
     # between request starts). Upgrade only that untouched pair to the v1.0.4
     # high-throughput replay profile: ten persistent connections and eight
