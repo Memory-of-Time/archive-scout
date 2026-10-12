@@ -10,8 +10,6 @@
 
 [All releases](https://github.com/Memory-of-Time/archive-scout/releases) · [Report an issue](https://github.com/Memory-of-Time/archive-scout/issues)
 
-> Release download links work only after the matching assets are published on GitHub. The build workflow defines these filenames; a successful local test does not mean binaries have been published.
-
 ## What Scout does
 
 - Index Wayback CDX inventories with restartable resume-key and paged traversal, query compatibility, and durable checkpoints.
