@@ -84,7 +84,8 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             self.assertEqual(original["counts"]["documents"], 1)
             shutil.move(str(old_root), str(new_root))
             loaded = load_project_config(new_root / "project.json")
-            self.assertEqual(loaded.output_dir, new_root)
+            self.assertTrue(loaded.output_dir.samefile(new_root),
+                            "Reopened project must point to the relocated directory")
             self.assertEqual(loaded.cdx_delay, 2.5)
             self.assertEqual(cdx_query_signature(loaded), signature)
             db = open_database(new_root)
@@ -94,7 +95,8 @@ class V120V121ResumeCompatibility(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)
                 path = db.execute("SELECT path FROM documents WHERE capture_id=1").fetchone()[0]
-                self.assertEqual(Path(path), new_root / "captures/resume_test.txt")
+                self.assertTrue(Path(path).samefile(new_root / "captures/resume_test.txt"),
+                                "Stored document must resolve to the existing relocated file")
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloading'").fetchone()[0], 0)
                 self.assertGreater(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0], 0)
                 self.assertGreater(db.execute("SELECT COUNT(*) FROM captures WHERE state='error'").fetchone()[0], 0)
