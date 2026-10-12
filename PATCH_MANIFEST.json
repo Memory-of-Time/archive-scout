@@ -1,0 +1,18 @@
+{
+  "release": "Scout v1.2.1 Cross-Platform Resume CI Hotfix 3",
+  "workflow_run": 38283078391,
+  "base_commit": "b2bb70871fd66833281f9fba2bea97c575fe91d0",
+  "source_changes": [
+    "tests/unit/test_v121_v120_upgrade_compat.py"
+  ],
+  "local_tests": {
+    "tests_run": 295,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6,
+    "environment": "Linux Python 3.13.5"
+  },
+  "sha256": {
+    "tests/unit/test_v121_v120_upgrade_compat.py": "1bf48ed689a2cac9e0df3b708d9669f9dc9d546bb5b51d7ef8f8d3070b34af63"
+  }
+}
