@@ -67,7 +67,7 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: Authenticode-sign Scout.exe
+      - name: Authenticode-sign ArchiveScout.exe
         if: vars.ENABLE_WINDOWS_ARTIFACT_SIGNING == 'true'
         uses: azure/artifact-signing-action@v2
         with:
@@ -75,12 +75,12 @@ jobs:
           signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.WINDOWS_SIGNING_PROFILE_NAME }}
           files: |
-            ${{ github.workspace }}\dist\Scout\Scout.exe
-            ${{ github.workspace }}\dist\ScoutCLI\ScoutCLI.exe
+            ${{ github.workspace }}\dist\ArchiveScout\ArchiveScout.exe
+            ${{ github.workspace }}\dist\ArchiveScoutCLI\ArchiveScoutCLI.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
-          description: Scout
+          description: Archive Scout
           description-url: https://github.com/${{ github.repository }}
       - name: Package only after signature verification
         if: vars.ENABLE_WINDOWS_ARTIFACT_SIGNING == 'true'
@@ -88,13 +88,13 @@ jobs:
         run: ./scripts/build_windows.ps1 -SkipBuild -RequireSigned
       - name: Verify Windows CLI executable
         shell: pwsh
-        run: .\dist\ScoutCLI\ScoutCLI.exe --help | Out-Null
+        run: .\dist\ArchiveScoutCLI\ArchiveScoutCLI.exe --help | Out-Null
       - name: Verify Windows release files
         shell: pwsh
         run: |
           $files = @(
-            "release/Scout-Windows-x64.zip",
-            "release/Scout-Windows-x64.zip.sha256"
+            "release/ArchiveScout-Windows-x64.zip",
+            "release/ArchiveScout-Windows-x64.zip.sha256"
           )
           foreach ($file in $files) {
             if (-not (Test-Path $file)) { throw "Missing release file: $file" }
@@ -103,10 +103,10 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Scout-Windows-x64
+          name: ArchiveScout-Windows-x64
           path: |
-            release/Scout-Windows-x64.zip
-            release/Scout-Windows-x64.zip.sha256
+            release/ArchiveScout-Windows-x64.zip
+            release/ArchiveScout-Windows-x64.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -134,19 +134,19 @@ jobs:
       - name: Build Linux x64 package
         run: bash scripts/build_linux.sh
       - name: Verify Linux CLI executable
-        run: ./dist/ScoutCLI/ScoutCLI --help >/dev/null
+        run: ./dist/ArchiveScoutCLI/ArchiveScoutCLI --help >/dev/null
       - name: Verify Linux release files
         run: |
-          test -f release/Scout-Linux-x64.tar.gz
-          test -f release/Scout-Linux-x64.tar.gz.sha256
+          test -f release/ArchiveScout-Linux-x64.tar.gz
+          test -f release/ArchiveScout-Linux-x64.tar.gz.sha256
           ls -lah release
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Scout-Linux-x64
+          name: ArchiveScout-Linux-x64
           path: |
-            release/Scout-Linux-x64.tar.gz
-            release/Scout-Linux-x64.tar.gz.sha256
+            release/ArchiveScout-Linux-x64.tar.gz
+            release/ArchiveScout-Linux-x64.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -175,16 +175,16 @@ jobs:
         run: bash scripts/build_macos.sh
       - name: Verify macOS release files
         run: |
-          test -f release/Scout-macOS-Universal.zip
-          test -f release/Scout-macOS-Universal.zip.sha256
+          test -f release/ArchiveScout-macOS-Universal.zip
+          test -f release/ArchiveScout-macOS-Universal.zip.sha256
           ls -lah release
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Scout-macOS-Universal
+          name: ArchiveScout-macOS-Universal
           path: |
-            release/Scout-macOS-Universal.zip
-            release/Scout-macOS-Universal.zip.sha256
+            release/ArchiveScout-macOS-Universal.zip
+            release/ArchiveScout-macOS-Universal.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -203,12 +203,12 @@ jobs:
         run: |
           set -euo pipefail
           required_files=(
-            "Scout-Windows-x64.zip"
-            "Scout-Windows-x64.zip.sha256"
-            "Scout-Linux-x64.tar.gz"
-            "Scout-Linux-x64.tar.gz.sha256"
-            "Scout-macOS-Universal.zip"
-            "Scout-macOS-Universal.zip.sha256"
+            "ArchiveScout-Windows-x64.zip"
+            "ArchiveScout-Windows-x64.zip.sha256"
+            "ArchiveScout-Linux-x64.tar.gz"
+            "ArchiveScout-Linux-x64.tar.gz.sha256"
+            "ArchiveScout-macOS-Universal.zip"
+            "ArchiveScout-macOS-Universal.zip.sha256"
           )
           for file in "${required_files[@]}"; do
             test -f "release-assets/$file" || {
@@ -226,15 +226,15 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Scout $TAG" \
+              --title "Archive Scout $TAG" \
               --generate-notes
           fi
           gh release upload "$TAG" \
-            release-assets/Scout-Windows-x64.zip \
-            release-assets/Scout-Windows-x64.zip.sha256 \
-            release-assets/Scout-Linux-x64.tar.gz \
-            release-assets/Scout-Linux-x64.tar.gz.sha256 \
-            release-assets/Scout-macOS-Universal.zip \
-            release-assets/Scout-macOS-Universal.zip.sha256 \
+            release-assets/ArchiveScout-Windows-x64.zip \
+            release-assets/ArchiveScout-Windows-x64.zip.sha256 \
+            release-assets/ArchiveScout-Linux-x64.tar.gz \
+            release-assets/ArchiveScout-Linux-x64.tar.gz.sha256 \
+            release-assets/ArchiveScout-macOS-Universal.zip \
+            release-assets/ArchiveScout-macOS-Universal.zip.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
