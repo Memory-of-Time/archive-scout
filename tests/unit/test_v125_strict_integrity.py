@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import closing
 import sqlite3
 import tempfile
 import threading
@@ -285,7 +286,7 @@ class DurableMediaRecovery(unittest.TestCase):
             with patch('archive_scout.projects.backups.create_project_backup',side_effect=PermissionError('backup denied')):
                 with self.assertRaises(PermissionError):
                     open_database(root)
-            with sqlite3.connect(root/'archive_scout.sqlite3') as raw:
+            with closing(sqlite3.connect(root/'archive_scout.sqlite3')) as raw:
                 self.assertEqual(raw.execute('SELECT version FROM schema_info').fetchone()[0],9)
             db=open_database(root)
             try:

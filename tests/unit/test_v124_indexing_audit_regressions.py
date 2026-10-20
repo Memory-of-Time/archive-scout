@@ -83,17 +83,21 @@ class IndexAuditV124(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             cfg = project(Path(temp), ['example.com/*'])
             cfg.skip_slow_index_targets = True
-            cfg.index_target_minutes = 0.00005
+            cfg.index_target_minutes = 0.001  # 60 ms of active indexing work.
             cfg = cfg.normalized()
             db = open_database(cfg.output_dir)
             calls = []
+            # A simulated clock makes budget expiry deterministic on slow CI
+            # runners: admit one request, then expire before its continuation.
+            from time import monotonic
+            clock = [monotonic()]
             def response(_client, urls, params, **kwargs):
-                import time
                 calls.append(dict(params).get('resumeKey'))
-                time.sleep(0.01)
+                clock[0] += 1.0
                 return CDXRows([('20010101010101', 'http://example.com/a', 'text/html', '200', 'A', '1')], 'cursor1')
             try:
-                with patch.object(HttpClient, 'get_cdx_any', response):
+                with patch('archive_scout.cdx.indexer.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(HttpClient, 'get_cdx_any', response):
                     deferred = index_archive(cfg, db, threading.Event())
                 self.assertTrue(deferred)
                 self.assertEqual(len(calls), 1)
