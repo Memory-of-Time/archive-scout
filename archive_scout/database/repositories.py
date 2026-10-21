@@ -254,7 +254,7 @@ def upsert_document(
 ) -> int:
     now = utc_now()
     row = database.execute(
-        """SELECT id,path,title,links_json,content_hash,normalized_hash,size_bytes
+        """SELECT id,path,title,body_text,links_json,content_hash,normalized_hash,size_bytes
            FROM documents WHERE capture_id=?""",
         (capture_id,),
     ).fetchone()
@@ -266,6 +266,7 @@ def upsert_document(
             (
                 str(row["path"] or "") != str(path),
                 str(row["title"] or "") != title,
+                str(row["body_text"] or "") != body_text,
                 str(row["links_json"] or "") != links_json,
                 str(row["content_hash"] or "") != content_hash,
                 str(row["normalized_hash"] or "") != normalized_hash,

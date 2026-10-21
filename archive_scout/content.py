@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import codecs
 import re
 import urllib.parse
 from html.parser import HTMLParser
@@ -18,6 +19,7 @@ URL_PATTERN = re.compile(r'''(?ix)\b(?:https?://|ftp://|www\.)[^\s<>"'()\[\]{}]+
 TITLE_PATTERN = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 TAG_PATTERN = re.compile(r"(?is)<[^>]+>")
 CHARSET_PATTERN = re.compile(r"charset\s*=\s*['\"]?([A-Za-z0-9._-]+)", re.IGNORECASE)
+XML_ENCODING_PATTERN = re.compile(r"<\?xml[^>]*\bencoding\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 REPLAY_ERROR_MARKERS = (
     ("this url has been excluded from the wayback machine", "wayback_excluded"),
     ("blocked site error", "wayback_excluded"),
@@ -100,7 +102,15 @@ def decode_bytes(data: bytes, content_type: str = "") -> str:
     match = CHARSET_PATTERN.search(head)
     if match:
         candidates.append(match.group(1))
+    xml = XML_ENCODING_PATTERN.search(head)
+    if xml:
+        candidates.append(xml.group(1))
     candidates.extend(["utf-8", "windows-1252", "latin-1"])
+    html_content = ("html" in content_type.casefold() or b"<html" in data[:1024].lower()
+                    or b"<!doctype html" in data[:1024].lower())
+    if html_content:
+        candidates = ["windows-1252" if value.casefold() in
+                      {"iso-8859-1", "latin-1", "latin1"} else value for value in candidates]
     for encoding in dict.fromkeys(candidates):
         try:
             return data.decode(encoding)
@@ -142,15 +152,25 @@ def looks_textual_bytes(data: bytes, content_type: str = "") -> bool:
         return False
     if sample.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")):
         try:
-            decoded = decode_bytes(data[:min(len(data), 16384)], content_type)
+            # The classification buffer is only a prefix: unfinished codepoints
+            # at the boundary must not turn an otherwise valid body into media.
+            if sample.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+                codec = "utf-32"
+            elif sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+                codec = "utf-16"
+            else:
+                codec = "utf-8-sig"
+            decoder = codecs.getincrementaldecoder(codec)(errors="strict")
+            decoded = decoder.decode(data[:min(len(data), 16384)], final=False)
             return sum(ord(ch) < 9 or 13 < ord(ch) < 32 for ch in decoded[:4096]) / max(1, len(decoded[:4096])) < 0.04
-        except UnicodeError:
+        except (LookupError, UnicodeError):
             return False
     # UTF-16/32 without BOM is accepted only with an explicit supported charset.
     declared = CHARSET_PATTERN.search(content_type)
     if declared and declared.group(1).casefold().replace("_", "-").startswith(("utf-16", "utf-32")):
         try:
-            decoded = sample.decode(declared.group(1))
+            decoder = codecs.getincrementaldecoder(declared.group(1))(errors="strict")
+            decoded = decoder.decode(sample, final=False)
             return "\ufffd" not in decoded and sum(ord(ch) < 9 or 13 < ord(ch) < 32 for ch in decoded) / max(1, len(decoded)) < .04
         except (LookupError, UnicodeError):
             return False
@@ -228,6 +248,39 @@ def parse_page(raw: str, original: str) -> tuple[str, str, list[str]]:
             links.add(normalized)
     return title, visible, sorted(links)
 
+
+# A shared interpretation rule, used by acquisition, rescan, local import,
+# Hitlist and derived FTS body. A stray <token> in a .txt file is not HTML.
+MARKUP_PATH_SUFFIXES = frozenset({
+    ".html", ".htm", ".shtml", ".shtm", ".dhtml", ".dhtm", ".xhtml", ".xhtm",
+    ".phtml", ".phtm", ".php", ".php3", ".php4", ".php5", ".cgi",
+    ".asp", ".aspx", ".jsp", ".cfm",
+})
+
+
+def is_markup_representation(raw: str, original: str, content_type: str = "") -> bool:
+    mime = (content_type or "").split(";", 1)[0].strip().casefold()
+    if "html" in mime or mime == "application/xhtml+xml":
+        return True
+    parsed = safe_urlsplit(original)
+    path = urllib.parse.unquote(parsed.path if parsed else original).casefold()
+    if path.endswith(tuple(MARKUP_PATH_SUFFIXES)):
+        return True
+    # Historic captures frequently declare text/plain for HTML. Require
+    # unmistakable document structure rather than arbitrary angle brackets.
+    prefix = raw[:8192].lstrip().casefold()
+    if prefix.startswith(("<!doctype html", "<html", "<head", "<body")):
+        return True
+    return bool(re.search(r"<(?:(?:html|head|body)\b[^>]*>|title\b[^>]*>).*?</(?:html|head|body|title)\s*>",
+                          prefix, flags=re.S))
+
+
+def parse_text_representation(raw: str, original: str, content_type: str = "") -> tuple[str, str, list[str]]:
+    """Preserve actual plain text as FTS body; render only confirmed markup."""
+    if is_markup_representation(raw, original, content_type):
+        return parse_page(raw, original)
+    links = {normalize_link(value, original) for value in URL_PATTERN.findall(raw)}
+    return "", raw, sorted(link for link in links if link)
 
 def classify_replay_content(raw: str, final_url: str) -> str | None:
     """Return a specific Wayback replay problem when an error shell was saved as HTTP 200.

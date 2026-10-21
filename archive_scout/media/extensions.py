@@ -7,9 +7,10 @@ from urllib.parse import unquote, urlsplit
 
 from ..config import MediaConfig, normalize_extension
 from ..constants import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from ..classification import SUFFIX_NON_TEXT_IMAGES, SUFFIX_NON_TEXT_MEDIA
 
 
-MEDIA_SUFFIX_PATTERN = re.compile(r"(?i)(\.[a-z0-9]{1,10})(?=$|[?&#;])")
+MEDIA_SUFFIX_PATTERN = re.compile(r"(?i)(\.[a-z0-9-]{1,10})(?=$|[?&#;])")
 
 
 def extension_from_url(url: str) -> str:
@@ -17,7 +18,7 @@ def extension_from_url(url: str) -> str:
         parsed = urlsplit(url)
         path = unquote(parsed.path or "")
         suffix = Path(path).suffix.casefold()
-        if suffix and re.fullmatch(r"\.[a-z0-9]{1,10}", suffix, re.IGNORECASE):
+        if suffix and re.fullmatch(r"\.[a-z0-9-]{1,10}", suffix, re.IGNORECASE):
             return suffix
         # Some archived URLs contain tracking data attached with '&' or ';'
         # directly to the path, so pathlib sees '.jpg&ref=...' as the suffix.
@@ -38,9 +39,16 @@ def extension_from_url(url: str) -> str:
 def media_kind(extension: str, mimetype: str = "") -> str | None:
     extension = normalize_extension(extension)
     mime = (mimetype or "").split(";", 1)[0].casefold()
-    if extension in IMAGE_EXTENSIONS or mime.startswith("image/"):
+    # User-selected historical suffixes are preservation formats, not codecs.
+    # Keep their original UI Images/Videos group even if bytes are audio,
+    # a playlist/descriptor, or an opaque legacy container.
+    if extension in SUFFIX_NON_TEXT_IMAGES or extension in IMAGE_EXTENSIONS:
         return "image"
-    if extension in VIDEO_EXTENSIONS or mime.startswith("video/") or mime in {
+    if extension in SUFFIX_NON_TEXT_MEDIA or extension in VIDEO_EXTENSIONS:
+        return "video"
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("video/") or mime in {
         "application/x-shockwave-flash",
         "application/futuresplash",
         "application/vnd.rn-realmedia",

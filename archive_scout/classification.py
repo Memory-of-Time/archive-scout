@@ -187,7 +187,7 @@ def classify_payload_kind(data: bytes, content_type: str, original_url: str) -> 
     # Evidence from actual bytes outranks an incorrect archived MIME label.
     # Binary signatures above are definitive, but ordinary valid HTML can be
     # mislabeled as image/jpeg, and should still enter text scanning.
-    if not looks_textual_bytes(data, "text/plain"):
+    if not looks_textual_bytes(data, content_type):
         return ResourceDecision("other_binary", "payload:non_text", True)
     metadata = classify_indexed_resource(original_url, content_type)
     if metadata.resource_class == "media_descriptor":

@@ -129,7 +129,7 @@ def extension_filter_regex(extensions: list[str]) -> str:
     escaped = "|".join(re.escape(value) for value in values)
     # Historical sites frequently append broken tracking fragments such as
     # image.jpg&ref=thumb without a question mark. Accept those separators too.
-    return rf"(?i).*\.(?:{escaped})(?:$|[?&#;].*)"
+    return rf"(?i).*(?:\.|%2e)(?:{escaped})(?:$|[?&#;].*)"
 
 
 def build_media_params(

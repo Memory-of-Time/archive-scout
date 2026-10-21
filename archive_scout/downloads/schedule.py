@@ -39,7 +39,9 @@ def next_due(database: sqlite3.Connection, config=None) -> float | None:
         _populate_download_scopes(database, config)
         scope = """ AND EXISTS(SELECT 1 FROM targets t
             JOIN archive_scout_download_scopes sc ON sc.pattern=t.pattern
-            WHERE t.id=c.target_id AND sc.signature=c.query_signature)"""
+            WHERE sc.signature=c.query_signature AND (t.id=c.target_id OR EXISTS
+             (SELECT 1 FROM capture_target_membership m
+              WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
     else:
         scope = ""
     row = database.execute("""SELECT MIN(s.next_eligible_at) FROM text_retry_schedule s

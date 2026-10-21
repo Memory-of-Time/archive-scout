@@ -138,7 +138,6 @@ def validate_media_representation(response: dict, *, path_hint: str = "") -> Non
         raise RuntimeError("media response is not a complete successful representation")
     content_range = headers.get("content-range", "")
     if status == 206:
-        import re
         matched = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range)
         if not matched:
             raise RuntimeError("incomplete_media_range: partial response has no verifiable complete range")
@@ -154,6 +153,31 @@ def validate_media_representation(response: dict, *, path_hint: str = "") -> Non
         raise RuntimeError("incomplete_media_length: received bytes differ from Content-Length")
     if not _known_binary_prefix(prefix):
         stripped = prefix.lstrip(b"\xef\xbb\xbf\t\r\n ").lower()
+        # Recognized playlist/metafile sources are legitimate media assets,
+        # even when a historical response labels them text/html. Preserving
+        # the descriptor does not certify any streams it references.
+        from ..classification import MEDIA_DESCRIPTOR_EXTENSIONS, path_extension
+        suffix = path_extension(path_hint)
+        if suffix in MEDIA_DESCRIPTOR_EXTENSIONS:
+            # An XML declaration by itself is not evidence of a playable
+            # descriptor; Wayback error responses can also be XML documents.
+            source = re.sub(rb"^<\?xml[^>]*>\s*", b"", stripped[:2048])
+            root_tag = re.match(rb"<([a-z][a-z0-9:_-]*)(?:\s|>)", source)
+            root = root_tag.group(1).split(b":")[-1] if root_tag else b""
+            markup_descriptors = {
+                ".asx": {b"asx"}, ".wax": {b"asx"},
+                ".wvx": {b"asx"}, ".wmx": {b"asx"},
+                ".wpl": {b"smil", b"playlist"},
+                ".smil": {b"smil"}, ".smi": {b"smil"},
+                ".mpd": {b"mpd"},
+            }
+            valid_descriptor = root in markup_descriptors.get(suffix, set())
+            valid_descriptor = valid_descriptor or (
+                suffix in {".m3u", ".m3u8"} and stripped.startswith(b"#extm3u")
+            ) or (suffix == ".pls" and stripped.startswith(b"[playlist]"))
+            valid_descriptor = valid_descriptor or (suffix == ".vtt" and stripped.startswith(b"webvtt"))
+            if valid_descriptor and b"<html" not in stripped[:1024] and b"<title>wayback machine" not in stripped[:1024]:
+                return
         if (stripped.startswith((b"<!doctype html", b"<html", b"<?xml"))
                 or b"<html" in stripped[:512]
                 or b"<title>wayback machine" in stripped[:1024]):

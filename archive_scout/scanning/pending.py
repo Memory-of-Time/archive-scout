@@ -94,7 +94,9 @@ def _reconcile_legacy_pending(database: sqlite3.Connection, config) -> None:
         with database:
             database.execute("""UPDATE captures SET state='downloaded_unscanned',updated_at=?
                 WHERE state='downloaded' AND query_signature=?
-                AND target_id IN (SELECT id FROM targets WHERE pattern=?)
+                AND EXISTS (SELECT 1 FROM targets t WHERE t.pattern=? AND
+                    (t.id=captures.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
+                        WHERE m.capture_id=captures.id AND m.target_id=t.id)))
                 AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=captures.id)""",
                 (utc_now(),signature,target))
             database.execute("INSERT OR IGNORE INTO scout_scan_reconciled(signature,pattern) VALUES(?,?)", (signature,target))
@@ -113,11 +115,14 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
             """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.length,d.path,
                  v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
                  v.response_content_type AS response_content_type,v.final_url AS final_url
-               FROM captures c JOIN targets t ON t.id=c.target_id
+               FROM captures c
                LEFT JOIN documents d ON d.capture_id=c.id
                LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                WHERE c.state='downloaded_unscanned'
-               AND c.query_signature=? AND t.pattern IN (""" + target_slots + """)
+               AND c.query_signature=? AND EXISTS (SELECT 1 FROM targets t
+                   WHERE t.pattern IN (""" + target_slots + """) AND
+                   (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
+                       WHERE m.capture_id=c.id AND m.target_id=t.id)))
                AND c.id>? ORDER BY c.id LIMIT 500""",
             (signature, *targets, cursor_id),
         ).fetchall()
@@ -166,9 +171,12 @@ def scan_pending_saved(
                 raise Stopped
     # Indexed existence test replaces an unconditional project-wide COUNT.
     has_pending = database.execute(
-        """SELECT 1 FROM captures c JOIN targets t ON t.id=c.target_id
+        """SELECT 1 FROM captures c
            WHERE c.state='downloaded_unscanned'
-             AND c.query_signature=? AND t.pattern IN (""" + target_slots + ") LIMIT 1",
+             AND c.query_signature=? AND EXISTS (SELECT 1 FROM targets t
+                 WHERE t.pattern IN (""" + target_slots + """) AND
+                 (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
+                   WHERE m.capture_id=c.id AND m.target_id=t.id))) LIMIT 1""",
         (signature, *targets),
     ).fetchone()
     if not has_pending:
@@ -252,7 +260,7 @@ def scan_pending_saved(
                                     "UPDATE capture_routing SET routing='downloaded_scanned',updated_at=? WHERE capture_id=?",
                                     (utc_now(), result["capture_id"]),
                                 )
-                                resolve_errors(database, capture_id=result["capture_id"], document_id=document_id)
+                                resolve_errors(database, capture_id=result["capture_id"], document_id=document_id, operations=("scan",))
                             except Exception as exc:
                                 database.execute("ROLLBACK TO SAVEPOINT scout_capture_scan")
                                 if _sqlite_write_busy(exc):

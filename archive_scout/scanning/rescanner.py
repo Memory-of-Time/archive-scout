@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 from collections import deque
 
-from ..content import decode_bytes, parse_page
+from ..content import decode_bytes, parse_page, parse_text_representation
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
 from ..utils import hash_text, normalize_search
@@ -36,17 +36,22 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob]) -> dict
             return {"kind": "integrity", "row": row,
                     "error": "retained archive body differs from committed acquisition evidence"}
         raw = decode_bytes(saved_bytes, str(row.get("response_content_type") or row.get("mimetype") or ""))
-        document_changed = content_hash != str(row.get("content_hash") or "")
-        if not document_changed:
-            try:
-                title = str(row.get("title") or "")
-                visible = str(row.get("body_text") or "")
-                links_payload = json.loads(str(row.get("links_json") or "[]"))
-                links = [str(value) for value in links_payload] if isinstance(links_payload, list) else []
-            except (TypeError, ValueError, json.JSONDecodeError):
-                document_changed = True
-        if document_changed:
-            title, visible, links = parse_page(raw, str(row["original_url"]))
+        # Recreate derived content when rescanning, even if the retained file
+        # hash is unchanged. Parser/charset fixes must not certify old FTS text.
+        title, visible, links = parse_text_representation(
+            raw, str(row["original_url"]),
+            str(row.get("response_content_type") or row.get("mimetype") or "")
+        )
+        try:
+            old_links = json.loads(str(row.get("links_json") or "[]"))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            old_links = []
+        document_changed = (
+            content_hash != str(row.get("content_hash") or "")
+            or title != str(row.get("title") or "")
+            or visible != str(row.get("body_text") or "")
+            or links != old_links
+        )
         prepared_fields, prepared_normalized_fields = prepare_analysis_fields(
             str(row["original_url"]), title, visible, raw, links
         )

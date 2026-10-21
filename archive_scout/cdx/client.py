@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import errno
+from contextlib import nullcontext
 import gzip
 import io
 import zlib
@@ -23,6 +25,7 @@ from ..events import Stopped
 from ..json_codec import JSONDecodeErrors, loads as json_loads
 from ..network.transports import (
     RedirectPolicyError,
+    PermitRevoked,
     ResilientTransport,
     TransportExhaustedError,
     is_transport_connection_failure,
@@ -169,7 +172,7 @@ class HttpClient:
             callback=network_callback,
         )
         if isinstance(self.transport, ResilientTransport):
-            self.transport.fallback_pacer = limiter
+            self.transport.physical_pacer = limiter
 
     def close(self) -> None:
         self.transport.close()
@@ -191,11 +194,14 @@ class HttpClient:
             ensure_frozen_bundle_available()
             permit = self.host_gate.acquire_request(self.stop_event)
             try:
-                with self.limiter.slot(self.stop_event):
+                with (nullcontext() if isinstance(self.transport, ResilientTransport)
+                      else self.limiter.slot(self.stop_event)):
                     if not self.host_gate.permit_is_current(permit):
                         self.host_gate.finish_request(permit, recovered=False)
                         continue
                     options = {"redirect_validator": redirect_validator} if redirect_validator is not None else {}
+                    if isinstance(self.transport, ResilientTransport):
+                        options["permit_checker"] = lambda: self.host_gate.permit_is_current(permit)
                     response = self.transport.request(url, headers, max_bytes, self.stop_event, **options)
                 status = int(response.status)
 
@@ -279,6 +285,9 @@ class HttpClient:
                 # not an outage and must release a successful recovery probe.
                 self.host_gate.finish_request(permit, recovered=True)
                 raise
+            except PermitRevoked:
+                self.host_gate.finish_request(permit, recovered=False)
+                continue
             except (RateLimitDeferred, Stopped):
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
@@ -378,7 +387,8 @@ class HttpClient:
                 destination.unlink(missing_ok=True)
             permit = self.host_gate.acquire_request(self.stop_event)
             try:
-                with self.limiter.slot(self.stop_event):
+                with (nullcontext() if isinstance(self.transport, ResilientTransport)
+                      else self.limiter.slot(self.stop_event)):
                     if not self.host_gate.permit_is_current(permit):
                         self.host_gate.finish_request(permit, recovered=False)
                         continue
@@ -386,7 +396,10 @@ class HttpClient:
                         response = self.transport.download(
                             url, headers, destination, max_bytes, self.stop_event,
                             retain_partial=retain_partial, expected_digest=expected_digest,
-                            **({"redirect_validator": redirect_validator} if redirect_validator else {}),
+                            **({"redirect_validator": redirect_validator, "permit_checker":
+                                lambda: self.host_gate.permit_is_current(permit)}
+                               if redirect_validator else {"permit_checker":
+                                lambda: self.host_gate.permit_is_current(permit)}),
                         )
                     else:
                         response = self.transport.download(
@@ -440,6 +453,9 @@ class HttpClient:
                     "backend": response.backend,
                     "elapsed": response.elapsed,
                 }
+            except PermitRevoked:
+                self.host_gate.finish_request(permit, recovered=False)
+                continue
             except (RateLimitDeferred, Stopped):
                 self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
@@ -472,6 +488,9 @@ class HttpClient:
             except (httpx.HTTPError, urllib3.exceptions.HTTPError, TimeoutError, OSError) as exc:
                 self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
+                if isinstance(exc, OSError) and (exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}
+                    or getattr(exc, "winerror", None) in {39, 112}):
+                    raise  # local storage blockage is not a remote retry
                 if is_missing_frozen_bundle_error(exc):
                     raise frozen_bundle_error_from_exception(exc) from exc
                 timed_out = is_timeout_error(exc)

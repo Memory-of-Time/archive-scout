@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.2.5 — text consistency follow-through (same public version)
+
+- Share one text-representation policy across acquisition, imported local text, rescan and Hitlist: preserve literal plain-text angle brackets in FTS while still rendering verifiable HTML and honoring historical HTML suffixes.
+- Import the nine audited text suffixes with the normal BOM/charset decoder and bounded directory traversal. Preserve original local files and bytes; refuse recognizable binary content instead of inventing a text interpretation.
+- Repair stale persisted body text and FTS entries when a local rescan reinterprets unchanged retained bytes. Document database upserts now compare `body_text` as well as normalized fingerprints.
+- Enforce shared physical-request pacing and renewed host admission on every redirect hop for httpx, urllib3 and curl, including automatic backend fallback. Revoked host permits do not cause another-backend retries.
+- Permit curl to identify and return complete HTTP 429/503 response headers without waiting through a stalled control-response body.
+- Tighten playlist descriptor acceptance to positive format-root evidence and preserve authentic unknown media filename extensions instead of inventing `.mp4`/`.png` during text-to-media routing.
+- Improve stall messages with transport cooldown/waiter evidence. Keep version 1.2.5, SQLite schema 10, existing project state, and unchanged healthy replay pacing.
+- The new targeted regression tests cover nine historical imports, rescan-to-FTS repair, all backend redirect hops, host permit revocation, curl delayed control bodies, and positive/negative media-descriptor cases.
+
+## Archive Scout v1.2.5 — text acquisition consistency corrections (20 October 2026)
+
+- Verify complete standalone HTTP 206 ranges and compressed-stream checksums/end markers before publishing text payloads across httpx, urllib3 and curl; reject truncated gzip instead of saving its valid-looking prefix.
+- Handle HTTP 429/503 control status before decoding its potentially malformed response body in pooled Python backends.
+- Prevent capture-specific decompression and local pool failures from cooling unrelated backend routes; pace physical request admission after backend recovery and on fallback.
+- Keep text retries eligible through interrupted reservation/attempt counts, and interleave bounded due retries with fresh work without rebuilding the long-lived thread pool.
+- Include overlapping target memberships in saved-body scanning, retry due-time selection and operation-completeness checks; resolve download versus scan errors at the successful operation boundary.
+- Preserve all 76 explicitly selected historical image/video-group extensions in media indexing; correctly parse `.dvr-ms`, accommodate percent-encoded dots in the CDX suffix prefilter, and recognize supported playlist text as a media descriptor rather than an HTML error.
+- Improve declared wide-character text admission, preview-boundary handling, XML encoding declarations, historical `.phtm` Hitlist fallback, and nested ENOSPC/EDQUOT failure propagation.
+- Preserve version 1.2.5 and schema 10. Benchmarks and unresolved limitations are provided in the accompanying patch validation ledger; offline throughput is not a live Wayback guarantee.
+
 ## Archive Scout v1.2.5 — strict acquisition and media integrity
 
 - Require completed selected index evidence before new download requests at operation and downloader entry points.

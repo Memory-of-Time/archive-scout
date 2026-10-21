@@ -19,7 +19,7 @@ from ..database.classification import classify_indexed_captures
 from ..classification import classify_indexed_resource, classify_payload_kind
 from ..config import ProjectConfig
 from ..constants import REPLAY_URL
-from ..content import classify_replay_content, decode_bytes, is_text_candidate, looks_textual_bytes, parse_page
+from ..content import classify_replay_content, decode_bytes, is_text_candidate, looks_textual_bytes, parse_page, parse_text_representation
 from ..database.repositories import record_error, record_site_issue, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
 from ..parsing.embeds import extract_embed_candidates_fast
@@ -41,7 +41,11 @@ class StorageFullError(OSError):
 
 def _storage_full(exc: BaseException) -> bool:
     visited = set()
-    while isinstance(exc, BaseException) and id(exc) not in visited:
+    pending = [exc]
+    while pending:
+        exc = pending.pop()
+        if not isinstance(exc, BaseException) or id(exc) in visited:
+            continue
         visited.add(id(exc))
         if isinstance(exc, OSError) and (exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}
                                             or getattr(exc, "winerror", None) in {39, 112}):
@@ -49,7 +53,8 @@ def _storage_full(exc: BaseException) -> bool:
         if isinstance(exc, sqlite3.Error) and (getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL
                                                or "database or disk is full" in str(exc).casefold()):
             return True
-        exc = exc.__cause__ or exc.__context__
+        pending.extend(error for _backend, error in getattr(exc, "failures", ()))
+        pending.extend(x for x in (exc.__cause__, exc.__context__) if x is not None)
     return False
 
 
@@ -187,8 +192,9 @@ def prepare_download_rows(
             ON s.pattern=t.pattern AND s.signature=c.query_signature
             WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                 WHERE m.capture_id=c.id AND m.target_id=t.id))""",
-            "(c.download_attempts<? OR c.state='error')"])
-        params.append(config.max_attempts)
+            "1=1"])
+        # Historical submission attempts are not a lifetime eligibility ceiling.
+        # An interrupted queue reservation may never have reached the network.
     if states:
         clauses.append("c.state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)
@@ -369,7 +375,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
                 "bytes_saved": len(data), "content_hash": hashlib.sha256(data).hexdigest(),
                 "http_status": response["status"], "final_url": response["final_url"],
                 "response_content_type": content_type, "deferred_scan": True}
-    title, visible, links = parse_page(raw, original)
+    title, visible, links = parse_text_representation(raw, original, content_type)
     # Avoid a second full HTML parser pass in the download hot path. The page
     # parser above already found ordinary attributes; this lightweight source
     # pass recovers FlashVars/legacy player config. Dedicated media discovery
@@ -431,7 +437,12 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
         if decision.resource_class not in {"text", "media_descriptor"}:
             raise NonTextResponse(decision.resource_class, decision.reason, content_type)
         # A recognizable archive error shell is not a saved original document.
-        preview_text = decode_bytes(preview, content_type)
+        try:
+            preview_text = decode_bytes(preview, content_type)
+        except UnicodeDecodeError:
+            # Prefix-only preview can split a UTF-16 surrogate/UTF-8 character.
+            # The scanner validates the complete retained document locally.
+            preview_text = ""
         replay_problem = classify_replay_content(preview_text, response["final_url"])
         if replay_problem:
             raise RuntimeError(replay_problem)
@@ -484,6 +495,7 @@ def save_success(database: sqlite3.Connection, result: dict) -> None:
             )
             _save_payload_evidence(database, result)
             clear_retry(database, result["capture_id"])
+            resolve_errors(database, capture_id=result["capture_id"], operations=("download",))
         return
     with database:
         document_id = upsert_document(
@@ -503,7 +515,7 @@ def save_success(database: sqlite3.Connection, result: dict) -> None:
         )
         for scan_run_id, analysis in result["analyses"].items():
             save_match(database, int(scan_run_id), document_id, analysis)
-        resolve_errors(database, capture_id=result["capture_id"], document_id=document_id)
+        resolve_errors(database, capture_id=result["capture_id"], operations=("download",))
         _save_payload_evidence(database, result)
         clear_retry(database, result["capture_id"])
 
@@ -652,23 +664,53 @@ def download_archive(
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-scout") as pool:
             futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
     
+            fresh_admitted = 0
+
             def submit_available() -> None:
+                nonlocal fresh_admitted, total
                 slots = max_inflight - len(futures)
                 if slots <= 0:
                     return
                 rows: list[sqlite3.Row] = []
                 for _ in range(slots):
+                    if stop_event.is_set():
+                        raise Stopped
+                    retry_row = None
+                    # Interleave one due retry after each bounded block of
+                    # fresh work. Read only indexed SQLite eligibility; do
+                    # not rebuild the complete acquisition queue or pool.
+                    if config.network.persistent_retries and fresh_admitted >= 16:
+                        retry_row = database.execute("""SELECT c.* FROM text_retry_schedule sched
+                            JOIN captures c ON c.id=sched.capture_id
+                            WHERE c.state='error' AND sched.next_eligible_at<=?
+                              AND NOT EXISTS (SELECT 1 FROM archive_scout_download_queue q WHERE q.id=c.id)
+                              AND EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
+                                   AND e.operation='download' AND e.retryable=1
+                                   AND e.resolved=0 AND e.ignored=0)
+                              AND EXISTS (SELECT 1 FROM targets t
+                                JOIN archive_scout_download_scopes sc ON sc.pattern=t.pattern
+                                    AND sc.signature=c.query_signature
+                                WHERE t.id=c.target_id OR EXISTS (
+                                  SELECT 1 FROM capture_target_membership m
+                                  WHERE m.capture_id=c.id AND m.target_id=t.id))
+                            ORDER BY sched.next_eligible_at,c.id LIMIT 1""", (time.time(),)).fetchone()
+                        fresh_admitted = 0
+                    if retry_row is not None:
+                        rows.append(retry_row)
+                        total += 1  # an additional physical attempt, not a new capture identity
+                        continue
                     try:
                         row = next(row_iter)
                     except StopIteration:
                         break
-                    if stop_event.is_set():
-                        raise Stopped
+                    fresh_admitted += 1
                     rows.append(row)
                 if not rows:
                     return
                 now = utc_now()
                 with database_write_lock, database:
+                    database.executemany("DELETE FROM archive_scout_download_queue WHERE id=?",
+                                         ((int(row["id"]),) for row in rows))
                     database.executemany(
                         "UPDATE captures SET state='downloading',download_attempts=download_attempts+1,updated_at=? WHERE id=?",
                         ((now, int(row["id"])) for row in rows),
@@ -697,6 +739,9 @@ def download_archive(
                     now = time.monotonic()
                     if callback and now-last_completion >= 30.0 and now-last_stall_message >= 30.0:
                         status = client.host_gate.snapshot()
+                        transport_health = (client.transport.snapshot()
+                            if isinstance(getattr(client, "transport", None), ResilientTransport)
+                            else {})
                         callback(ProgressEvent(
                             "acquisition_stall",
                             f"No completed text requests for {now-last_completion:.0f}s; "
@@ -704,8 +749,11 @@ def download_archive(
                             f"workers waiting at Wayback gate {status['waiting_workers']}; "
                             f"probe active {status['recovery_probe']}; "
                             f"host pause {status['remaining_pause']:.1f}s; "
-                            f"last successful save {now-last_save:.0f}s ago. "
-                            "Other workers may be awaiting network responses or pacing."
+                            f"last successful save {now-last_save:.0f}s ago; "
+                            f"backend waiters {transport_health.get('backend_waiters', '?')}; "
+                            f"cooling backends {transport_health.get('cooling_backends', ())}; "
+                            f"backend cooldown max {transport_health.get('cooldown_seconds', '?')}s. "
+                            "Remaining worker occupancy may be network, filesystem, scanner, or DB work."
                         ))
                         last_stall_message = now
                     continue
@@ -769,8 +817,9 @@ def download_archive(
                                 from ..database.repositories import get_or_create_media_target, upsert_media_captures
                                 target = get_or_create_media_target(database, "__deferred_text_replay__")
                                 suffix = extension_from_url(str(row["original_url"]))
-                                if suffix not in {".png",".jpg",".jpeg",".gif",".webp",".bmp",".avif",".mp4",".webm",".avi",".mov",".mkv",".flv",".swf",".wmv"}:
-                                    suffix = ".png" if exc.resource_class == "image" else ".mp4"
+                                # Preserve the URL's real suffix (or absence
+                                # of one); a fallback .mp4/.png would invent
+                                # format identity for opaque historical bytes.
                                 upsert_media_captures(
                                     database,[({"original": row["original_url"],"timestamp":row["timestamp"],
                                                "mimetype":exc.content_type,"statuscode":row["statuscode"],

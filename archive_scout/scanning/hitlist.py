@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from typing import Callable
 
-from ..content import decode_bytes, looks_textual_bytes, parse_page
+from ..content import decode_bytes, looks_textual_bytes, parse_page, parse_text_representation, is_markup_representation
 from ..events import ProgressEvent, Stopped
 from ..downloads.downloader import capture_path
 from ..utils import utc_now
@@ -183,7 +183,8 @@ def _needs_rendered_fallback(
     confidently plain/non-markup; ambiguous MIME, historical HTML suffixes,
     fragments, and late markup retain the rendered fallback for coverage.
     """
-    del raw  # Classification intentionally avoids a short-prefix HTML heuristic.
+    if is_markup_representation(raw, original_url, content_type):
+        return True
     mime = (content_type or "").split(";", 1)[0].strip().casefold()
     if "html" in mime or "xhtml" in mime:
         return True
@@ -192,7 +193,7 @@ def _needs_rendered_fallback(
     name = (parsed.path.rsplit("/", 1)[-1] if parsed else "").casefold()
     html_suffixes = (
         ".html", ".htm", ".shtml", ".shtm", ".xhtml", ".xhtm",
-        ".php", ".php3", ".php4", ".php5", ".phtml", ".asp", ".aspx",
+        ".php", ".php3", ".php4", ".php5", ".phtml", ".phtm", ".asp", ".aspx",
         ".jsp", ".cfm", ".cgi", ".dhtml", ".dhtm",
     )
     if name.endswith(html_suffixes):
@@ -355,7 +356,7 @@ def search_with_hitlist(
                             raw, content_type, path, str(row["original_url"])
                         )
                     ):
-                        _title, visible, links = parse_page(raw, str(row["original_url"]))
+                        _title, visible, links = parse_text_representation(raw, str(row["original_url"]), content_type)
                         view = normalize_search(visible + "\n" + "\n".join(links))
                         for pattern, count in _count_matches(automaton, view).items():
                             if pattern not in source_counts:

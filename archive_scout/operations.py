@@ -241,8 +241,11 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
             for target in config.targets:
                 signature = cdx_query_signature(config.for_target(target))
                 gap = database.execute(
-                    """SELECT 1 FROM captures c JOIN targets t ON t.id=c.target_id
-                       WHERE t.pattern=? AND c.query_signature=? AND
+                    """SELECT 1 FROM captures c
+                       WHERE c.query_signature=? AND EXISTS (SELECT 1 FROM targets t
+                           WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS
+                               (SELECT 1 FROM capture_target_membership m
+                                WHERE m.capture_id=c.id AND m.target_id=t.id))) AND
                         (c.state='downloaded_unscanned' OR
                          (c.state='downloaded' AND (NOT EXISTS (
                              SELECT 1 FROM documents d WHERE d.capture_id=c.id) OR
@@ -251,7 +254,7 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
                                  WHERE m.document_id=d.id AND m.scan_run_id=?)))) OR
                          EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
                              AND e.operation='scan' AND e.resolved=0)) LIMIT 1""",
-                    (target, signature, job.scan_run_id),
+                    (signature, target, job.scan_run_id),
                 ).fetchone()
                 if gap:
                     actual = "interrupted"
@@ -299,9 +302,12 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         # still considers only recorded retryable errors, once per sweep.
         exhausted = " OR (c.state='pending' AND c.download_attempts>=?)" if include_exhausted_pending else ""
         rows = database.execute(
-            """SELECT c.id FROM captures c JOIN targets t ON t.id=c.target_id
-               WHERE c.id>? AND EXISTS (SELECT 1 FROM archive_scout_retry_scopes s
-                   WHERE s.pattern=t.pattern AND s.signature=c.query_signature)
+            """SELECT c.id FROM captures c
+               WHERE c.id>? AND EXISTS (SELECT 1 FROM targets t
+                  JOIN archive_scout_retry_scopes s ON s.pattern=t.pattern
+                   AND s.signature=c.query_signature
+                   WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
+                     WHERE m.capture_id=c.id AND m.target_id=t.id))
                AND ((c.state='error' AND EXISTS (
                    SELECT 1 FROM errors e WHERE e.capture_id=c.id
                    AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
@@ -328,9 +334,11 @@ def remaining_acquisition_gaps(config: ProjectConfig, database: sqlite3.Connecti
     from .downloads.downloader import _populate_download_scopes
     _populate_download_scopes(database, config)
     return int(database.execute(
-        """SELECT COUNT(*) FROM captures c JOIN targets t ON t.id=c.target_id
-           WHERE EXISTS(SELECT 1 FROM archive_scout_download_scopes s
-                WHERE s.pattern=t.pattern AND s.signature=c.query_signature)
+        """SELECT COUNT(*) FROM captures c
+           WHERE EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+                ON s.pattern=t.pattern AND s.signature=c.query_signature
+                WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
+                     WHERE m.capture_id=c.id AND m.target_id=t.id))
              AND (c.state='error' OR (c.state='pending' AND c.download_attempts>=?))""",
         (config.max_attempts,),
     ).fetchone()[0])
