@@ -33,7 +33,24 @@ def clear_retry(database: sqlite3.Connection, capture_id: int) -> None:
     database.execute("DELETE FROM text_retry_schedule WHERE capture_id=?", (capture_id,))
 
 
-def next_due(database: sqlite3.Connection, config=None) -> float | None:
+def retry_selection(database: sqlite3.Connection, config, alias: str = "c") -> tuple[str, list]:
+    """Bounded SQL selection shared by explicit retry and its recovery turns."""
+    clauses, params = [], []
+    if config.retry_capture_ids:
+        database.execute("CREATE TEMP TABLE IF NOT EXISTS archive_scout_retry_filter(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+        database.execute("DELETE FROM archive_scout_retry_filter")
+        database.executemany("INSERT OR IGNORE INTO archive_scout_retry_filter VALUES(?)",
+                             ((int(value),) for value in config.retry_capture_ids))
+        clauses.append(f"EXISTS(SELECT 1 FROM archive_scout_retry_filter f WHERE f.id={alias}.id)")
+    if config.retry_error_categories:
+        clauses.append(f"""EXISTS(SELECT 1 FROM errors e WHERE e.capture_id={alias}.id
+            AND e.resolved=0 AND e.ignored=0 AND e.retryable=1 AND e.category IN ("""
+            + ",".join("?" for _ in config.retry_error_categories) + "))")
+        params.extend(config.retry_error_categories)
+    return "".join(" AND " + item for item in clauses), params
+
+
+def next_due(database: sqlite3.Connection, config=None, *, respect_selection=False) -> float | None:
     if config is not None:
         from .downloader import _populate_download_scopes
         _populate_download_scopes(database, config)
@@ -44,8 +61,9 @@ def next_due(database: sqlite3.Connection, config=None) -> float | None:
               WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
     else:
         scope = ""
+    selection, params = retry_selection(database, config) if respect_selection and config else ("", [])
     row = database.execute("""SELECT MIN(s.next_eligible_at) FROM text_retry_schedule s
         JOIN captures c ON c.id=s.capture_id WHERE c.state='error' AND EXISTS
         (SELECT 1 FROM errors e WHERE e.capture_id=c.id AND e.retryable=1
-         AND e.resolved=0 AND e.ignored=0)""" + scope).fetchone()
+         AND e.resolved=0 AND e.ignored=0)""" + scope + selection, params).fetchone()
     return float(row[0]) if row and row[0] is not None else None

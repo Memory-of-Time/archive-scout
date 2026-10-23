@@ -11,8 +11,9 @@ class ScoutReleaseBrandTests(unittest.TestCase):
 
     def test_windows_numeric_version_metadata(self):
         source = (Path(__file__).resolve().parents[2] / "packaging/windows/version_info.txt").read_text()
-        self.assertIn("filevers=(1, 2, 3, 0)", source)
-        self.assertIn("prodvers=(1, 2, 3, 0)", source)
+        numeric_version = (*map(int, VERSION.split('.')), 0)
+        self.assertIn(f"filevers={numeric_version}", source)
+        self.assertIn(f"prodvers={numeric_version}", source)
 
     def test_three_platform_download_links_match_release_assets(self):
         root = Path(__file__).resolve().parents[2]

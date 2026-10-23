@@ -117,6 +117,12 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
                 "SELECT COUNT(*) FROM index_state WHERE complete=0").fetchone()[0])
             incomplete_media = int(db.execute("SELECT COUNT(*) FROM media_index_state WHERE complete=0").fetchone()[0])
             media_pending = int(db.execute("SELECT COUNT(*) FROM media_captures WHERE state IN ('pending','error','downloading')").fetchone()[0])
+            request = db.execute("SELECT value FROM project_meta WHERE key='resume_request'").fetchone()
+            backlog = db.execute("SELECT value FROM project_meta WHERE key='resume_backlog'").fetchone()
+            unfinished_requests = int(request is not None) + (len(json.loads(backlog[0])) if backlog else 0)
+            embedded_pending = int(db.execute("""SELECT COUNT(*) FROM media_discovery_queue
+                WHERE state IN ('pending','error','resolving','blocked')
+                OR (state='unavailable' AND COALESCE(last_error,'')!='')""").fetchone()[0])
             # Clone settings, redirecting *only* output paths to staging.
             temporary_config = replace(config, output_dir=staging)
             paths = _collect_report_files(temporary_config, db, scan_run_id, progress, stop_event)
@@ -137,11 +143,14 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
                            "unfinished_media_captures": media_pending,
                            "index_checkpoints": index_checkpoints,
                            "incomplete_index_checkpoints": incomplete_index,
-                           "incomplete_media_checkpoints": incomplete_media},
+                           "incomplete_media_checkpoints": incomplete_media,
+                           "unfinished_requests": unfinished_requests,
+                           "unfinished_embedded_lookups": embedded_pending},
                 "complete": bool(index_checkpoints and operation and operation[1] != "report" and
                                  operation[2] == "complete" and
                                  (scan is None or scan[1] == "complete") and
-                                 not (pending or media_pending or incomplete_index or incomplete_media)),
+                                 not (pending or media_pending or incomplete_index or incomplete_media
+                                      or unfinished_requests or embedded_pending)),
                 "files": sorted(str(value.relative_to(staging)) for value in paths.values() if value.is_file()),
                 "note": "A successful report export does not establish inventory, acquisition, or scan completeness."
             }

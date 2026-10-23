@@ -45,7 +45,8 @@ def _host_in_project_scope(host: str, scopes: list[tuple[str, bool]]) -> bool:
     return False
 
 
-def make_replay_redirect_validator(config: ProjectConfig, source_original: str):
+def make_replay_redirect_validator(config: ProjectConfig, source_original: str, *,
+                                   skip_redirects: bool = False):
     """Return the shared archive-only redirect policy for one stored capture.
 
     The callback runs before the transport contacts each redirect destination.
@@ -58,6 +59,8 @@ def make_replay_redirect_validator(config: ProjectConfig, source_original: str):
     source_host = (urllib.parse.urlsplit(source_original).hostname or "").casefold().rstrip(".")
 
     def validate(source_url: str, destination_url: str) -> None:
+        if skip_redirects:
+            raise RedirectPolicyError(source_url, destination_url, "redirect_skipped")
         if urllib.parse.urlsplit(destination_url).scheme.casefold() not in {"http", "https"}:
             raise RedirectPolicyError(source_url, destination_url, "live_redirect_blocked")
         embedded = replay_original_url(destination_url)

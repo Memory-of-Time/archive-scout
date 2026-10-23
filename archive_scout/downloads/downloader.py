@@ -174,6 +174,34 @@ def prepare_download_rows(
     _populate_download_scopes(database, config)
     if not capture_ids:
         _restore_changed_url_filter_skips(database, config)
+    # Earlier releases stored redirect-policy refusals as nonretryable errors.
+    # Recheck only exclusions whose meaning changed under the current policy;
+    # keep their history until a real response establishes the new outcome.
+    redirect_categories = (("external_redirect_blocked",) if config.download_external_redirects
+                           else ("external_redirect_blocked", "live_redirect_blocked"))
+    database.execute("""UPDATE captures SET state='pending',updated_at=? WHERE state='error'
+        AND EXISTS(SELECT 1 FROM errors e WHERE e.capture_id=captures.id
+            AND e.operation='download' AND e.resolved=0 AND e.ignored=0
+            AND e.category IN (""" + ",".join("?" for _ in redirect_categories) + """))
+        AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+            ON s.pattern=t.pattern AND s.signature=captures.query_signature
+            WHERE t.id=captures.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
+                WHERE m.capture_id=captures.id AND m.target_id=t.id))""",
+        (utc_now(), *redirect_categories))
+    if config.download_external_redirects:
+        # This policy is intentionally adjustable on Resume. Earlier explicit
+        # redirect exclusions must not become permanent hidden omissions.
+        database.execute("""UPDATE captures SET state='pending',updated_at=?
+            WHERE state='skipped' AND EXISTS(SELECT 1 FROM capture_routing r
+                WHERE r.capture_id=captures.id AND r.routing='skipped_redirect_policy')
+            AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+                ON s.pattern=t.pattern AND s.signature=captures.query_signature
+                WHERE t.id=captures.target_id OR EXISTS(
+                    SELECT 1 FROM capture_target_membership m
+                    WHERE m.capture_id=captures.id AND m.target_id=t.id))""", (utc_now(),))
+        database.execute("""UPDATE capture_routing SET routing='pending',updated_at=?
+            WHERE routing='skipped_redirect_policy' AND EXISTS(SELECT 1 FROM captures c
+                WHERE c.id=capture_routing.capture_id AND c.state='pending')""", (utc_now(),))
 
     source = "captures c"
     clauses: list[str] = []
@@ -187,14 +215,12 @@ def prepare_download_rows(
             ((int(value),) for value in capture_ids),
         )
         source += " JOIN archive_scout_capture_selection s ON s.id=c.id"
-    else:
-        clauses.extend(["""EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+    clauses.extend(["""EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
             ON s.pattern=t.pattern AND s.signature=c.query_signature
             WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                 WHERE m.capture_id=c.id AND m.target_id=t.id))""",
             "1=1"])
-        # Historical submission attempts are not a lifetime eligibility ceiling.
-        # An interrupted queue reservation may never have reached the network.
+    # Explicit selections obey the same active scope as normal acquisition.
     if states:
         clauses.append("c.state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)
@@ -353,7 +379,8 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
     url = replay_url(row["timestamp"], original)
     if isinstance(client, HttpClient):
         response = client.get(url, config.max_file_bytes,
-                              redirect_validator=make_replay_redirect_validator(config, original))
+                              redirect_validator=make_replay_redirect_validator(config, original,
+                                  skip_redirects=not config.download_external_redirects))
     else:
         # Existing offline integrations can supply a fixture-only client.
         response = client.get(url, config.max_file_bytes)
@@ -427,7 +454,10 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
     try:
         response = client.download_to_path(
             replay_url(row["timestamp"], original), stage, config.max_file_bytes,
-            redirect_validator=make_replay_redirect_validator(config, original),
+            redirect_validator=make_replay_redirect_validator(config, original,
+                skip_redirects=not config.download_external_redirects),
+            **({"expected_digest": str(row["digest"] or "")} if isinstance(client, HttpClient)
+               and "digest" in row.keys() else {}),
             **({"retain_partial": False} if isinstance(client, HttpClient) else {}),
         )
         content_type = (response["headers"].get("content-type") or
@@ -457,7 +487,8 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
             "file_fsync_publish_seconds": publish_seconds, "capture_id": int(row["id"]), "path": path,
             "bytes_saved": int(response["bytes"]), "content_hash": response["content_hash"],
             "http_status": response["status"], "final_url": response["final_url"],
-            "response_content_type": content_type, "deferred_scan": True}
+            "response_content_type": content_type, "deferred_scan": True,
+            "encoding_recovery": response.get("encoding_recovery", "")}
     finally:
         # A partial text replay is NOT a resumable media transfer.  Discard
         # both its bytes and HTTPX range/ETag sidecar.  A stale sidecar without
@@ -468,6 +499,11 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
 
 
 def _save_payload_evidence(database: sqlite3.Connection, result: dict) -> None:
+    if result.get("encoding_recovery"):
+        note = record_error(database, "validation", "encoding_header_recovered",
+                            str(result["encoding_recovery"]),
+                            capture_id=int(result["capture_id"]), retryable=False)
+        database.execute("UPDATE errors SET resolved=1 WHERE id=?", (note,))
     database.execute("""INSERT INTO capture_payload_evidence
         (capture_id,content_hash,bytes_saved,response_content_type,final_url,response_status,updated_at)
         VALUES(?,?,?,?,?,?,?) ON CONFLICT(capture_id) DO UPDATE SET
@@ -679,7 +715,7 @@ def download_archive(
                     # Interleave one due retry after each bounded block of
                     # fresh work. Read only indexed SQLite eligibility; do
                     # not rebuild the complete acquisition queue or pool.
-                    if config.network.persistent_retries and fresh_admitted >= 16:
+                    if config.network.persistent_retries and fresh_admitted >= 16 and not capture_ids:
                         retry_row = database.execute("""SELECT c.* FROM text_retry_schedule sched
                             JOIN captures c ON c.id=sched.capture_id
                             WHERE c.state='error' AND sched.next_eligible_at<=?
@@ -849,6 +885,29 @@ def download_archive(
                         with database_write_lock, database:
                             database.execute("UPDATE captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))
                         raise
+                    except RedirectPolicyError as exc:
+                        if exc.category != "redirect_skipped":
+                            # Live/unapproved destinations remain explicit
+                            # errors when following archived redirects is on.
+                            with database_write_lock, database:
+                                database.execute("UPDATE captures SET state='error',final_url=?,updated_at=? WHERE id=?",
+                                    (exc.destination, utc_now(), row["id"]))
+                                record_error(database, "download", exc.category, str(exc),
+                                             capture_id=int(row["id"]), retryable=False)
+                                database.execute("UPDATE capture_routing SET routing='failed_redirect_policy',updated_at=? WHERE capture_id=?",
+                                                 (utc_now(), row["id"]))
+                                clear_retry(database, int(row["id"]))
+                            failures += 1
+                        else:
+                            with database_write_lock, database:
+                                database.execute("UPDATE captures SET state='skipped',final_url=?,updated_at=? WHERE id=?",
+                                    (exc.destination, utc_now(), row["id"]))
+                                database.execute("UPDATE capture_routing SET routing='skipped_redirect_policy',updated_at=? WHERE capture_id=?",
+                                    (utc_now(), row["id"]))
+                                clear_retry(database, int(row["id"]))
+                                resolve_errors(database, capture_id=int(row["id"]), operations=("download",))
+                            if callback:
+                                callback(ProgressEvent("redirect_skipped", f"Skipped redirected text URL: {row['original_url']}"))
                     except Exception as exc:
                         if _storage_full(exc):
                             for pending in futures:

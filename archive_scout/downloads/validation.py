@@ -12,7 +12,8 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     # textual messages. Pool exhaustion is not an archive read timeout.
     import httpx
     import urllib3
-    from ..network.transports import TransportExhaustedError
+    from ..network.transports import (TransportExhaustedError, ContentEncodingMismatch,
+                                     PayloadDigestMismatch, IncompleteRepresentationError)
     pending: list[BaseException] = [exc]
     visited = set()
     while pending:
@@ -20,6 +21,12 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
         if id(current) in visited:
             continue
         visited.add(id(current))
+        if isinstance(current, ContentEncodingMismatch):
+            return "content_encoding_mismatch", status, True
+        if isinstance(current, PayloadDigestMismatch):
+            return "payload_digest_mismatch", status, True
+        if isinstance(current, IncompleteRepresentationError):
+            return "incomplete_representation", status, True
         if isinstance(current, httpx.PoolTimeout) or isinstance(current, urllib3.exceptions.EmptyPoolError):
             return "connection_pool_timeout", status, True
         if isinstance(current, (httpx.ConnectTimeout, urllib3.exceptions.ConnectTimeoutError)):

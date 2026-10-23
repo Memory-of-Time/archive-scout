@@ -682,6 +682,12 @@ def _loaded_index_scope(payload: dict, root: Path) -> str:
 def load_project_config(path: Path) -> ProjectConfig:
     path = Path(path).expanduser()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    return project_config_from_payload(payload, path)
+
+
+def project_config_from_payload(payload: dict, path: Path) -> ProjectConfig:
+    """Use one compatibility loader for project files and durable resume plans."""
+    path = Path(path).expanduser()
     saved_root = Path(payload.get("output_dir") or path.parent).expanduser()
     # The standard project.json belongs inside the project directory. When a
     # complete project is moved or copied, use the colocated database instead

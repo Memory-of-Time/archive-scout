@@ -14,6 +14,7 @@ from archive_scout.cdx.client import (
 )
 from archive_scout.cdx.indexer import index_archive
 from archive_scout.cdx.parallel import PageFetchResult, effective_page_workers
+from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.config import MediaConfig, NetworkConfig, ProjectConfig
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target, upsert_captures, upsert_media_captures
@@ -245,7 +246,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
                         for index in range(2000)
                     ),
                     target_id,
-                    "selection-test",
+                    cdx_query_signature(config),
                 )
             selected = [row[0] for row in database.execute(
                 "SELECT id FROM captures ORDER BY id LIMIT 1500"
@@ -421,6 +422,8 @@ class LargeProjectStabilityTests(unittest.TestCase):
                 keywords=["example"],
                 retry_capture_ids=capture_ids,
             ).normalized()
+            database.execute("UPDATE captures SET query_signature=? WHERE query_signature='retry-selection'",
+                             (cdx_query_signature(config),))
             with patch("archive_scout.downloads.retry.download_archive") as mocked:
                 retry_error_urls(config, database, 1, threading.Event(), None)
             # Bounded manual retry batches preserve the same stable selection

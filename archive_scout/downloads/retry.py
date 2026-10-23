@@ -9,7 +9,7 @@ from ..config import ProjectConfig
 from ..events import ProgressEvent
 from ..scanning.jobs import ScanJob
 from ..scanning.rescanner import rescan_documents, rescan_keyword_sets
-from .downloader import download_archive
+from .downloader import download_archive, _populate_download_scopes
 
 
 def retry_error_urls(
@@ -20,7 +20,13 @@ def retry_error_urls(
     callback: Callable[[ProgressEvent], None] | None,
     scan_jobs: list[ScanJob] | None = None,
 ) -> None:
-    clauses = ["e.resolved=0", "e.ignored=0", "e.retryable=1", "e.capture_id IS NOT NULL"]
+    _populate_download_scopes(database, config)
+    clauses = ["e.resolved=0", "e.ignored=0", "e.retryable=1", "e.capture_id IS NOT NULL",
+        """EXISTS(SELECT 1 FROM captures c WHERE c.id=e.capture_id AND EXISTS(
+            SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+            ON s.pattern=t.pattern AND s.signature=c.query_signature
+            WHERE t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
+                WHERE m.capture_id=c.id AND m.target_id=t.id)))"""]
     params: list[object] = []
     if config.retry_error_categories:
         clauses.append("e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")")

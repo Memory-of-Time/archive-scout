@@ -20,7 +20,8 @@ def main() -> int:
     for name in ("archive-scout-gui", "scout-gui"):
         assert f'{name} = "archive_scout.app:main"' in project, f"missing GUI alias {name}"
     version_info = (root / "packaging/windows/version_info.txt").read_text(encoding="utf-8")
-    for marker in ("filevers=(1, 2, 3, 0)", "prodvers=(1, 2, 3, 0)",
+    numeric_version = (*map(int, VERSION.split(".")), 0)
+    for marker in (f"filevers={numeric_version}", f"prodvers={numeric_version}",
                    "'Archive Scout'", "'ArchiveScout.exe'"):
         assert marker in version_info, f"Windows version_info missing {marker}"
     readme = (root / "README.md").read_text(encoding="utf-8")

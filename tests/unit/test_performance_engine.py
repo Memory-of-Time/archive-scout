@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from archive_scout.cdx.client import HttpClient
+from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.config import ProjectConfig
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import (
@@ -75,6 +76,7 @@ class PerformanceEngineTests(unittest.TestCase):
                 keywords=["excluded: blocked"],
                 download_scope="keyword_urls",
             )
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.for_target('example.com/*')),))
             total, rows = prepare_download_rows(
                 database, config, patterns, capture_ids=[capture_id]
             )
@@ -193,6 +195,7 @@ class PerformanceEngineTests(unittest.TestCase):
                 )
                 ids.append(int(database.execute("SELECT last_insert_rowid()").fetchone()[0]))
             config = ProjectConfig(output_dir=root, targets=["example.com/*"], keywords=["example"])
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.for_target('example.com/*')),))
             total, rows = prepare_download_rows(database, config, [], capture_ids=ids)
             ordered = [int(row["length"]) for row in rows]
             self.assertEqual(total, 4)

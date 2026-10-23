@@ -79,6 +79,23 @@ def require_media_coverage(database: sqlite3.Connection, config: ProjectConfig) 
         raise IndexCoveragePending("Media inventory incomplete; acquisition not admitted: " + "; ".join(gaps[:4]))
 
 
+def require_embedded_coverage(database: sqlite3.Connection, config: ProjectConfig,
+                              signature: str) -> None:
+    """Every saved document and lookup must be accounted for before media I/O."""
+    if not config.media.discover_embedded:
+        return
+    if database.execute("""SELECT 1 FROM documents d
+        LEFT JOIN media_discovery_documents m ON m.document_id=d.id AND m.query_signature=?
+        WHERE m.document_id IS NULL OR m.content_hash IS NOT d.content_hash LIMIT 1""",
+        (signature,)).fetchone():
+        raise IndexCoveragePending("Embedded media discovery has unprocessed or changed saved documents")
+    if database.execute("""SELECT 1 FROM media_discovery_queue WHERE query_signature=?
+        AND (state IN ('pending','error','resolving','blocked')
+             OR (state='unavailable' AND COALESCE(last_error,'')!='')) LIMIT 1""",
+        (signature,)).fetchone():
+        raise IndexCoveragePending("Embedded media lookup obligations remain unresolved")
+
+
 def record_admission(db: sqlite3.Connection, operation_run_id: int,
                      phase: str, config: ProjectConfig) -> None:
     """Record a positive, frozen scope fingerprint once per admitted phase."""

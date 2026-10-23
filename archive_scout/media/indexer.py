@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
@@ -49,6 +50,7 @@ from ..database.repositories import (
     media_discovery_counts,
     queue_media_discovery_candidates,
     record_error,
+    resolve_errors,
     record_site_issue,
     upsert_media_captures,
 )
@@ -1086,6 +1088,11 @@ def _discover_document_media(
     """Pure local worker used by embedded-media discovery."""
     document_id = int(row["id"])
     content_hash = str(row.get("content_hash") or "")
+    path = Path(str(row.get("path") or ""))
+    if not path.is_absolute():
+        path = output_dir / path
+    if not path.is_file():
+        raise FileNotFoundError(f"Saved document required for media discovery is missing: {document_id}")
     known_links = [str(value) for value in json_value(row.get("links_json"), []) if str(value).strip()]
     raw = safe_document_text(output_dir, str(row.get("path") or ""), max_file_bytes)
     found = discover_media(raw, str(row.get("original_url") or ""), media, known_links)
@@ -1272,6 +1279,7 @@ def index_embedded_media(
     signature: str,
     *,
     external_only: bool = False,
+    discover_documents: bool = True,
 ) -> None:
     """Discover and index embedded media with a persistent, bounded lookup queue.
 
@@ -1284,11 +1292,13 @@ def index_embedded_media(
     media = config.media.normalized()
     if not media.discover_embedded:
         return
-    _discover_embedded_queue(config, database, stop_event, callback, signature, external_only=external_only)
+    if discover_documents:
+        _discover_embedded_queue(config, database, stop_event, callback, signature, external_only=external_only)
+    attempt_limit = (2**63-1 if config.network.persistent_retries else config.max_attempts)
     pending_total = int(database.execute(
         """SELECT COUNT(*) FROM media_discovery_queue
            WHERE query_signature=? AND state IN ('pending','error') AND lookup_attempts<?""",
-        (signature, config.max_attempts),
+        (signature, attempt_limit),
     ).fetchone()[0])
     if not pending_total:
         counts = media_discovery_counts(database, signature)
@@ -1304,7 +1314,7 @@ def index_embedded_media(
     workers = min(max(1, config.network.normalized().cdx_workers), 10)
     max_inflight = max(workers, workers * 2)
     endpoints = cdx_endpoints(config)
-    row_iter = iter_media_discovery_rows(database, signature, config.max_attempts)
+    row_iter = iter_media_discovery_rows(database, signature, attempt_limit)
     completed = indexed = unavailable = errors = 0
     blocked_hosts = blocked_site_hosts(database)
 
@@ -1384,6 +1394,12 @@ def index_embedded_media(
                             "indexed" if accepted_count else "unavailable",
                             result_count=accepted_count,
                         )
+                        if document_id is not None and not database.execute(
+                            "SELECT 1 FROM media_discovery_queue WHERE source_document_id=? "
+                            "AND (state IN ('pending','error','resolving','blocked') "
+                            "OR (state='unavailable' AND COALESCE(last_error,'')!='')) LIMIT 1",
+                            (document_id,)).fetchone():
+                            resolve_errors(database, document_id=document_id, operations=("media_embed",))
                     if accepted_count:
                         indexed += 1
                     else:
@@ -1440,6 +1456,29 @@ def index_embedded_media(
                     ))
                 submit_available()
 
+def _complete_embedded_media(config, database, client, stop_event, callback, signature, *, external_only=False):
+    """Retry lookup turns without repeating saved-document discovery each turn."""
+    turn = 0
+    while True:
+        try:
+            index_embedded_media(config, database, client, stop_event, callback, signature,
+                                 external_only=external_only, discover_documents=turn == 0)
+        except RateLimitDeferred:
+            if not config.network.persistent_retries:
+                raise
+        if not config.network.persistent_retries or not database.execute(
+            "SELECT 1 FROM media_discovery_queue WHERE query_signature=? AND state IN ('pending','error') LIMIT 1",
+            (signature,)).fetchone():
+            return
+        wait = min(config.network.retry_max_seconds,
+                   config.network.retry_base_seconds * 2**min(turn, 12))
+        if callback:
+            callback(ProgressEvent("media_embed", f"Embedded lookup checkpoints retained; automatic retry in {wait:.1f}s. Media acquisition remains gated."))
+        if stop_event.wait(wait):
+            raise Stopped
+        turn += 1
+
+
 def index_external_embedded_media(
     config: ProjectConfig,
     database: sqlite3.Connection,
@@ -1487,9 +1526,11 @@ def index_external_embedded_media(
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
     )
     try:
-        index_embedded_media(
+        _complete_embedded_media(
             config, database, client, stop_event, callback, signature, external_only=True
         )
+        from ..coverage import require_embedded_coverage
+        require_embedded_coverage(database, config, signature)
         _apply_snapshot_strategy(database, signature, config.media.snapshot_strategy)
         return signature
     finally:
@@ -1546,11 +1587,13 @@ def index_media(
     )
     try:
         deferred = index_direct_media(config, database, client, stop_event, callback, signature, state_signature)
-        index_embedded_media(config, database, client, stop_event, callback, signature)
-        pending = bool(database.execute(
-            "SELECT 1 FROM media_index_state WHERE query_signature=? AND complete=0 LIMIT 1",
-            (state_signature,),
-        ).fetchone())
+        _complete_embedded_media(config, database, client, stop_event, callback, signature)
+        from ..coverage import media_coverage_gaps, require_embedded_coverage, IndexCoveragePending
+        pending = bool(media_coverage_gaps(database, config))
+        try:
+            require_embedded_coverage(database, config, signature)
+        except IndexCoveragePending:
+            pending = True
         if not deferred and not pending:
             _apply_snapshot_strategy(database, signature, media.snapshot_strategy)
         elif callback:

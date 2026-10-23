@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from ..cdx.client import HttpClient, RateLimitDeferred
 from ..config import ProjectConfig
+from ..downloads.redirects import make_replay_redirect_validator
 from ..database.repositories import blocked_site_reasons, record_error, record_site_issue, save_media_success
 from ..downloads.downloader import replay_url
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
@@ -213,6 +214,7 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
             response = client.download_to_path(
                 media_replay_url(row), temp, config.media.max_file_bytes,
                 expected_digest=str(_media_row_value(row, "digest", "")),
+                redirect_validator=make_replay_redirect_validator(config, str(row["original_url"])),
             )
         except TypeError as exc:
             # Compatibility with test/third-party clients that keep the old API.
@@ -308,10 +310,11 @@ def download_media(
     # Direct and retry paths need the same positive index proof as orchestration.
     # Embedded discovery carries its own distinct scope/admission from the
     # preceding scan/discovery phase rather than a direct-media checkpoint.
-    from ..coverage import IndexCoveragePending, require_media_coverage
+    from ..coverage import IndexCoveragePending, require_media_coverage, require_embedded_coverage
     direct_signature = media_query_signature(config)
     if media_signature is None or media_signature == direct_signature:
         require_media_coverage(database, config)
+        require_embedded_coverage(database, config, direct_signature)
     else:
         # Supplying an arbitrary signature must not act as an admission bypass.
         # The only supported separate scope is externally embedded discovery
@@ -324,6 +327,7 @@ def download_media(
                                         allow_external_embeds=True)
         if media_signature != signature_of(external_config):
             raise IndexCoveragePending("Unrecognized media inventory identity; acquisition is not admitted")
+        require_embedded_coverage(database, external_config, media_signature)
         if database.execute(
             "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
             "AND state IN ('pending','error','resolving') LIMIT 1",
@@ -348,8 +352,8 @@ def download_media(
         clauses.append("query_signature=?")
         params.append(media_signature or media_query_signature(config))
     else:
-        clauses.extend(["query_signature=?", "download_attempts<?"])
-        params.extend([media_signature or media_query_signature(config), config.max_attempts])
+        clauses.append("query_signature=?")
+        params.append(media_signature or media_query_signature(config))
     if states:
         clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)

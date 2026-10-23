@@ -5,6 +5,7 @@ import json
 import re
 import base64
 import zlib
+import itertools
 import os
 import shutil
 import socket
@@ -228,6 +229,14 @@ class IncompleteRepresentationError(RuntimeError):
     """The received bytes do not establish a complete HTTP representation."""
 
 
+class ContentEncodingMismatch(IncompleteRepresentationError):
+    """Declared compression contradicts the raw received representation."""
+
+
+class PayloadDigestMismatch(IncompleteRepresentationError):
+    """A proposed header repair did not match the selected archived payload."""
+
+
 def _check_full_range(status: int, headers: dict[str, str]) -> None:
     """A standalone 206 prefix must never be published as an entire document."""
     if status != 206:
@@ -242,7 +251,8 @@ def _check_full_range(status: int, headers: dict[str, str]) -> None:
 
 
 def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
-                             stop_event: threading.Event) -> Iterable[bytes]:
+                             stop_event: threading.Event, *,
+                             expected_digest: str = "") -> Iterable[bytes]:
     """Bounded raw-wire decoder with gzip/deflate EOF and CRC verification.
 
     Libraries' convenience decoded iterators may accept an incomplete gzip
@@ -253,6 +263,27 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
     encoding = headers.get("content-encoding", "identity").split(",", 1)[0].strip().casefold()
     if encoding not in {"", "identity", "gzip", "x-gzip", "deflate"}:
         raise IncompleteRepresentationError(f"unsupported HTTP content encoding: {encoding}")
+    repair_digest = ""
+    repair_hash = None
+    if encoding in {"gzip", "x-gzip"}:
+        iterator = iter(chunks)
+        prefix = bytearray()
+        while len(prefix) < 2:
+            if stop_event.is_set():
+                raise Stopped
+            try:
+                prefix.extend(next(iterator))
+            except StopIteration:
+                break
+        chunks = itertools.chain((bytes(prefix),), iterator)
+        if prefix and not prefix.startswith(b"\x1f\x8b"):
+            repair_digest = _valid_cdx_digest(expected_digest)
+            if not repair_digest:
+                raise ContentEncodingMismatch("gzip header contradicts payload; no comparable capture digest for recovery")
+            # Never guess from HTML appearance. The complete candidate must
+            # match this capture's CDX payload digest before it can publish.
+            repair_hash = hashlib.sha1()
+            encoding = "identity"
     advertised = headers.get("content-length", "")
     expected_wire = int(advertised) if advertised.isdigit() else None
     received_wire = 0
@@ -261,6 +292,8 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
             if stop_event.is_set():
                 raise Stopped
             received_wire += len(chunk)
+            if repair_hash is not None:
+                repair_hash.update(chunk)
             yield chunk
     else:
         gzip_mode = encoding in {"gzip", "x-gzip"}
@@ -292,6 +325,11 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
     if expected_wire is not None and expected_wire != received_wire:
         raise IncompleteRepresentationError(
             f"HTTP Content-Length mismatch: received {received_wire}, expected {expected_wire}")
+    if repair_hash is not None:
+        actual = base64.b32encode(repair_hash.digest()).decode("ascii").rstrip("=")
+        if actual != repair_digest:
+            raise PayloadDigestMismatch("encoding-header recovery failed the selected capture's CDX digest")
+        headers["x-archive-scout-encoding-recovery"] = "gzip header mismatch; CDX SHA-1 verified: " + actual
 
 
 def _partial_metadata_path(destination: Path) -> Path:
@@ -533,6 +571,9 @@ class HttpxBackend:
             options = {"follow_redirects": False} if (redirect_validator is not None or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))) else {}
             with self.client.stream("GET", current_url, headers=headers, **options) as response:
                 location = response.headers.get("Location")
+                if response.status_code in {301,302,303,307,308} and not location and redirect_validator:
+                    redirect_validator(current_url, current_url)
+                    raise IncompleteRepresentationError("redirect response has no Location header")
                 if response.status_code in {301, 302, 303, 307, 308} and location and (
                     redirect_validator is not None or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))
                 ):
@@ -590,6 +631,10 @@ class HttpxBackend:
                                 **({"follow_redirects": False} if redirect_validator or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None)) else {})) as response:
             if (redirect_validator or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))) and int(response.status_code) in {301,302,303,307,308}:
                 location = response.headers.get("location")
+                if not location:
+                    if redirect_validator:
+                        redirect_validator(url, url)
+                    raise IncompleteRepresentationError("redirect response has no Location header")
                 if location:
                     next_url = urllib.parse.urljoin(url, location)
                     if redirect_validator:
@@ -614,7 +659,7 @@ class HttpxBackend:
                     b"", self.name, time.monotonic()-started)
             try:
                 raw_chunks = response.iter_raw(64 * 1024) if not retain_partial else response.iter_bytes(64 * 1024)
-                verified_chunks = (_decoded_verified_chunks(raw_chunks, fields, stop_event)
+                verified_chunks = (_decoded_verified_chunks(raw_chunks, fields, stop_event, expected_digest=expected_digest)
                                    if not retain_partial else raw_chunks)
                 total, content_hash, preview = _write_limited(
                     verified_chunks,
@@ -632,7 +677,7 @@ class HttpxBackend:
                 raise
             return TransportFileResponse(
                 status=int(response.status_code),
-                headers=_copy_headers(response.headers.items()),
+                headers=fields,
                 final_url=str(response.url),
                 path=destination,
                 bytes_written=total,
@@ -726,7 +771,9 @@ class Urllib3Backend:
                     break
                 location = response.headers.get("Location")
                 if not location:
-                    break
+                    if redirect_validator:
+                        redirect_validator(current_url, current_url)
+                    raise IncompleteRepresentationError("redirect response has no Location header")
                 destination = urllib.parse.urljoin(current_url, location)
                 if redirect_validator is not None:
                     redirect_validator(current_url, destination)
@@ -775,6 +822,7 @@ class Urllib3Backend:
         max_bytes: int,
         stop_event: threading.Event,
         redirect_validator: Callable[[str, str], None] | None = None,
+        *, expected_digest: str = "",
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -790,7 +838,9 @@ class Urllib3Backend:
                     break
                 location = response.headers.get("Location")
                 if not location:
-                    break
+                    if redirect_validator:
+                        redirect_validator(current_url, current_url)
+                    raise IncompleteRepresentationError("redirect response has no Location header")
                 destination_url = urllib.parse.urljoin(current_url, location)
                 if redirect_validator:
                     redirect_validator(current_url, destination_url)
@@ -798,6 +848,7 @@ class Urllib3Backend:
                 response = None
                 _pace_redirect_hop(self, stop_event)
                 current_url = destination_url
+                expected_digest = ""  # source capture evidence does not identify a different replay
             else:
                 raise RuntimeError(f"too many redirects: {url}")
             assert response is not None
@@ -816,12 +867,12 @@ class Urllib3Backend:
                     b"", self.name, time.monotonic()-started)
             total, content_hash, preview = _write_limited(
                 _decoded_verified_chunks(response.stream(amt=64 * 1024, decode_content=False),
-                                         fields, stop_event),
+                                         fields, stop_event, expected_digest=expected_digest),
                 destination, max_bytes, stop_event,
             )
             result = TransportFileResponse(
                 status=int(response.status),
-                headers=_copy_headers(response.headers.items()),
+                headers=fields,
                 final_url=current_url,
                 path=destination,
                 bytes_written=total,
@@ -861,7 +912,7 @@ class CurlBackend:
                 if key.casefold() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
 
     @staticmethod
-    def _early_control_status(path: Path) -> tuple[int, dict[str, str]] | None:
+    def _early_control_status(path: Path, *, redirects: bool = False) -> tuple[int, dict[str, str]] | None:
         """Read a bounded complete header block, never a potentially huge body.
 
         Curl writes `--dump-header` as soon as response headers arrive. This
@@ -880,7 +931,8 @@ class CurlBackend:
             return None
         last = blocks[-1].decode("iso-8859-1", "replace")
         parts = last.splitlines()[0].split()
-        if len(parts) < 2 or parts[1] not in {"429", "503"}:
+        accepted = {"429", "503"} | ({"301", "302", "303", "307", "308"} if redirects else set())
+        if len(parts) < 2 or parts[1] not in accepted:
             return None
         fields = {}
         for line in last.splitlines()[1:]:
@@ -914,6 +966,10 @@ class CurlBackend:
         for _ in range(11):
             response = self._request_once(current_url, headers, max_bytes, stop_event, False)
             location = response.headers.get("location")
+            if response.status in {301,302,303,307,308} and not location:
+                if redirect_validator:
+                    redirect_validator(current_url, current_url)
+                raise IncompleteRepresentationError("redirect response has no Location header")
             if response.status not in {301, 302, 303, 307, 308} or not location:
                 response.elapsed = time.monotonic() - started
                 return response
@@ -972,7 +1028,7 @@ class CurlBackend:
             )
             early_control = None
             while proc.poll() is None:
-                early_control = self._early_control_status(header_path)
+                early_control = self._early_control_status(header_path, redirects=not follow_redirects)
                 if early_control is not None:
                     proc.kill()
                     break
@@ -981,6 +1037,11 @@ class CurlBackend:
                     proc.wait(timeout=5)
                     raise Stopped
             stdout, stderr = proc.communicate()
+            if early_control is None:
+                # A short redirect can finish (or close its irrelevant body)
+                # between polls. Its headers still take priority over curl's
+                # transfer/decompression error for that discarded body.
+                early_control = self._early_control_status(header_path, redirects=not follow_redirects)
             if early_control is not None:
                 status, fields = early_control
                 return TransportResponse(status, fields, url, b"", self.name,
@@ -1017,6 +1078,7 @@ class CurlBackend:
         stop_event: threading.Event,
         redirect_validator: Callable[[str, str], None] | None = None,
         _redirect_depth: int = 0,
+        *, expected_digest: str = "",
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -1044,7 +1106,9 @@ class CurlBackend:
             )
             early_control = None
             while proc.poll() is None:
-                early_control = self._early_control_status(header_path)
+                early_control = self._early_control_status(header_path,
+                    redirects=bool(redirect_validator or getattr(self, "redirect_pacer", None)
+                                   or getattr(self, "redirect_permit_checker", None)))
                 if early_control is not None:
                     proc.kill()
                     break
@@ -1054,8 +1118,26 @@ class CurlBackend:
                     destination.unlink(missing_ok=True)
                     raise Stopped
             stdout, stderr = proc.communicate()
+            if early_control is None:
+                early_control = self._early_control_status(header_path,
+                    redirects=bool(redirect_validator or getattr(self, "redirect_pacer", None)
+                                   or getattr(self, "redirect_permit_checker", None)))
             if early_control is not None:
                 status, fields = early_control
+                if status in {301,302,303,307,308} and not fields.get("location"):
+                    if redirect_validator:
+                        redirect_validator(url, url)
+                    raise IncompleteRepresentationError("redirect response has no Location header")
+                if status in {301, 302, 303, 307, 308} and fields.get("location"):
+                    if _redirect_depth >= 10:
+                        raise RuntimeError(f"too many redirects: {url}")
+                    next_url = urllib.parse.urljoin(url, fields["location"])
+                    if redirect_validator:
+                        redirect_validator(url, next_url)
+                    _pace_redirect_hop(self, stop_event)
+                    return self.download(next_url, headers, destination, max_bytes, stop_event,
+                        redirect_validator=redirect_validator, _redirect_depth=_redirect_depth+1,
+                        expected_digest="")
                 return TransportFileResponse(status, fields, url, destination, 0,
                     hashlib.sha256(b"").hexdigest(), b"", self.name,
                     time.monotonic()-started)
@@ -1079,7 +1161,8 @@ class CurlBackend:
                     redirect_validator(url, next_url)
                 _pace_redirect_hop(self, stop_event)
                 return self.download(next_url, headers, destination, max_bytes, stop_event,
-                    redirect_validator=redirect_validator, _redirect_depth=_redirect_depth+1)
+                    redirect_validator=redirect_validator, _redirect_depth=_redirect_depth+1,
+                    expected_digest="")
             _check_full_range(status, parsed_headers)
             if status in {429, 503}:
                 return TransportFileResponse(status, parsed_headers, final_url,
@@ -1088,7 +1171,7 @@ class CurlBackend:
             with raw_path.open("rb") as raw:
                 raw_chunks = iter(lambda: raw.read(64 * 1024), b"")
                 size, content_hash, preview = _write_limited(
-                    _decoded_verified_chunks(raw_chunks, parsed_headers, stop_event),
+                    _decoded_verified_chunks(raw_chunks, parsed_headers, stop_event, expected_digest=expected_digest),
                     destination, max_bytes, stop_event)
             return TransportFileResponse(
                 status=status, headers=parsed_headers, final_url=final_url,
@@ -1182,7 +1265,8 @@ class ResilientTransport:
                 "preferred_backend": self.last_success,
             }
 
-    def _await_backend(self, name: str, stop_event: threading.Event) -> None:
+    def _await_backend(self, name: str, stop_event: threading.Event,
+                       alternatives: Iterable[str] = ()) -> str:
         """One recovery probe per cooling backend, without blocking healthy peers."""
         if not hasattr(self, "condition"):
             # Compatibility with legacy injected transports made via __new__.
@@ -1194,9 +1278,16 @@ class ResilientTransport:
             with self.condition:
                 until = self.cooldown_until.get(name)
                 if until is None:
-                    return
+                    return name
                 delay = max(0.0, until - time.monotonic())
                 if delay > 0 or name in self.recovery_probes:
+                    ready = next((other for other in alternatives
+                        if other != name and other in self.backends
+                        and other not in self.recovery_probes
+                        and self.cooldown_until.get(other, 0.0) <= time.monotonic()), None)
+                    if ready is not None:
+                        name = ready
+                        continue
                     self.backend_waiters += 1
                     try:
                         self.condition.wait(timeout=min(0.5, max(0.05, delay)))
@@ -1204,7 +1295,7 @@ class ResilientTransport:
                         self.backend_waiters -= 1
                     continue
                 self.recovery_probes.add(name)
-                return
+                return name
 
     def _backend_result(self, name: str, succeeded: bool) -> None:
         with self.condition:
@@ -1227,8 +1318,15 @@ class ResilientTransport:
         failures: list[tuple[str, BaseException]] = []
         # An alternate stack is a diagnosis/recovery trial, not three new
         # physical connections for every failed logical URL attempt.
+        attempted: set[str] = set()
         for attempt_number, name in enumerate(self._ordered_names()[:2]):
-            self._await_backend(name, stop_event)
+            if name in attempted:
+                continue
+            name = self._await_backend(name, stop_event,
+                [route for route in self.order if route not in attempted])
+            if name in attempted:
+                continue
+            attempted.add(name)
             try:
                 pacer = getattr(self, "physical_pacer", None) or getattr(self, "fallback_pacer", None)
                 if pacer is not None and (getattr(self, "physical_pacer", None) is not None or attempt_number):
@@ -1322,8 +1420,17 @@ class ResilientTransport:
         failures: list[tuple[str, BaseException]] = []
         names = (["httpx"] if retain_partial and destination.exists() and _partial_metadata_path(destination).is_file()
                  and "httpx" in self.backends else self._ordered_names()[:2])
+        attempted: set[str] = set()
         for attempt_number, name in enumerate(names):
-            self._await_backend(name, stop_event)
+            if name in attempted:
+                continue
+            alternatives = [route for route in self.order if route not in attempted]
+            if retain_partial and len(names) == 1:
+                alternatives = names
+            name = self._await_backend(name, stop_event, alternatives)
+            if name in attempted:
+                continue
+            attempted.add(name)
             try:
                 pacer = getattr(self, "physical_pacer", None) or getattr(self, "fallback_pacer", None)
                 if pacer is not None and (getattr(self, "physical_pacer", None) is not None or attempt_number):
@@ -1345,7 +1452,10 @@ class ResilientTransport:
             try:
                 kwargs = ({"redirect_validator": redirect_validator}
                           if redirect_validator is not None else {})
+                if _valid_cdx_digest(expected_digest):
+                    kwargs["expected_digest"] = expected_digest
                 if name == "httpx" and retain_partial:
+                    kwargs.pop("expected_digest", None)
                     response = backend.download(
                         url, headers, destination, max_bytes, stop_event,
                         retain_partial=True, expected_digest=expected_digest, **kwargs,

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from archive_scout.config import ProjectConfig
+from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target, record_error, upsert_capture, upsert_document
 from archive_scout.downloads.retry import retry_error_urls
@@ -50,6 +51,7 @@ class RetryTests(unittest.TestCase):
             record_error(database, "scan", "scan_failure", "bad scan", capture_id=rows[0]["id"], document_id=document_id)
             record_error(database, "download", "timeout", "timed out", capture_id=rows[1]["id"])
             config = ProjectConfig(output_dir=root, targets=["example.com/*"], keywords=["alpha"])
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.for_target('example.com/*')),))
             captured = {"documents": [], "captures": []}
 
             def fake_rescan(database, scan_run_id, keywords, stop_event, callback, document_ids, workers=None):

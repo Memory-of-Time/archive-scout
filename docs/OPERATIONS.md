@@ -5,16 +5,44 @@ Archive Scout keeps indexing, text acquisition, local scanning, media acquisitio
 ## Core operation handoffs
 
 - **All:** Recover local retained bodies and missing scores; resume required CDX indexing; download and scan selected text; verify the saved-body scan; write text reports; optionally continue the selected media phase; optionally rebuild Research.
-- **Resume:** Keep compatible scan evidence and the exact unfinished supplemental-media phase, including its saved direct/external media settings. Do not convert an external-embed task into broad direct-media indexing.
-- **Download and scan:** Use existing indexed captures, score retained text, verify scan coverage, and write reports without fresh indexing.
-- **Download only:** Index and acquire text without scoring; if enabled, process selected media; report unresolved work independently.
+- **Resume:** Restore the latest unfinished acquisition, indexing, scanning or media request, including its saved targets, dates, keyword sets and media selection. Acquisition-only remains acquisition-only. Distinct earlier unfinished requests remain checkpointed; completing an intervening task makes the earlier request resumable again. Reports and maintenance do not replace acquisition intent. Current transport, pacing, report and redirect controls remain adjustable.
+- **Download and scan:** Reuse complete inventory; finish any missing required index coverage before replay requests, score retained text, verify scan coverage, and write reports.
+- **Download only:** Index and acquire text without scoring; if embedded media is enabled, parse retained bodies locally for discovery without creating keyword scan jobs. Finish required media indexing before acquiring selected media. Report unresolved work independently.
 - **Index only:** Index and classify the inventory, write index reports, retain incomplete state for deferred CDX scopes.
 - **Rescan:** Reinterpret retained local bodies with selected rules, without requesting archive bodies.
-- **Retry:** Text retry and media retry keep their existing distinct scope and attempt policies. Pending/failed selected media is never labeled successfully acquired.
+- **Retry:** Retry selected errors within the active inventory scope. Temporary failures continue through persistent scheduling when enabled; accumulated historical attempts never permanently hide eligible pending work. Text recovery and local scanning finish before dependent media acquisition. Pending/failed selected media is never labeled successfully acquired.
 - **Media only:** Media-index, media-download and media-retry operate without requiring an ordinary text scan and report their own unfinished selection.
 - **Report (idle):** Regenerates available scan/index and media reports. Does not index, download or rescan. If no index or scan exists, writes an honest empty inventory summary.
 
 Other analysis, research, hitlist, import, repair, integrity, backup and maintenance operations remain independent. Completed scan evidence is **not revoked** by an export permission, storage or formatting failure.
+
+## Redirect policy and phase admission
+
+With **Follow archived redirects during text acquisition** off, the first HTTP
+301/302/303/307/308 response excludes that capture immediately. No destination
+request, redirect-body parsing, fallback replay or automatic retry follows.
+This includes same-site, canonical and timestamp redirects. The capture remains
+in the inventory as `skipped_redirect_policy`, with its destination recorded.
+Turning the option on reopens those policy exclusions in the active scope.
+Enabled text following permits archived destinations; live-web destinations
+remain errors. Media retains archive-only host checks; the same setting permits
+external archived media hosts, while ordinary same-site archived media redirects
+remain followable. Legacy config key `download_external_redirects` is preserved.
+
+Every acquisition mode requires positive coverage for its required inventory.
+Combined operations index direct text/media inventory before text acquisition,
+then refresh embedded discovery after new text is retained and parsed. Embedded
+URLs unknowable before reading archived text must be resolved before **media**
+acquisition. A failed required lookup or missing body blocks the dependent phase;
+an authoritative zero-result lookup is recorded as unavailable. Index timeout,
+an empty queue, an attempt ceiling, or a successful export is never completion
+evidence. Explicit policy exclusions are recorded exclusions, not saved bodies.
+
+User Stop and process termination preserve committed checkpoints and validated
+bodies; use Resume after reopening. Persistent recovery handles temporary
+failures while the process runs. Permanent archive unavailability, deleted local
+files and disk failure remain explicit incomplete/error outcomes. Resumability
+preserves obligations; it cannot make unavailable archive content exist.
 
 ## Write report now (Reports tab)
 

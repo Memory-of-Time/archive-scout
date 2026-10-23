@@ -6,6 +6,7 @@ import hashlib
 import threading
 import time
 from dataclasses import asdict, replace
+from contextlib import closing
 from pathlib import Path
 from typing import Callable
 
@@ -14,7 +15,7 @@ from .cdx.indexer import index_archive
 from .cdx.parameters import cdx_query_signature
 from .database.classification import classify_indexed_captures
 from .analysis.workflow import run_analysis
-from .config import KeywordSetConfig, MediaConfig, ProjectConfig, save_project_config
+from .config import KeywordSetConfig, MediaConfig, ProjectConfig, save_project_config, project_config_from_payload
 from .database.connection import open_database
 from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
@@ -31,7 +32,7 @@ from .projects.repair import repair_project
 from .projects.diagnostics import export_diagnostics
 from .projects.importers import import_text_folder
 from .constants import VERSION
-from .coverage import IndexCoveragePending, require_text_coverage, require_media_coverage, text_coverage_gaps, media_coverage_gaps, record_admission
+from .coverage import IndexCoveragePending, require_text_coverage, require_media_coverage, require_embedded_coverage, text_coverage_gaps, media_coverage_gaps, record_admission
 from .projects.merge import merge_projects
 from .reports.text import generate_index_reports, generate_reports
 from .research.index import build_research_index
@@ -55,13 +56,14 @@ def _media_unfinished(database: sqlite3.Connection, config: ProjectConfig,
     signatures = [media_query_signature(config)]
     if extra_signature:
         signatures.append(extra_signature)
+    try:
+        require_embedded_coverage(database, config, extra_signature or media_query_signature(config))
+    except IndexCoveragePending:
+        return True
     return bool((not extra_signature and media_coverage_gaps(database, config)) or database.execute(
         "SELECT 1 FROM media_captures WHERE state IN ('pending','error','downloading') "
         "AND query_signature IN (" + ",".join("?" for _ in signatures) + ") LIMIT 1",
         signatures,
-    ).fetchone() or database.execute(
-        "SELECT 1 FROM media_index_state WHERE query_signature=? AND complete=0 LIMIT 1",
-        (media_index_state_signature(config),),
     ).fetchone() or (extra_signature and database.execute(
         "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
         "AND state IN ('pending','error','resolving') LIMIT 1",
@@ -89,6 +91,80 @@ SUPPORTED_MODES = {
     "media_all", "media_index", "media_download", "media_retry",
     "analysis", "research_index", "forum_rebuild", "merge_project",
 }
+
+RESUMABLE_MODES = {"all", "external_media_after_scan", "index", "download",
+    "download_only", "retry_download_errors", "rescan", "retry_errors",
+    "media_all", "media_index", "media_download", "media_retry"}
+
+
+def _request_identity(request: dict) -> tuple[str, str]:
+    settings = dict(request["settings"])
+    for key in ("output_dir", "workers", "download_delay", "cdx_delay", "connect_timeout",
+                "read_timeout", "network", "report", "download_external_redirects"):
+        settings.pop(key, None)
+    return request["mode"], json.dumps(settings, sort_keys=True)
+
+
+def _remember_resume_request(db, config, mode, operation_run_id, *, resumed=False):
+    request = {"mode": mode, "settings": config.to_payload(), "operation_run_id": operation_run_id}
+    old = db.execute("SELECT value FROM project_meta WHERE key='resume_request'").fetchone()
+    backlog = db.execute("SELECT value FROM project_meta WHERE key='resume_backlog'").fetchone()
+    pending = json.loads(backlog[0]) if backlog else []
+    if old and not resumed:
+        previous = json.loads(old[0])
+        if _request_identity(previous) != _request_identity(request):
+            pending = [item for item in pending if _request_identity(item) != _request_identity(previous)]
+            pending.append(previous)
+    # Repeating or resuming the same request replaces its operation envelope,
+    # while every payload/checkpoint retains its independent durable identity.
+    pending = [item for item in pending if _request_identity(item) != _request_identity(request)]
+    db.execute("INSERT OR REPLACE INTO project_meta VALUES('resume_backlog',?)", (json.dumps(pending),))
+    db.execute("INSERT OR REPLACE INTO project_meta VALUES('resume_request',?)", (json.dumps(request),))
+
+
+def _complete_resume_request(db, operation_run_id):
+    active = db.execute("SELECT value FROM project_meta WHERE key='resume_request'").fetchone()
+    if not active or json.loads(active[0]).get("operation_run_id") != operation_run_id:
+        return
+    backlog = db.execute("SELECT value FROM project_meta WHERE key='resume_backlog'").fetchone()
+    pending = json.loads(backlog[0]) if backlog else []
+    if pending:
+        db.execute("UPDATE project_meta SET value=? WHERE key='resume_request'", (json.dumps(pending.pop()),))
+    else:
+        db.execute("DELETE FROM project_meta WHERE key='resume_request'")
+    if pending:
+        db.execute("UPDATE project_meta SET value=? WHERE key='resume_backlog'", (json.dumps(pending),))
+    else:
+        db.execute("DELETE FROM project_meta WHERE key='resume_backlog'")
+
+
+def _resume_request(config: ProjectConfig) -> tuple[ProjectConfig, str]:
+    """Restore intent without letting reports/maintenance overwrite the plan.
+
+    Project location and current transport/redirect controls remain adjustable;
+    inventory, keyword rules and optional media retain the interrupted request.
+    """
+    path = config.output_dir / "archive_scout.sqlite3"
+    if not path.is_file():
+        return config, "resume"
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        try:
+            row = db.execute("SELECT value FROM project_meta WHERE key='resume_request'").fetchone()
+        except sqlite3.OperationalError:
+            return config, "resume"  # legacy database; normal migration handles it
+    if not row:
+        return config, "resume"
+    saved = json.loads(row[0])
+    mode = saved.get("mode")
+    if mode not in RESUMABLE_MODES:
+        raise ValueError("Saved resume operation is unsupported; project progress was retained")
+    restored = project_config_from_payload(saved["settings"], config.output_dir / "project.json")
+    restored = replace(restored, output_dir=config.output_dir, workers=config.workers,
+        download_delay=config.download_delay, cdx_delay=config.cdx_delay,
+        connect_timeout=config.connect_timeout, read_timeout=config.read_timeout,
+        network=config.network, report=config.report,
+        download_external_redirects=config.download_external_redirects).normalized()
+    return restored, mode
 
 
 def is_recoverable_pause(exc: BaseException) -> bool:
@@ -119,12 +195,12 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
     previously scored documents belong to the current target/signature set.
     This check is performed at most once on an explicit Resume, never per URL.
     """
-    allowed = ("interrupted", "complete") if include_complete else ("interrupted",)
+    allowed = ("interrupted", "failed", "complete") if include_complete else ("interrupted", "failed")
     candidate = database.execute(
         """SELECT id,metadata_json,status FROM scan_runs
            WHERE keyword_set_id=? AND minimum_score=? AND status IN ("""
         + ",".join("?" for _ in allowed) + """)
-           AND source_operation IN (""" + ("'rescan'" if rescan_only else "'all','download','resume','external_media_after_scan'") + """)
+           AND source_operation IN (""" + ("'rescan'" if rescan_only else "'all','download','resume','external_media_after_scan','retry_errors'") + """)
            ORDER BY CASE status WHEN 'interrupted' THEN 0 ELSE 1 END,id DESC LIMIT 1""",
         (keyword_set_id, config.minimum_score, *allowed),
     ).fetchone()
@@ -155,15 +231,20 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
         # v1.2.0 had no scope marker. Only reuse if its existing matched
         # document references are all in the present scope. Unmatched saved
         # captures keep their independent durable states regardless.
-        conditions = " OR ".join("(t.pattern=? AND c.query_signature=?)" for _ in accepted)
-        params = [item for pair in sorted(accepted) for item in pair]
+        database.execute("CREATE TEMP TABLE IF NOT EXISTS archive_scout_legacy_scopes(pattern TEXT,signature TEXT,PRIMARY KEY(pattern,signature)) WITHOUT ROWID")
+        database.execute("DELETE FROM archive_scout_legacy_scopes")
+        database.executemany("INSERT INTO archive_scout_legacy_scopes VALUES(?,?)", sorted(accepted))
         mismatch = database.execute(
-            f"""SELECT 1 FROM document_matches dm
+            """SELECT 1 FROM document_matches dm
                 JOIN documents d ON d.id=dm.document_id
                 JOIN captures c ON c.id=d.capture_id
-                LEFT JOIN targets t ON t.id=c.target_id
-                WHERE dm.scan_run_id=? AND NOT ({conditions}) LIMIT 1""",
-            (run_id, *params),
+                WHERE dm.scan_run_id=? AND NOT EXISTS (
+                    SELECT 1 FROM targets t JOIN archive_scout_legacy_scopes s
+                    ON s.pattern=t.pattern AND s.signature=c.query_signature
+                    WHERE t.id=c.target_id OR EXISTS (
+                        SELECT 1 FROM capture_target_membership m
+                        WHERE m.capture_id=c.id AND m.target_id=t.id)) LIMIT 1""",
+            (run_id,),
         ).fetchone()
         if mismatch is not None:
             return None
@@ -193,9 +274,9 @@ def prepare_scan_jobs(
         scope_id = _scan_scope_identity(config)
         run_id = (_reusable_interrupted_scan_run(
             database, config, keyword_set_id, scope_id,
-            include_complete=mode in {"all", "download", "resume", "external_media_after_scan"},
+            include_complete=mode in {"all", "download", "resume", "external_media_after_scan", "retry_errors"},
             rescan_only=mode == "rescan",
-        ) if mode in {"all", "download", "resume", "external_media_after_scan", "rescan"} else None)
+        ) if mode in {"all", "download", "resume", "external_media_after_scan", "rescan", "retry_errors"} else None)
         if run_id is None:
             run_id = start_scan_run(
                 database,
@@ -283,7 +364,7 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
 
 
 def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000,
-                           include_exhausted_pending: bool = False):
+                           include_exhausted_pending: bool = False, respect_selection: bool = False):
     """Yield each eligible capture at most once per pass, without an ID-sized list."""
     # Reuse a bounded, disk-backed scope table so target-specific CDX overrides
     # are not silently filtered out by the global signature on retry.
@@ -295,6 +376,8 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         "INSERT OR IGNORE INTO archive_scout_retry_scopes VALUES(?,?)",
         ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
     )
+    from .downloads.schedule import retry_selection
+    selection, selected_params = retry_selection(database, config) if respect_selection else ("", [])
     last_id = 0
     while True:
         # Explicit retry includes pending captures which a lifetime attempt
@@ -314,9 +397,9 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
                    AND (NOT EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id)
                         OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
                                    AND sched.next_eligible_at<=?)))"""
-            + exhausted + ") ORDER BY c.id LIMIT ?",
-            (last_id, time.time(), config.max_attempts, batch_size)
-            if include_exhausted_pending else (last_id, time.time(), batch_size),
+            + exhausted + ")" + selection + " ORDER BY c.id LIMIT ?",
+            (last_id, time.time(), *([config.max_attempts] if include_exhausted_pending else []),
+             *selected_params, batch_size),
         ).fetchall()
         if not rows:
             return
@@ -339,8 +422,7 @@ def remaining_acquisition_gaps(config: ProjectConfig, database: sqlite3.Connecti
                 ON s.pattern=t.pattern AND s.signature=c.query_signature
                 WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                      WHERE m.capture_id=c.id AND m.target_id=t.id))
-             AND (c.state='error' OR (c.state='pending' AND c.download_attempts>=?))""",
-        (config.max_attempts,),
+             AND c.state IN ('error','pending','downloading')""",
     ).fetchone()[0])
 
 
@@ -354,6 +436,7 @@ def recover_transient_text_errors(
     *,
     continuous: bool = False,
     acquire_only: bool = False,
+    respect_selection: bool = False,
 ) -> int:
     """Fair, bounded-memory retries with autonomous outage recovery.
 
@@ -367,7 +450,7 @@ def recover_transient_text_errors(
     previous_remaining = None
     while True:
         attempted = 0
-        for ids in _retryable_text_batches(config, database):
+        for ids in _retryable_text_batches(config, database, respect_selection=respect_selection):
             if stop_event.is_set():
                 raise Stopped
             attempted += len(ids)
@@ -378,10 +461,11 @@ def recover_transient_text_errors(
                              acquire_only=acquire_only)
         # Query one bounded batch to test whether retryable work remains. Avoid
         # a project-sized COUNT inside the hot capture-saving loop.
-        remaining = next(_retryable_text_batches(config, database, batch_size=1), [])
+        remaining = next(_retryable_text_batches(config, database, batch_size=1,
+                                                respect_selection=respect_selection), [])
         if not remaining:
             from .downloads.schedule import next_due
-            scheduled_due = next_due(database, config)
+            scheduled_due = next_due(database, config, respect_selection=respect_selection)
             if scheduled_due is None:
                 return 0
             if not continuous or not config.network.persistent_retries:
@@ -412,7 +496,7 @@ def recover_transient_text_errors(
             failures_without_progress = 0
         previous_remaining = attempted
         from .downloads.schedule import next_due
-        earliest = next_due(database, config)
+        earliest = next_due(database, config, respect_selection=respect_selection)
         pause = min(config.network.retry_max_seconds,
                     max(0.05, (earliest-time.time()) if earliest is not None else
                         config.network.retry_base_seconds))
@@ -427,7 +511,7 @@ def recover_transient_text_errors(
 
 def retry_capture_downloads(config, database, stop_event, callback) -> None:
     """Explicit acquisition-only retry, with no scan jobs or keyword matching."""
-    for ids in _retryable_text_batches(config, database, include_exhausted_pending=True):
+    for ids in _retryable_text_batches(config, database, include_exhausted_pending=True, respect_selection=True):
         if stop_event.is_set():
             raise Stopped
         emit(callback, ProgressEvent("download_retry", f"Retrying {len(ids):,} failed or attempt-exhausted downloads without scanning"))
@@ -443,6 +527,13 @@ def run_project(
     callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     config = config.normalized()
+    resumed_request = False
+    if mode == "resume":
+        config, restored_mode = _resume_request(config)
+        if restored_mode != "resume":
+            emit(callback, ProgressEvent("resume", f"Resuming saved {restored_mode} operation; committed progress retained"))
+            mode = restored_mode
+            resumed_request = True
     if config.download_scope == "index_only" and mode in {"all", "download_only", "external_media_after_scan"}:
         mode = "index"
     if mode == "external_media_after_scan":
@@ -493,6 +584,8 @@ def run_project(
                 discover_embedded=True if pending_media_phase == "external" else config.media.discover_embedded,
                 allow_external_embeds=True if pending_media_phase == "external" else config.media.allow_external_embeds)
     operation_run_id = start_operation_run(database, mode, VERSION)
+    if mode in RESUMABLE_MODES:
+        _remember_resume_request(database, config, mode, operation_run_id, resumed=resumed_request)
     database.commit()
     original_callback = callback
     owner_thread_id = threading.get_ident()
@@ -538,6 +631,9 @@ def run_project(
 
     def result_paths(paths: dict[str, Path]) -> OperationPaths:
         row = database.execute("SELECT status,message FROM operation_runs WHERE id=?", (operation_run_id,)).fetchone()
+        if row and row[0] == "complete" and mode in RESUMABLE_MODES:
+            _complete_resume_request(database, operation_run_id)
+            database.commit()
         return OperationPaths(paths, status=str(row[0]) if row else "complete",
                               message=str(row[1] or "") if row else "")
 
@@ -638,12 +734,16 @@ def run_project(
             index_media(config, database, stop_event, callback)
             paths = generate_media_reports(config, database)
             gaps = bool(media_coverage_gaps(database, config))
+            try:
+                require_embedded_coverage(database, config, media_query_signature(config))
+            except IndexCoveragePending:
+                gaps = True
             finish_operation_run(database, operation_run_id, "incomplete" if gaps else "complete",
                 "Media indexing incomplete; unfinished coverage retained" if gaps else "Media index complete")
             database.commit()
             return result_paths(paths)
         if mode == "media_download":
-            if media_coverage_gaps(database, config):
+            if config.media.discover_embedded or media_coverage_gaps(database, config):
                 index_media(config, database, stop_event, callback)
             require_media_coverage(database, config)
             download_media(config, database, stop_event, callback)
@@ -655,7 +755,7 @@ def run_project(
             database.commit()
             return result_paths(paths)
         if mode == "media_retry":
-            if media_coverage_gaps(database, config):
+            if config.media.discover_embedded or media_coverage_gaps(database, config):
                 index_media(config, database, stop_event, callback)
             require_media_coverage(database, config)
             retry_media_errors(config, database, stop_event, callback)
@@ -725,7 +825,20 @@ def run_project(
                                               callback, continuous=True, acquire_only=True)
             else:
                 retry_capture_downloads(config, database, stop_event, callback)
+                recover_transient_text_errors(config, database, 0, [], stop_event,
+                                              callback, continuous=True, acquire_only=True,
+                                              respect_selection=True)
             if mode == "download_only" and config.media.enabled:
+                if remaining_acquisition_gaps(config, database):
+                    raise IndexCoveragePending("Text acquisition is unfinished; dependent media discovery was not started")
+                if config.media.discover_embedded:
+                    # Parse local bodies for discovery without creating keyword
+                    # jobs; a later Rescan still scores every saved document.
+                    from .scanning.pending import scan_pending_saved
+                    for target in config.targets:
+                        scan_pending_saved(database, config.for_target(target), [],
+                                           stop_event, callback, workers=config.workers)
+                index_media(config, database, stop_event, callback)
                 require_media_coverage(database, config)
                 download_media(config, database, stop_event, callback)
                 recover_active_media(config, database, stop_event, callback)
@@ -772,20 +885,9 @@ def run_project(
                 "WHERE e.resolved=0 AND e.ignored=0 AND e.retryable=1 AND mc.query_signature=?",
                 (media_query_signature(config),),
             ).fetchone()[0]
-            if media_error_count:
-                if media_coverage_gaps(database, config):
-                    index_media(config, database, stop_event, callback)
-                require_media_coverage(database, config)
-                retry_media_errors(
-                    config,
-                    database,
-                    stop_event,
-                    callback,
-                    config.retry_media_capture_ids or None,
-                )
-        if mode in {"all", "external_media_after_scan", "download", "resume"}:
+        if mode in {"all", "external_media_after_scan", "download", "resume", "retry_errors"}:
             recover_transient_text_errors(config, database, primary_run_id, jobs, stop_event,
-                                          callback, continuous=True)
+                                          callback, continuous=True, respect_selection=mode == "retry_errors")
         if mode in {"all", "download", "resume", "external_media_after_scan", "retry_errors"}:
             from .scanning.pending import scan_pending_saved
             for target in config.targets:
@@ -806,8 +908,18 @@ def run_project(
             raise IncompleteCoverage(
                 "Partial reports saved, but scan coverage is incomplete for run(s) "
                 + ", ".join(map(str, incomplete_runs)) + ". Media phase was not started.", paths)
+        if mode in {"all", "external_media_after_scan", "resume", "retry_errors"} and remaining_acquisition_gaps(config, database):
+            raise IncompleteCoverage("Text acquisition remains incomplete; dependent media acquisition was not started", paths)
         external_media_signature = None
-        if mode == "external_media_after_scan" or (mode == "resume" and pending_media_phase == "external"):
+        if mode == "retry_errors" and media_error_count:
+            index_media(config, database, stop_event, callback)
+            require_media_coverage(database, config)
+            require_embedded_coverage(database, config, media_query_signature(config))
+            retry_media_errors(config, database, stop_event, callback,
+                               config.retry_media_capture_ids or None)
+            recover_active_media(config, database, stop_event, callback)
+            paths.update(generate_media_reports(config, database))
+        elif mode == "external_media_after_scan" or (mode == "resume" and pending_media_phase == "external"):
 
             emit(
                 callback,
@@ -818,6 +930,7 @@ def run_project(
             )
             media_signature = index_external_embedded_media(config, database, stop_event, callback)
             external_media_signature = media_signature
+            require_embedded_coverage(database, config, media_signature)
             media_total = int(database.execute(
                 "SELECT COUNT(*) FROM media_captures WHERE query_signature=?", (media_signature,)
             ).fetchone()[0])
@@ -851,7 +964,9 @@ def run_project(
 
             paths.update(generate_media_reports(config, database))
         elif (mode == "all" and config.media.enabled) or (mode == "resume" and pending_media_phase == "direct"):
-
+            # Newly acquired text may introduce previously unknowable URLs.
+            # Direct CDX checkpoints are reused; only new discovery is resolved.
+            index_media(config, database, stop_event, callback)
             require_media_coverage(database, config)
             record_admission(database, operation_run_id, "embedded", config)
             download_media(config, database, stop_event, callback,
@@ -870,8 +985,11 @@ def run_project(
             research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
             paths["research_index"] = research_report
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-        unresolved = remaining_acquisition_gaps(config, database)
-        media_gaps = (bool(config.media.enabled or pending_media_phase) and _media_unfinished(database, config, external_media_signature))
+        unresolved = remaining_acquisition_gaps(config, database) if mode != "rescan" else 0
+        media_requested = (mode == "external_media_after_scan" or external_media_signature is not None
+            or (mode == "all" and config.media.enabled) or bool(pending_media_phase)
+            or (mode == "retry_errors" and bool(media_error_count)))
+        media_gaps = bool(media_requested and _media_unfinished(database, config, external_media_signature))
         finish_operation_run(database, operation_run_id,
                              "incomplete" if (unresolved or index_deferred or media_gaps) else "complete",
                              f"{unresolved:,} unresolved capture(s); indexing deferred={index_deferred}; media gaps={media_gaps}" if (unresolved or index_deferred or media_gaps)

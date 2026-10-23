@@ -166,7 +166,8 @@ def rescan_keyword_sets(
         clauses.append(
             "EXISTS (SELECT 1 FROM targets t "
             "JOIN archive_scout_rescan_scope s ON s.pattern=t.pattern "
-            "AND s.signature=c.query_signature WHERE t.id=c.target_id)"
+            "AND s.signature=c.query_signature WHERE t.id=c.target_id OR EXISTS ("
+            "SELECT 1 FROM capture_target_membership m WHERE m.capture_id=c.id AND m.target_id=t.id))"
         )
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_document_selection")
     if document_ids:

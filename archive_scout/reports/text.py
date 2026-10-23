@@ -112,7 +112,7 @@ def _write_selected(root: Path, run_dir: Path | None, name: str, lines: Iterator
 def _indexed_inventory_lines(database: sqlite3.Connection, fields: list[str]) -> Iterator[str]:
     """Streaming classification/routing evidence; generated only when requested."""
     for row in database.execute(
-        """SELECT c.timestamp,c.mimetype,c.state,c.original_url,
+        """SELECT c.timestamp,c.mimetype,c.state,c.original_url,c.final_url,
                   COALESCE(r.resource_class,'unknown') AS resource_class,
                   COALESCE(r.evidence,'not_classified') AS classification_reason,
                   COALESCE(r.routing,'pending') AS routing_decision
@@ -127,6 +127,8 @@ def _indexed_inventory_lines(database: sqlite3.Connection, fields: list[str]) ->
         coverage=("non_text" if kind in {"image","video","audio","other_binary"}
                   else "body_available" if retained else "url_only")
         skip_reason=str(row["classification_reason"]) if state in {"skipped","error"} else ""
+        if route == "skipped_redirect_policy":
+            skip_reason = "redirect disabled: " + str(row["final_url"] or "Location not supplied")
         values={"timestamp":str(row["timestamp"] or ""),"mime_type":str(row["mimetype"] or ""),
                 "resource_class":kind,"classification_reason":str(row["classification_reason"]),
                 "routing_decision":route,"body_coverage":coverage,"state":state,

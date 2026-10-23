@@ -1230,9 +1230,9 @@ class ArchiveScoutApp(tk.Tk):
 
         redirects = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
         redirects.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)
-        ttk.Checkbutton(redirects, text="Download archived redirect destinations outside selected sites",
+        ttk.Checkbutton(redirects, text="Follow archived redirects during text acquisition",
                         variable=self.download_external_redirects_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(redirects, text="By default, replay redirects stay within the source host or selected sites. Enable this to follow other archived hosts too. Live-web destinations are blocked; the destination is recorded.",
+        ttk.Label(redirects, text="Off: skip a text URL immediately at its first HTTP redirect, including same-site and timestamp redirects. On: follow archived destinations, including other sites. Live-web destinations are blocked. Skipped destinations are recorded.",
                   style="Muted.TLabel", wraplength=520, justify="left").grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
         appearance = ttk.LabelFrame(tab, text="Appearance", padding=10)

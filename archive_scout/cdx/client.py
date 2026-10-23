@@ -28,6 +28,7 @@ from ..network.transports import (
     PermitRevoked,
     ResilientTransport,
     TransportExhaustedError,
+    IncompleteRepresentationError,
     is_transport_connection_failure,
     is_transport_read_timeout,
     is_transport_timeout,
@@ -452,6 +453,7 @@ class HttpClient:
                     "final_url": response.final_url,
                     "backend": response.backend,
                     "elapsed": response.elapsed,
+                    "encoding_recovery": response.headers.get("x-archive-scout-encoding-recovery", ""),
                 }
             except PermitRevoked:
                 self.host_gate.finish_request(permit, recovered=False)
@@ -468,6 +470,12 @@ class HttpClient:
                 if is_missing_frozen_bundle_error(exc):
                     raise frozen_bundle_error_from_exception(exc) from exc
                 if isinstance(exc, TransportExhaustedError):
+                    if any(isinstance(failure, IncompleteRepresentationError)
+                           for _, failure in exc.failures):
+                        # Identical malformed bytes do not improve through
+                        # four immediate requests. The durable capture queue
+                        # owns the next logical recovery turn.
+                        raise TransientRequestError(f"representation failure for {url}: {exc}") from exc
                     if self.coordinated_connection_recovery and exc.connection_failed:
                         self.host_gate.connection_failed(
                             url, self.connection_failure_threshold, self.connection_retry_seconds
