@@ -29,6 +29,7 @@ from ..network.transports import (
     ResilientTransport,
     TransportExhaustedError,
     IncompleteRepresentationError,
+    normalize_transport_error,
     is_transport_connection_failure,
     is_transport_read_timeout,
     is_transport_timeout,
@@ -178,6 +179,25 @@ class HttpClient:
     def close(self) -> None:
         self.transport.close()
 
+    def _finish_failed_transport_turn(self, exc, url, permit, *, splittable):
+        """Persistent owners retry failed turns; do not multiply physical trials."""
+        if any(isinstance(normalize_transport_error(error), IncompleteRepresentationError)
+               for _, error in exc.failures):
+            # The server answered. A bad body is not a failed connectivity probe.
+            self.host_gate.finish_request(permit, recovered=True)
+            if self.coordinated_connection_recovery:
+                self.host_gate.connection_success()
+            raise TransientRequestError(f"representation failure for {url}: {exc}",
+                                        splittable=False) from exc
+        if exc.connection_failed:
+            self.host_gate.finish_request(permit, recovered=False)
+            if self.coordinated_connection_recovery:
+                self.host_gate.connection_failed(url, self.connection_failure_threshold,
+                                                 self.connection_retry_seconds)
+            raise TransientRequestError(f"connection turn failed for {url}: {exc}",
+                connection_failed=True, timed_out=exc.timed_out,
+                read_timed_out=exc.read_timed_out, splittable=splittable) from exc
+
     def get(self, url: str, max_bytes: int, accept: str = "*/*", *, redirect_validator=None) -> dict:
         headers = {
             "User-Agent": self.user_agent,
@@ -285,6 +305,8 @@ class HttpClient:
                 # The archive answered; a local destination policy refusal is
                 # not an outage and must release a successful recovery probe.
                 self.host_gate.finish_request(permit, recovered=True)
+                if self.coordinated_connection_recovery:
+                    self.host_gate.connection_success()
                 raise
             except PermitRevoked:
                 self.host_gate.finish_request(permit, recovered=False)
@@ -293,6 +315,8 @@ class HttpClient:
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
             except RuntimeError as exc:
+                if isinstance(exc, TransportExhaustedError):
+                    self._finish_failed_transport_turn(exc, url, permit, splittable=True)
                 self.host_gate.finish_request(permit, recovered=False)
                 if isinstance(exc, TransientRequestError):
                     raise
@@ -301,10 +325,6 @@ class HttpClient:
                 # TransportExhaustedError subclasses RuntimeError so it must be
                 # handled before deterministic local RuntimeError failures.
                 if isinstance(exc, TransportExhaustedError):
-                    if self.coordinated_connection_recovery and exc.connection_failed:
-                        self.host_gate.connection_failed(
-                            url, self.connection_failure_threshold, self.connection_retry_seconds
-                        )
                     timed_out = is_timeout_error(exc)
                     read_timed_out = bool(getattr(exc, "read_timed_out", False))
                     generic_attempt += 1
@@ -430,6 +450,8 @@ class HttpClient:
                     continue
 
                 self.host_gate.finish_request(permit, recovered=True)
+                if self.coordinated_connection_recovery:
+                    self.host_gate.connection_success()
                 if status >= 400:
                     self._discard_untracked_partial(destination)
                     if status not in RETRYABLE_STATUS:
@@ -455,6 +477,12 @@ class HttpClient:
                     "elapsed": response.elapsed,
                     "encoding_recovery": response.headers.get("x-archive-scout-encoding-recovery", ""),
                 }
+            except RedirectPolicyError:
+                self._discard_untracked_partial(destination)
+                self.host_gate.finish_request(permit, recovered=True)
+                if self.coordinated_connection_recovery:
+                    self.host_gate.connection_success()
+                raise
             except PermitRevoked:
                 self.host_gate.finish_request(permit, recovered=False)
                 continue
@@ -464,22 +492,14 @@ class HttpClient:
                 raise
             except RuntimeError as exc:
                 self._discard_untracked_partial(destination)
+                if isinstance(exc, TransportExhaustedError):
+                    self._finish_failed_transport_turn(exc, url, permit, splittable=False)
                 self.host_gate.finish_request(permit, recovered=False)
                 if isinstance(exc, TransientRequestError):
                     raise
                 if is_missing_frozen_bundle_error(exc):
                     raise frozen_bundle_error_from_exception(exc) from exc
                 if isinstance(exc, TransportExhaustedError):
-                    if any(isinstance(failure, IncompleteRepresentationError)
-                           for _, failure in exc.failures):
-                        # Identical malformed bytes do not improve through
-                        # four immediate requests. The durable capture queue
-                        # owns the next logical recovery turn.
-                        raise TransientRequestError(f"representation failure for {url}: {exc}") from exc
-                    if self.coordinated_connection_recovery and exc.connection_failed:
-                        self.host_gate.connection_failed(
-                            url, self.connection_failure_threshold, self.connection_retry_seconds
-                        )
                     timed_out = is_timeout_error(exc)
                     read_timed_out = bool(getattr(exc, "read_timed_out", False))
                     generic_attempt += 1

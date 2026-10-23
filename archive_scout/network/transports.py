@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import errno
+import http.client
 import json
 import re
 import base64
@@ -36,6 +38,50 @@ class BackendUnavailable(RuntimeError):
     pass
 
 
+class CurlTransportError(OSError):
+    """Preserve curl's exit code instead of inferring its phase from prose."""
+
+    def __init__(self, code: int, message: str):
+        self.curl_code = int(code)
+        super().__init__(message)
+
+
+def exception_chain(exc: BaseException) -> Iterable[BaseException]:
+    """Walk wrapped library errors, including urllib3's exception arguments."""
+    pending, seen = [exc], set()
+    while pending and len(seen) < 64:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for value in (current.__context__, getattr(current, "reason", None),
+                      *current.args[:16], current.__cause__):
+            if isinstance(value, BaseException):
+                pending.append(value)
+        pending.extend(error for _, error in getattr(current, "failures", ())
+                       if isinstance(error, BaseException))
+
+
+def normalize_transport_error(exc: BaseException) -> BaseException:
+    """Normalize failed representations without treating arbitrary resets as EOF."""
+    for error in exception_chain(exc):
+        if isinstance(error, IncompleteRepresentationError):
+            return error
+        incomplete = isinstance(error, (http.client.IncompleteRead, urllib3.exceptions.IncompleteRead))
+        incomplete |= isinstance(error, CurlTransportError) and error.curl_code == 18
+        if isinstance(error, (httpx.RemoteProtocolError, urllib3.exceptions.ProtocolError)):
+            message = str(error).casefold()
+            incomplete |= any(part in message for part in (
+                "without sending complete message body", "incomplete chunked read",
+                "response ended prematurely", "incompleteread("))
+        if incomplete:
+            normalized = IncompleteRepresentationError(str(error))
+            normalized.__cause__ = exc
+            return normalized
+    return exc
+
+
 class PermitRevoked(RuntimeError):
     """A shared host pause began while awaiting the physical network slot."""
 
@@ -61,7 +107,7 @@ class TransportExhaustedError(RuntimeError):
             is_transport_connection_failure(exc) for _, exc in failures
         )
         summary = "; ".join(f"{name}: {type(exc).__name__}: {exc}" for name, exc in failures)
-        super().__init__(f"all network backends failed for {url}: {summary}")
+        super().__init__(f"attempted network backend(s) failed for {url}: {summary}")
 
 
 @dataclass(slots=True)
@@ -88,8 +134,6 @@ class TransportFileResponse:
 
 
 def is_transport_timeout(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    visited: set[int] = set()
     timeout_types = (
         TimeoutError,
         httpx.TimeoutException,
@@ -97,15 +141,9 @@ def is_transport_timeout(exc: BaseException) -> bool:
         urllib3.exceptions.ReadTimeoutError,
         urllib3.exceptions.ConnectTimeoutError,
     )
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
+    for current in exception_chain(exc):
         if isinstance(current, timeout_types):
             return True
-        reason = getattr(current, "reason", None)
-        if isinstance(reason, BaseException) and reason is not current:
-            current = reason
-            continue
-        current = current.__cause__ or current.__context__
     return False
 
 
@@ -113,8 +151,6 @@ def is_transport_timeout(exc: BaseException) -> bool:
 
 def is_transport_connection_failure(exc: BaseException) -> bool:
     """Classify DNS, proxy, TLS, and socket setup failures across backends."""
-    current: BaseException | None = exc
-    visited: set[int] = set()
     connection_types = (
         ConnectionError,
         ConnectionRefusedError,
@@ -128,12 +164,19 @@ def is_transport_connection_failure(exc: BaseException) -> bool:
         urllib3.exceptions.ConnectTimeoutError,
         urllib3.exceptions.ProxyError,
     )
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
+    for current in exception_chain(exc):
         if isinstance(current, connection_types):
             return True
+        if isinstance(current, CurlTransportError):
+            if current.curl_code in {5, 6, 7, 35, 60, 97}:
+                return True
         if isinstance(current, OSError):
             text = str(current).casefold()
+            # Compatibility with injected/older curl wrappers that lost the code.
+            if re.search(r"curl:\s*\((?:5|6|7|35|60|97)\)", text):
+                return True
+            if current.errno in {errno.ECONNRESET, 10054} or getattr(current, "winerror", None) == 10054:
+                return True
             if any(token in text for token in (
                 "could not resolve", "name resolution", "failed to resolve",
                 "connection refused", "connect call failed", "failed to connect",
@@ -142,30 +185,17 @@ def is_transport_connection_failure(exc: BaseException) -> bool:
                 "no route to host",
             )):
                 return True
-        reason = getattr(current, "reason", None)
-        if isinstance(reason, BaseException) and reason is not current:
-            current = reason
-            continue
-        current = current.__cause__ or current.__context__
     return False
 
 
 def is_transport_read_timeout(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    visited: set[int] = set()
     read_types = (
         httpx.ReadTimeout,
         urllib3.exceptions.ReadTimeoutError,
     )
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
+    for current in exception_chain(exc):
         if isinstance(current, read_types):
             return True
-        reason = getattr(current, "reason", None)
-        if isinstance(reason, BaseException) and reason is not current:
-            current = reason
-            continue
-        current = current.__cause__ or current.__context__
     return False
 
 def _ssl_context() -> ssl.SSLContext:
@@ -1050,7 +1080,7 @@ class CurlBackend:
                 message = (stderr or stdout or f"curl exited {proc.returncode}").strip()
                 if proc.returncode == 28:
                     raise TimeoutError(message)
-                raise OSError(message)
+                raise CurlTransportError(proc.returncode, message)
             lines = stdout.splitlines()
             status = int(lines[-2]) if len(lines) >= 2 and lines[-2].isdigit() else 0
             final_url = lines[-1] if lines else url
@@ -1146,7 +1176,7 @@ class CurlBackend:
                 message = (stderr or stdout or f"curl exited {proc.returncode}").strip()
                 if proc.returncode == 28:
                     raise TimeoutError(message)
-                raise OSError(message)
+                raise CurlTransportError(proc.returncode, message)
             lines = stdout.splitlines()
             status = int(lines[-2]) if len(lines) >= 2 and lines[-2].isdigit() else 0
             final_url = lines[-1] if lines else url
@@ -1372,7 +1402,7 @@ class ResilientTransport:
                 if exc.errno in {28, 122} or getattr(exc, "winerror", None) in {39, 112}:
                     self._backend_result(name, True)
                     raise
-                failures.append((name, exc))
+                failures.append((name, normalize_transport_error(exc)))
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
                 # must not be retried using another backend.
@@ -1381,9 +1411,9 @@ class ResilientTransport:
                     # Release an exclusive recovery probe before propagating.
                     self._backend_result(name, True)
                     raise
-                failures.append((name, exc))
+                failures.append((name, normalize_transport_error(exc)))
             except Exception as exc:
-                failures.append((name, exc))
+                failures.append((name, normalize_transport_error(exc)))
             last_error = failures[-1][1]
             # A read/first-byte timeout does not establish a broken backend.
             self._backend_result(name, not is_transport_connection_failure(last_error))
@@ -1486,16 +1516,16 @@ class ResilientTransport:
                 if exc.errno in {28, 122} or getattr(exc, "winerror", None) in {39, 112}:
                     self._backend_result(name, True)
                     raise
-                failures.append((name, exc))
+                failures.append((name, normalize_transport_error(exc)))
             except RuntimeError as exc:
                 if str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     # Local response-policy refusal means the route answered.
                     # Release an exclusive recovery probe before propagating.
                     self._backend_result(name, True)
                     raise
-                failures.append((name, exc))
+                failures.append((name, normalize_transport_error(exc)))
             except Exception as exc:
-                failures.append((name, exc))
+                failures.append((name, normalize_transport_error(exc)))
             partial_ready = bool(retain_partial and _partial_metadata_path(destination).is_file()
                                  and destination.is_file())
             if not partial_ready:

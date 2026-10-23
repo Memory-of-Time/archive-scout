@@ -12,15 +12,11 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     # textual messages. Pool exhaustion is not an archive read timeout.
     import httpx
     import urllib3
-    from ..network.transports import (TransportExhaustedError, ContentEncodingMismatch,
-                                     PayloadDigestMismatch, IncompleteRepresentationError)
-    pending: list[BaseException] = [exc]
-    visited = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in visited:
-            continue
-        visited.add(id(current))
+    from ..network.transports import (ContentEncodingMismatch,
+                                     PayloadDigestMismatch, IncompleteRepresentationError,
+                                     exception_chain, normalize_transport_error,
+                                     is_transport_connection_failure)
+    for current in exception_chain(normalize_transport_error(exc)):
         if isinstance(current, ContentEncodingMismatch):
             return "content_encoding_mismatch", status, True
         if isinstance(current, PayloadDigestMismatch):
@@ -33,12 +29,8 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
             return "connect_timeout", status, True
         if isinstance(current, (httpx.ReadTimeout, urllib3.exceptions.ReadTimeoutError)):
             return "read_timeout", status, True
-        if isinstance(current, TransportExhaustedError):
-            pending.extend(error for _, error in current.failures)
-        if current.__cause__ is not None:
-            pending.append(current.__cause__)
-        if current.__context__ is not None:
-            pending.append(current.__context__)
+    if is_transport_connection_failure(exc):
+        return "connection", status, True
     explicit_category = str(getattr(exc, "category", "") or "")
     if explicit_category in {"wayback_excluded", "robots_blocked", "wayback_forbidden", "missing_capture", "http_client_error"}:
         return explicit_category, int(status) if status else None, False

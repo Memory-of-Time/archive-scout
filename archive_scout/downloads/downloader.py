@@ -122,25 +122,30 @@ def _restore_changed_url_filter_skips(database: sqlite3.Connection, config: Proj
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES(?,?)", (key,digest))
 
 
-def cumulative_download_progress(
-    database: sqlite3.Connection,
-    config: ProjectConfig,
-    queued_total: int,
-    capture_ids: list[int] | None = None,
-) -> tuple[int, int]:
-    """Return completed/total progress across the whole resumable CDX queue."""
-    if capture_ids:
-        return 0, max(0, int(queued_total))
-    # Callers may ask for progress without first constructing a queue.
+def _capture_progress_counts(database, config, capture_ids=None) -> dict[str, int]:
+    """One inventory aggregation per batch, never a history scan per save."""
     _populate_download_scopes(database, config)
-    total = int(database.execute(
-        """SELECT COUNT(*) FROM captures c WHERE EXISTS (
-            SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-            ON s.pattern=t.pattern AND s.signature=c.query_signature
-            WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-                WHERE m.capture_id=c.id AND m.target_id=t.id))"""
-    ).fetchone()[0])
-    return max(0, total - int(queued_total)), total
+    source = "captures c"
+    if capture_ids:
+        database.execute("CREATE TEMP TABLE IF NOT EXISTS archive_scout_progress_selection(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+        database.execute("DELETE FROM archive_scout_progress_selection")
+        database.executemany("INSERT OR IGNORE INTO archive_scout_progress_selection VALUES(?)",
+                             ((int(value),) for value in capture_ids))
+        # Drive explicit retries from selected IDs, not the entire history.
+        source = "archive_scout_progress_selection p CROSS JOIN captures c ON c.id=p.id"
+    rows = database.execute("SELECT c.state,COUNT(*) FROM " + source + """ WHERE EXISTS (
+        SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+        ON s.pattern=t.pattern AND s.signature=c.query_signature
+        WHERE t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
+            WHERE m.capture_id=c.id AND m.target_id=t.id)) GROUP BY c.state""")
+    return {str(row[0]): int(row[1]) for row in rows}
+
+
+def cumulative_download_progress(database: sqlite3.Connection, config: ProjectConfig,
+                                 queued_total: int, capture_ids=None) -> tuple[int, int]:
+    """Acquired/excluded capture identities; failures are unfinished, not progress."""
+    counts = _capture_progress_counts(database, config, capture_ids)
+    return sum(counts.get(state, 0) for state in ('downloaded','downloaded_unscanned','skipped')), sum(counts.values())
 
 
 def prepare_download_rows(
@@ -567,6 +572,7 @@ def download_archive(
     scan_jobs: list[ScanJob] | None = None,
     acquire_only: bool = False,
 ) -> None:
+    operation_started = time.monotonic()
     if config.download_scope == "index_only":
         if callback:
             callback(ProgressEvent("download", "Index-only mode selected; downloads skipped."))
@@ -588,18 +594,25 @@ def download_archive(
         combined_patterns = ScanJob.create(0, selected[0].name, selected[0].rules).patterns
     with database:
         database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
+    queue_started = time.monotonic()
+    if callback:
+        callback(ProgressEvent("download_prepare", "Preparing disk-backed text acquisition queue; committed progress is retained."))
     total, row_iter = prepare_download_rows(
         database, config, combined_patterns, states=states, capture_ids=capture_ids
     )
-    completed_before, cumulative_total = cumulative_download_progress(
-        database, config, total, capture_ids
-    )
+    progress_counts = _capture_progress_counts(database, config, capture_ids)
+    cumulative_total = sum(progress_counts.values())
+    retained = sum(progress_counts.get(state, 0) for state in ('downloaded','downloaded_unscanned'))
+    excluded = progress_counts.get('skipped', 0)
+    queue_preparation_seconds = time.monotonic()-queue_started
+    initial_queue_size = total
     if not total:
         if callback:
             callback(ProgressEvent(
                 "download",
-                f"No matching captures remain to download; project progress {completed_before:,}/{cumulative_total:,}.",
-                completed_before, cumulative_total,
+                f"No captures eligible in this batch; text acquisition satisfied {retained+excluded:,}/{cumulative_total:,}; "
+                f"retained {retained:,}; excluded/routed {excluded:,}. This does not certify complete inventory or scanning.",
+                retained+excluded, cumulative_total,
             ))
         if not acquire_only:
             from ..scanning.pending import scan_pending_saved
@@ -796,6 +809,7 @@ def download_archive(
                 last_completion = time.monotonic()
                 for future in done:
                     row = futures.pop(future)
+                    outcome_state = None
                     try:
                         result = future.result()
                         try:
@@ -825,6 +839,7 @@ def download_archive(
                                     pass  # Backstop: adopt exact ID-bound file at next run.
                             raise
                         saved_this_pass += 1
+                        outcome_state = 'downloaded_unscanned'
                         if scanner_thread is not None:
                             scanner_wakeup.set()
                         last_save = time.monotonic()
@@ -836,6 +851,7 @@ def download_archive(
                                 for analysis in result["analyses"].values()
                             ))
                     except NonTextResponse as exc:
+                        outcome_state = 'skipped'
                         with database_write_lock, database:
                             database.execute("UPDATE captures SET state='skipped',updated_at=? WHERE id=?", (utc_now(),row["id"]))
                             database.execute(
@@ -899,6 +915,7 @@ def download_archive(
                                 clear_retry(database, int(row["id"]))
                             failures += 1
                         else:
+                            outcome_state = 'skipped'
                             with database_write_lock, database:
                                 database.execute("UPDATE captures SET state='skipped',final_url=?,updated_at=? WHERE id=?",
                                     (exc.destination, utc_now(), row["id"]))
@@ -960,6 +977,14 @@ def download_archive(
                         if callback and should_surface_site_issue(category):
                             callback(ProgressEvent("site_issue", issue_message))
                     completed += 1
+                    if outcome_state is None:
+                        # Failures can still leave a valid retained checkpoint
+                        # when a later parse/commit stage fails. Read one ID,
+                        # never recount the project on the acquisition hot path.
+                        outcome_state = database.execute("SELECT state FROM captures WHERE id=?", (row['id'],)).fetchone()[0]
+                    was_retained = row['state'] in {'downloaded','downloaded_unscanned'}
+                    retained += int(outcome_state in {'downloaded','downloaded_unscanned'}) - int(was_retained)
+                    excluded += int(outcome_state == 'skipped') - int(row['state'] == 'skipped')
                     elapsed = max(0.001, time.monotonic() - started)
                     # This measures successfully committed *recent* saves,
                     # not an invocation average diluted by hours of indexing,
@@ -969,15 +994,17 @@ def download_archive(
                         recent_commits.popleft()
                     rate = len(recent_commits) / min(30.0, elapsed)
                     invocation_rate = saved_this_pass / elapsed
-                    cumulative_completed = min(cumulative_total, completed_before + completed)
+                    cumulative_completed = max(0, min(cumulative_total, retained + excluded))
                     if callback:
                         callback(
                             ProgressEvent(
                                 "download",
-                                f"Processed {cumulative_completed:,}/{cumulative_total:,}; "
-                                f"this pass {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
+                                f"Text acquisition satisfied {cumulative_completed:,}/{cumulative_total:,}; "
+                                f"retained {retained:,}; excluded/routed {excluded:,}; "
+                                f"attempt outcomes {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
                                 f"matches committed asynchronously; errors {failures:,}; recent successful saves {rate:.1f}/s (30s); "
-                                f"whole-pass average {invocation_rate:.1f}/s",
+                                f"acquisition average {invocation_rate:.1f}/s; "
+                                f"batch average including preparation {saved_this_pass/max(.001,now-operation_started):.1f}/s",
                                 cumulative_completed,
                                 cumulative_total,
                                 {
@@ -987,6 +1014,16 @@ def download_archive(
                                     "rolling_save_rate_30s": rate,
                                     "invocation_save_rate": invocation_rate,
                                     "new_saves": saved_this_pass,
+                                    "captures_satisfied": cumulative_completed,
+                                    "captures_retained": retained,
+                                    "captures_excluded_or_routed": excluded,
+                                    "capture_total": cumulative_total,
+                                    "attempt_outcomes": completed,
+                                    "attempt_errors": failures,
+                                    "initial_queue_size": initial_queue_size,
+                                    "admitted_attempts": total,
+                                    "queue_preparation_seconds": queue_preparation_seconds,
+                                    "operation_save_rate": saved_this_pass/max(.001, now-operation_started),
                                     "timing_samples": stage_stats["samples"],
                                     "avg_acquisition_seconds": (stage_stats["network_and_pacing_seconds"] /
                                         max(1, stage_stats["samples"])),
