@@ -31,6 +31,7 @@ from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
 from .schedule import record_failure, clear_retry
+from .checkpoint import write_receipt, discard_receipt, sync_directory
 from .redirects import make_replay_redirect_validator
 from ..network.transports import RedirectPolicyError, ResilientTransport
 
@@ -401,7 +402,11 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
     # Publish validated replay bytes before expensive local parsing/scoring.
     # Even a failed parser or SQLite transaction must not force reacquisition.
     path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
+    write_receipt(path, row, {"content_hash": hashlib.sha256(data).hexdigest(),
+        "bytes_saved": len(data), "http_status": response["status"],
+        "final_url": response["final_url"], "response_content_type": content_type})
     atomic_write_bytes(path, bytes(data))
+    sync_directory(path.parent)
     if not scan_now:
         return {"capture_id": int(row["id"]), "path": path,
                 "bytes_saved": len(data), "content_hash": hashlib.sha256(data).hexdigest(),
@@ -486,7 +491,11 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
         publish_started = time.monotonic()
         with stage.open("rb+") as stream:
             os.fsync(stream.fileno())
+        write_receipt(path, row, {"content_hash": response["content_hash"],
+            "bytes_saved": int(response["bytes"]), "http_status": response["status"],
+            "final_url": response["final_url"], "response_content_type": content_type})
         os.replace(stage, path)
+        sync_directory(path.parent)
         publish_seconds = time.monotonic() - publish_started
         return {"network_and_pacing_seconds": publish_started-acquisition_started,
             "file_fsync_publish_seconds": publish_seconds, "capture_id": int(row["id"]), "path": path,
@@ -537,6 +546,7 @@ def save_success(database: sqlite3.Connection, result: dict) -> None:
             _save_payload_evidence(database, result)
             clear_retry(database, result["capture_id"])
             resolve_errors(database, capture_id=result["capture_id"], operations=("download",))
+        discard_receipt(Path(result['path']))
         return
     with database:
         document_id = upsert_document(
@@ -559,6 +569,7 @@ def save_success(database: sqlite3.Connection, result: dict) -> None:
         resolve_errors(database, capture_id=result["capture_id"], operations=("download",))
         _save_payload_evidence(database, result)
         clear_retry(database, result["capture_id"])
+    discard_receipt(Path(result['path']))
 
 
 def download_archive(
@@ -810,6 +821,7 @@ def download_archive(
                 for future in done:
                     row = futures.pop(future)
                     outcome_state = None
+                    retained_after_failure = None
                     try:
                         result = future.result()
                         try:
@@ -821,22 +833,12 @@ def download_archive(
                             for stage in ("network_and_pacing_seconds", "file_fsync_publish_seconds"):
                                 stage_stats[stage] += float(result.get(stage, 0.0))
                         except Exception:
-                            # The atomic body exists even if an INSERT or FTS
-                            # write failed. Save an independent scan checkpoint
-                            # when SQLite is still writable; otherwise the
-                            # orphan-file adopter on restart finds it by ID.
+                            # Publish rescue state and its scan error together
+                            # in the outer handler. A scanner must not race a
+                            # later error write that downgrades a proven body.
                             path = Path(result.get("path", ""))
                             if path.is_file() and path.stat().st_size == result.get("bytes_saved"):
-                                try:
-                                    with database_write_lock, database:
-                                        database.execute(
-                                            """UPDATE captures SET state='downloaded_unscanned',
-                                               bytes_saved=?,http_status=?,final_url=?,updated_at=? WHERE id=?""",
-                                            (result["bytes_saved"], result["http_status"],
-                                             result["final_url"], utc_now(), result["capture_id"]),
-                                        )
-                                except sqlite3.Error:
-                                    pass  # Backstop: adopt exact ID-bound file at next run.
+                                retained_after_failure = result
                             raise
                         saved_this_pass += 1
                         outcome_state = 'downloaded_unscanned'
@@ -937,10 +939,17 @@ def download_archive(
                             category, status, retryable = exc.category, None, False
                         else:
                             category, status, retryable = classify_exception(exc)
+                        if retained_after_failure is not None:
+                            category, status, retryable = 'scan_commit_failure', retained_after_failure['http_status'], True
                         issue_message = site_issue_message(
                             category, str(row["original_url"]), "text download", status
                         )
                         with database_write_lock, database:
+                            if retained_after_failure is not None:
+                                _save_payload_evidence(database, retained_after_failure)
+                                database.execute("""UPDATE captures SET state='downloaded_unscanned',
+                                    bytes_saved=?,http_status=?,final_url=?,updated_at=? WHERE id=?""",
+                                    (retained_after_failure['bytes_saved'],status,retained_after_failure['final_url'],utc_now(),row['id']))
                             database.execute(
                                 """UPDATE captures SET state='error',http_status=?,
                                    final_url=COALESCE(?,final_url),updated_at=?
@@ -954,16 +963,19 @@ def download_archive(
                             )
                             record_error(
                                 database,
-                                "download",
+                                "scan" if retained_after_failure is not None else "download",
                                 category,
                                 repr(exc),
                                 capture_id=int(row["id"]),
                                 http_status=status,
                                 retryable=retryable,
                             )
-                            record_failure(database, int(row["id"]), category, status, retryable,
-                                           config.network.retry_base_seconds,
-                                           config.network.retry_max_seconds)
+                            if retained_after_failure is not None:
+                                clear_retry(database,int(row['id']))
+                            else:
+                                record_failure(database, int(row["id"]), category, status, retryable,
+                                               config.network.retry_base_seconds,
+                                               config.network.retry_max_seconds)
                             if should_surface_site_issue(category):
                                 record_site_issue(
                                     database,
@@ -976,6 +988,8 @@ def download_archive(
                                 )
                         if callback and should_surface_site_issue(category):
                             callback(ProgressEvent("site_issue", issue_message))
+                        if retained_after_failure is not None:
+                            scanner_wakeup.set()
                     completed += 1
                     if outcome_state is None:
                         # Failures can still leave a valid retained checkpoint

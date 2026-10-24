@@ -54,6 +54,10 @@ def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
     if row.get("expected_hash") and (actual_hash != row["expected_hash"]
             or len(data) != int(row.get("expected_size") or 0)):
         raise PayloadIntegrityError(f"local retained body failed SHA-256/size validation: capture {row['id']}")
+    if not row.get('expected_hash'):
+        from ..downloads.checkpoint import prove_file
+        if not prove_file(path, row):
+            raise PayloadIntegrityError(f"local retained body has no complete-transfer proof: capture {row['id']}")
     raw = decode_bytes(data, row.get("response_content_type") or row.get("mimetype") or "")
     replay_problem = classify_replay_content(raw, row.get("final_url") or "")
     if replay_problem:
@@ -112,8 +116,9 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
     target_slots = ",".join("?" for _ in targets)
     while True:
         batch = database.execute(
-            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.length,d.path,
-                 v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
+            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.length,c.digest,d.path,
+                 COALESCE(v.content_hash,d.content_hash) AS expected_hash,
+                 COALESCE(v.bytes_saved,d.size_bytes) AS expected_size,
                  v.response_content_type AS response_content_type,v.final_url AS final_url
                FROM captures c
                LEFT JOIN documents d ON d.capture_id=c.id
@@ -233,6 +238,7 @@ def scan_pending_saved(
                     for future in futures:
                         future.cancel()
                     raise Stopped
+                scanned_paths = []
                 try:
                     # The acquisition owner and scanner coordinate their writes
                     # using a common mutex, while BEGIN IMMEDIATE claims the
@@ -260,7 +266,13 @@ def scan_pending_saved(
                                     "UPDATE capture_routing SET routing='downloaded_scanned',updated_at=? WHERE capture_id=?",
                                     (utc_now(), result["capture_id"]),
                                 )
-                                resolve_errors(database, capture_id=result["capture_id"], document_id=document_id, operations=("scan",))
+                                # Earlier failures can precede document INSERT.
+                                # Requiring its new document ID would strand a
+                                # NULL-document error after successful recovery.
+                                resolve_errors(database, capture_id=result["capture_id"], operations=("scan","download"))
+                                from ..downloads.schedule import clear_retry
+                                clear_retry(database, result['capture_id'])
+                                scanned_paths.append(Path(result['path']))
                             except Exception as exc:
                                 database.execute("ROLLBACK TO SAVEPOINT scout_capture_scan")
                                 if _sqlite_write_busy(exc):
@@ -298,6 +310,9 @@ def scan_pending_saved(
                     delay = min(1.0, 0.1 * 2 ** min(4, busy_attempt - 1))
                     if stop_event.wait(delay):
                         raise Stopped
+            from ..downloads.checkpoint import discard_receipt
+            for path in scanned_paths:
+                discard_receipt(path)
             for future, row, estimate in ready:
                 futures.pop(future)
                 in_flight_bytes -= estimate
@@ -308,6 +323,13 @@ def scan_pending_saved(
                     completed, None,
                 ))
     return completed
+
+
+def _record_recovery_gap(database, row, category: str, message: str) -> None:
+    capture_id = int(row['id'])
+    database.execute("UPDATE captures SET state='error',updated_at=? WHERE id=?", (utc_now(),capture_id))
+    record_error(database, 'scan' if row['state']=='downloaded_unscanned' else 'download',
+                 category, message, capture_id=capture_id, retryable=True)
 
 
 def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: threading.Event,
@@ -322,6 +344,9 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
     from ..classification import classify_payload_kind
     from ..content import classify_replay_content, decode_bytes
     from ..cdx.parameters import cdx_query_signature
+    from ..downloads.checkpoint import prove_file, discard_receipt, preserve_unverified, sync_directory
+    from ..downloads.downloader import _save_payload_evidence
+    from ..downloads.schedule import clear_retry
     target = target or (config.targets[0] if config.targets else None)
     if not target:
         return 0
@@ -330,19 +355,23 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
     adopted = 0
     while True:
         rows = database.execute(
-            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,
-                       v.content_hash AS expected_hash,v.bytes_saved AS expected_size
+            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.digest,c.state,
+                       v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
+                       v.response_content_type,v.final_url,v.response_status
                    FROM captures c
                    LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                LEFT JOIN documents d ON d.capture_id=c.id
-               JOIN targets t ON t.id=c.target_id
-               WHERE c.id>? AND c.query_signature=? AND t.pattern=?
-                 AND c.state IN ('pending','error') AND c.download_attempts>0
+               WHERE c.id>? AND c.query_signature=? AND EXISTS(SELECT 1 FROM targets t
+                 WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS(
+                   SELECT 1 FROM capture_target_membership m WHERE m.capture_id=c.id AND m.target_id=t.id)))
+                 AND ((c.state IN ('pending','error') AND c.download_attempts>0)
+                   OR (c.state='downloaded_unscanned' AND v.capture_id IS NULL))
                  AND d.id IS NULL ORDER BY c.id LIMIT 500""",
             (cursor, sig, target),
         ).fetchall()
         if not rows:
             break
+        committed_paths = []
         with database:
             for row in rows:
                 if stop_event.is_set():
@@ -350,31 +379,52 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                 cursor = int(row["id"])
                 path = capture_path(config.output_dir, cursor, row["timestamp"], row["original_url"])
                 try:
+                    stage = path.with_name(path.name + '.transfer')
+                    if stage.is_file() and 0 < stage.stat().st_size <= config.max_file_bytes:
+                        staged_proof = prove_file(stage, row, expected_hash=row['expected_hash'],
+                            expected_size=row['expected_size'], receipt_for=path)
+                        if staged_proof:
+                            os.replace(stage, path)
+                            sync_directory(path.parent)
                     length = path.stat().st_size
                     if not (0 < length <= config.max_file_bytes):
+                        if row['state'] == 'downloaded_unscanned':
+                            raise FileNotFoundError('retained body has invalid size')
                         continue
-                    # Exact capture identity is encoded in the filename, but a
-                    # previously committed SHA-256 is stronger and mandatory
-                    # whenever available. Do not silently adopt altered bytes.
-                    if row["expected_hash"]:
-                        if length != int(row["expected_size"] or 0):
-                            continue
-                        digest = hashlib.sha256()
-                        with path.open("rb") as check:
-                            for segment in iter(lambda: check.read(1024*1024), b""):
-                                digest.update(segment)
-                        if digest.hexdigest() != row["expected_hash"]:
-                            continue
+                    proof = prove_file(path, row, expected_hash=row['expected_hash'],
+                                       expected_size=row['expected_size'])
+                    if not proof:
+                        preserve_unverified(path)
+                        _record_recovery_gap(database,row,'local_integrity_unproven',
+                            'Saved file has no matching complete-transfer proof; preserved for inspection and queued for reacquisition.')
+                        continue
                     with path.open("rb") as handle:
                         preview = handle.read(min(length, 65536))
                     decision = classify_payload_kind(preview, row["mimetype"] or "", row["original_url"])
                     if decision.resource_class != 'text':
+                        if row['state']=='downloaded_unscanned':
+                            _record_recovery_gap(database,row,'local_integrity_unproven',
+                                'Unproven retained body is not text; acquisition must revalidate routing.')
                         continue
-                    if classify_replay_content(decode_bytes(preview, row["mimetype"] or ""), ''):
+                    try:
+                        preview_text = decode_bytes(preview, proof.get('response_content_type') or row['mimetype'] or '')
+                    except UnicodeDecodeError:
+                        # A prefix can split a UTF-8 character or UTF-16 pair.
+                        # Full-byte proof is already checked; local scanning
+                        # validates the complete representation next.
+                        preview_text = ''
+                    if classify_replay_content(preview_text, proof.get('final_url') or ''):
+                        if row['state']=='downloaded_unscanned':
+                            _record_recovery_gap(database,row,'invalid_archive_replay',
+                                'Recovered file is an archive error shell, not a completed original.')
                         continue
+                    _save_payload_evidence(database, {**proof, 'capture_id':cursor,
+                        'response_content_type':proof.get('response_content_type') or row['response_content_type'] or row['mimetype'],
+                        'final_url':proof.get('final_url') or row['final_url'] or '',
+                        'http_status':proof.get('http_status') or row['response_status'] or 200})
                     database.execute(
                         """UPDATE captures SET state='downloaded_unscanned',bytes_saved=?,updated_at=?
-                           WHERE id=? AND state IN ('error','pending')""",
+                           WHERE id=? AND state IN ('error','pending','downloaded_unscanned')""",
                         (length, utc_now(), cursor),
                     )
                     database.execute(
@@ -384,8 +434,29 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                         (utc_now(), cursor),
                     )
                     adopted += 1
-                except (OSError, ValueError, UnicodeError):
+                    clear_retry(database, cursor)
+                    resolve_errors(database, capture_id=cursor, operations=('download',))
+                    committed_paths.append(path)
+                except FileNotFoundError:
+                    if row['state'] == 'downloaded_unscanned':
+                        _record_recovery_gap(database,row,'missing_local_file',
+                            'Unproven retained body is missing; queued for reacquisition.')
                     continue
+                except OSError as exc:
+                    from ..downloads.downloader import _storage_full, StorageFullError
+                    if _storage_full(exc):
+                        raise StorageFullError('storage full during retained-body recovery') from exc
+                    if row['state']=='downloaded_unscanned':
+                        _record_recovery_gap(database,row,'local_integrity_unproven',repr(exc))
+                    continue
+                except (ValueError, UnicodeError):
+                    if row['state']=='downloaded_unscanned':
+                        _record_recovery_gap(database,row,'local_integrity_unproven',
+                            'Retained body validation failed; reacquisition required.')
+                    continue
+        # Receipts are removed only AFTER the evidence/state transaction commits.
+        for path in committed_paths:
+            discard_receipt(path)
     if adopted and callback:
         callback(ProgressEvent('scan', f'Recovered {adopted:,} complete previously saved bodies without network access.'))
     return adopted

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import tempfile
+import base64
+import hashlib
 import threading
 import unittest
 from pathlib import Path
@@ -40,7 +42,8 @@ class CoverageIntegrityTests(unittest.TestCase):
         path = capture_path(cfg.output_dir, row["id"], row["timestamp"], row["original_url"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"<html><body>needle and other evidence</body></html>")
-        db.execute("UPDATE captures SET state=? WHERE id=?", (state, row["id"]))
+        digest=base64.b32encode(hashlib.sha1(path.read_bytes()).digest()).decode()
+        db.execute("UPDATE captures SET state=?,digest=? WHERE id=?", (state, digest, row["id"]))
         db.commit()
         return int(row["id"]), path
 

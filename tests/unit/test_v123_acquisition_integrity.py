@@ -142,8 +142,10 @@ class V123AcquisitionIntegrity(unittest.TestCase):
                 path = capture_path(cfg.output_dir, int(row['id']),row['timestamp'],row['original_url'])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b'<html><title>needle</title><body>needle</body></html>')
+                import base64, hashlib
                 with db:
-                    db.execute("UPDATE captures SET state='error',download_attempts=1")
+                    db.execute("UPDATE captures SET state='error',download_attempts=1,digest=?",
+                        (base64.b32encode(hashlib.sha1(path.read_bytes()).digest()).decode(),))
                 self.assertEqual(adopt_orphaned_bodies(db, cfg, threading.Event()), 1)
                 self.assertEqual(db.execute('SELECT state FROM captures').fetchone()[0], 'downloaded_unscanned')
                 self.assertEqual(adopt_orphaned_bodies(db, cfg, threading.Event()), 0)

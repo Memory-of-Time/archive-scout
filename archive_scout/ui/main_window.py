@@ -351,6 +351,7 @@ class ArchiveScoutApp(tk.Tk):
         self.dashboard_media_policy_var = tk.StringVar(value="Supplemental media is disabled for text runs.")
         self.dashboard_refresh_mode_var = tk.StringVar(value="manual")
         self.dashboard_refresh_seconds_var = tk.StringVar(value="10")
+        self.acquisition_update_seconds_var = tk.StringVar(value="0.5")
         self.dashboard_eta_enabled_var = tk.BooleanVar(value=False)
         self.dashboard_eta_var = tk.StringVar(value="Estimated time remaining: off")
         self.dashboard_last_refresh_var = tk.StringVar(value="Not refreshed yet")
@@ -534,6 +535,13 @@ class ArchiveScoutApp(tk.Tk):
         refresh_mode.bind("<<ComboboxSelected>>", lambda _e: self._dashboard_refresh_settings_changed())
         refresh_interval.bind("<<ComboboxSelected>>", lambda _e: self._dashboard_refresh_settings_changed())
         refresh_interval.bind("<FocusOut>", lambda _e: self._dashboard_refresh_settings_changed())
+        ttk.Label(refresh_controls, text="Text acquisition updates:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        acquisition_interval = ttk.Combobox(
+            refresh_controls, textvariable=self.acquisition_update_seconds_var,
+            values=("Every available update", "0.5", "1"), state="readonly", width=22,
+        )
+        acquisition_interval.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        acquisition_interval.bind("<<ComboboxSelected>>", lambda _e: self._acquisition_update_changed())
         ttk.Label(actions, textvariable=self.dashboard_last_refresh_var, style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
         ttk.Button(actions, text="Refresh dashboard", command=lambda: self.refresh_dashboard(manual=True)).pack(fill="x", pady=3)
         ttk.Button(actions, text="Create backup", command=lambda: self.start(self.build_config(require_keywords=False), "backup")).pack(fill="x", pady=3)
@@ -1962,6 +1970,7 @@ class ArchiveScoutApp(tk.Tk):
             return
         mode = override_mode or MODE_LABELS[self.mode_var.get()]
         self.stop_event.clear()
+        self.events.reset_acquisition()
         self._eta_tracker.reset("Starting")
         self.progress_var.set(0)
         self.status_var.set("Starting…")
@@ -1997,7 +2006,20 @@ class ArchiveScoutApp(tk.Tk):
             self.events.put(("error", traceback.format_exc()))
 
     def on_engine_event(self, event: ProgressEvent) -> None:
-        self.events.put_progress(event)
+        # Routine download counters are presentation-only, coalesced in one slot.
+        # Engine callbacks, local scanning, and CLI output are unchanged.
+        if event.stage == "download" and event.detail and "attempt_outcomes" in event.detail:
+            self.events.put_acquisition(event)
+        elif event.stage in {"site_issue", "acquisition_stall", "storage_full", "redirect_skipped"}:
+            self.events.put_notice(event)
+        else:
+            self.events.put_progress(event)
+
+    def _acquisition_update_changed(self) -> None:
+        selected = self.acquisition_update_seconds_var.get()
+        seconds = 0.0 if selected == "Every available update" else float(selected)
+        self.events.set_acquisition_interval(seconds)
+        self.save_app_state()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -2010,7 +2032,7 @@ class ArchiveScoutApp(tk.Tk):
             while processed < 500:
                 kind, payload = self.events.get_nowait()
                 processed += 1
-                if kind == "progress":
+                if kind in {"progress", "notice"}:
                     event = payload
                     self.update_dashboard_from_progress(event)
                     self.status_var.set(event.message)
@@ -2021,6 +2043,8 @@ class ArchiveScoutApp(tk.Tk):
                     else:
                         self.progress.configure(mode="indeterminate")
                         self.progress.start(12)
+                elif kind == "notices_dropped":
+                    self.log(f"Activity display omitted {payload} notices while busy; capture errors remain in the project database.")
                 elif kind == "dashboard":
                     self._apply_dashboard_result(payload)
                 elif kind == "complete":
@@ -3046,6 +3070,7 @@ class ArchiveScoutApp(tk.Tk):
                 "dashboard_refresh_mode": self.dashboard_refresh_mode_var.get(),
                 "dashboard_refresh_seconds": self.dashboard_refresh_seconds_var.get(),
                 "dashboard_eta_enabled": self.dashboard_eta_enabled_var.get(),
+                "acquisition_update_seconds": self.acquisition_update_seconds_var.get(),
             }
             path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         except Exception:
@@ -3070,6 +3095,11 @@ class ArchiveScoutApp(tk.Tk):
                 self.font_scale_var.set(str(appearance["font_scale"]))
             self.dashboard_refresh_mode_var.set(appearance.get("dashboard_refresh_mode", "manual"))
             self.dashboard_refresh_seconds_var.set(str(appearance.get("dashboard_refresh_seconds", 10)))
+            selected = str(appearance.get("acquisition_update_seconds", "0.5"))
+            if selected not in {"Every available update", "0.5", "1"}:
+                selected = "0.5"
+            self.acquisition_update_seconds_var.set(selected)
+            self.events.set_acquisition_interval(0.0 if selected == "Every available update" else float(selected))
             self.dashboard_eta_enabled_var.set(bool(appearance.get("dashboard_eta_enabled", False)))
             self._eta_tracker.set_enabled(self.dashboard_eta_enabled_var.get())
             if appearance.get("geometry"):

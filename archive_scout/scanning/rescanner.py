@@ -307,7 +307,6 @@ def rescan_keyword_sets(
                         resolve_errors(
                             database,
                             capture_id=capture_id,
-                            document_id=saved_document_id,
                             operations=("scan", "parse"),
                         )
                     finished_ids.add(document_id)

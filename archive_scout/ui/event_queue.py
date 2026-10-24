@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
@@ -17,6 +18,35 @@ class CoalescingEventQueue(Generic[T]):
         self._lock = threading.Lock()
         self._latest_progress: T | None = None
         self._progress_pending = False
+        self._acquisition: T | None = None
+        self._acquisition_interval = 0.5
+        self._last_acquisition = float('-inf')
+        self._deferred_control: tuple[str, object] | None = None
+        self._dropped_notices = 0
+
+    def set_acquisition_interval(self, seconds: float) -> None:
+        if seconds not in (0.0, 0.5, 1.0):
+            raise ValueError('acquisition display interval must be every update, 0.5, or 1 second')
+        with self._lock:
+            self._acquisition_interval = seconds
+
+    def reset_acquisition(self) -> None:
+        with self._lock:
+            self._acquisition = None
+            self._last_acquisition = float('-inf')
+
+    def put_acquisition(self, payload: T) -> None:
+        with self._lock:
+            self._acquisition = payload
+
+    def put_notice(self, payload: T) -> None:
+        # Notices cannot be overwritten by routine progress. The producer never
+        # blocks on a full UI queue; durable per-capture errors live in SQLite.
+        try:
+            self._queue.put_nowait(('notice', payload))
+        except queue.Full:
+            with self._lock:
+                self._dropped_notices += 1
 
     def put_progress(self, payload: T) -> None:
         with self._lock:
@@ -38,7 +68,29 @@ class CoalescingEventQueue(Generic[T]):
         self._queue.put(item)
 
     def get_nowait(self) -> tuple[str, object]:
-        kind, payload = self._queue.get_nowait()
+        with self._lock:
+            item, self._deferred_control = self._deferred_control, None
+        if item is None:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                with self._lock:
+                    if self._dropped_notices:
+                        count, self._dropped_notices = self._dropped_notices, 0
+                        return 'notices_dropped', count
+                    if self._acquisition is not None and time.monotonic()-self._last_acquisition >= self._acquisition_interval:
+                        payload, self._acquisition = self._acquisition, None
+                        self._last_acquisition = time.monotonic()
+                        return 'progress', payload
+                raise
+        kind, payload = item
+        if kind in {'complete','stopped','error','deferred','incomplete_result','incomplete'}:
+            with self._lock:
+                if self._acquisition is not None:
+                    latest, self._acquisition = self._acquisition, None
+                    self._last_acquisition = time.monotonic()
+                    self._deferred_control = item
+                    return 'progress', latest
         if kind != "progress":
             return kind, payload
         with self._lock:

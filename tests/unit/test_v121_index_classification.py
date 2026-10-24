@@ -106,7 +106,9 @@ class RoutingRegressionTests(unittest.TestCase):
                 path.parent.mkdir(parents=True,exist_ok=True)
                 path.write_bytes(b'<html>archived needle source</html>')
                 with db:
-                    db.execute("UPDATE captures SET state='downloaded_unscanned' WHERE id=?",(id_,))
+                    import base64, hashlib
+                    digest=base64.b32encode(hashlib.sha1(path.read_bytes()).digest()).decode()
+                    db.execute("UPDATE captures SET state='downloaded_unscanned',digest=? WHERE id=?",(digest,id_))
                 # No eligible network work. Scan must still drain the durable backlog.
                 with patch('archive_scout.downloads.downloader.HttpClient',side_effect=AssertionError('network must not open')):
                     download_archive(config,db,scan_id,threading.Event(),None,
