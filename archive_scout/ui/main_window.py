@@ -2010,7 +2010,7 @@ class ArchiveScoutApp(tk.Tk):
         # Engine callbacks, local scanning, and CLI output are unchanged.
         if event.stage == "download" and event.detail and "attempt_outcomes" in event.detail:
             self.events.put_acquisition(event)
-        elif event.stage in {"site_issue", "acquisition_stall", "storage_full", "redirect_skipped"}:
+        elif event.stage in {"site_issue", "acquisition_stall", "storage_full", "redirect_skipped", "acquisition_health"}:
             self.events.put_notice(event)
         else:
             self.events.put_progress(event)
@@ -2917,7 +2917,7 @@ class ArchiveScoutApp(tk.Tk):
         capture_ids = sorted({int(row["capture_id"]) for row in selected if row.get("capture_id")})
         media_ids = sorted({int(row["media_capture_id"]) for row in selected if row.get("media_capture_id")})
         if not capture_ids and not media_ids:
-            messagebox.showinfo(APP_NAME, "Select one or more retryable text-page or media errors.")
+            messagebox.showinfo(APP_NAME, "Select one or more text-page or media errors to recheck.")
             return
         config = self.build_config(require_keywords=bool(capture_ids))
         config.retry_capture_ids = capture_ids

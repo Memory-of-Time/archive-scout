@@ -376,8 +376,9 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         "INSERT OR IGNORE INTO archive_scout_retry_scopes VALUES(?,?)",
         ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
     )
-    from .downloads.schedule import retry_selection
+    from .downloads.schedule import retry_selection, explicit_error_predicate
     selection, selected_params = retry_selection(database, config) if respect_selection else ("", [])
+    error_predicate = explicit_error_predicate(config) if respect_selection else 'e.retryable=1'
     last_id = 0
     while True:
         # Explicit retry includes pending captures which a lifetime attempt
@@ -393,7 +394,7 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
                      WHERE m.capture_id=c.id AND m.target_id=t.id))
                AND ((c.state='error' AND EXISTS (
                    SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                   AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
+                   AND e.resolved=0 AND e.ignored=0 AND """ + error_predicate + """)
                    AND (NOT EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id)
                         OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
                                    AND sched.next_eligible_at<=?)))"""

@@ -142,6 +142,8 @@ def is_transport_timeout(exc: BaseException) -> bool:
         urllib3.exceptions.ConnectTimeoutError,
     )
     for current in exception_chain(exc):
+        if isinstance(current, urllib3.exceptions.NewConnectionError):
+            continue  # urllib3 subclasses ConnectTimeoutError even for ECONNREFUSED/DNS.
         if isinstance(current, timeout_types):
             return True
     return False
@@ -226,6 +228,7 @@ def _write_limited(
     stop_event: threading.Event,
     preview_bytes: int = 20_000,
     preserve_on_stream_error: bool = False,
+    response_metadata: dict | None = None,
 ) -> tuple[int, str, bytes]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
@@ -246,13 +249,39 @@ def _write_limited(
                 if len(preview) < preview_bytes:
                     preview.extend(chunk[: preview_bytes - len(preview)])
         return total, digest.hexdigest(), bytes(preview)
-    except (Stopped, httpx.HTTPError, urllib3.exceptions.HTTPError, OSError, TimeoutError):
+    except (Stopped, httpx.HTTPError, urllib3.exceptions.HTTPError, OSError, TimeoutError) as exc:
+        _transfer_diagnostic(exc, preview, total, digest.hexdigest(), response_metadata)
         if not preserve_on_stream_error:
             destination.unlink(missing_ok=True)
         raise
-    except Exception:
+    except Exception as exc:
+        _transfer_diagnostic(exc, preview, total, digest.hexdigest(), response_metadata)
         destination.unlink(missing_ok=True)
         raise
+
+
+_DIAGNOSTIC_HEADERS = frozenset({
+    'content-type', 'content-length', 'content-encoding', 'transfer-encoding',
+    'retry-after', 'memento-datetime', 'x-archive-orig-content-encoding',
+    'x-archive-orig-content-length', 'x-archive-src',
+})
+
+
+def _transfer_diagnostic(exc, preview, total, digest, metadata=None):
+    if isinstance(exc, Stopped):
+        return
+    # Failure-only bounded evidence, never a validated body or resume receipt.
+    exc.transfer_diagnostic = {
+        'decoded_bytes_received': total, 'received_sha256': digest,
+        'decoded_prefix_base64': base64.b64encode(preview[:4096]).decode('ascii'),
+        **(metadata or {}),
+    }
+
+
+def response_diagnostic(status, fields, final_url):
+    return {'response_status': int(status), 'final_url': str(final_url)[:1500],
+            'response_headers': {str(k).lower(): str(v)[:500] for k, v in fields.items()
+                                 if str(k).lower() in _DIAGNOSTIC_HEADERS}}
 
 
 class IncompleteRepresentationError(RuntimeError):
@@ -283,6 +312,53 @@ def _check_full_range(status: int, headers: dict[str, str]) -> None:
 def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
                              stop_event: threading.Event, *,
                              expected_digest: str = "") -> Iterable[bytes]:
+    """Decode every content coding in reverse order; preserve failure evidence."""
+    codings = [value.strip().casefold() for value in
+               headers.get('content-encoding', 'identity').split(',')]
+    prefix = bytearray()
+    received = 0
+
+    def raw_chunks():
+        nonlocal received
+        for chunk in chunks:
+            received += len(chunk)
+            if len(prefix) < 4096:
+                prefix.extend(chunk[:4096-len(prefix)])
+            yield chunk
+
+    try:
+        if len(codings) > 4 or any(coding not in {'', 'identity', 'gzip', 'x-gzip', 'deflate'}
+                                   for coding in codings):
+            raise IncompleteRepresentationError('unsupported HTTP content encoding chain: ' +
+                                                ', '.join(codings)[:200])
+        if len(codings) == 1:
+            yield from _decode_single_verified_chunks(raw_chunks(), headers, stop_event,
+                                                      expected_digest=expected_digest)
+        else:
+            decoded = raw_chunks()
+            for coding in reversed(codings):
+                # Inner lengths describe intermediate bytes, not the HTTP wire.
+                decoded = _decode_single_verified_chunks(decoded, {'content-encoding': coding},
+                                                         stop_event)
+            yield from decoded
+            advertised = headers.get('content-length', '')
+            if advertised.isdigit() and int(advertised) != received:
+                raise IncompleteRepresentationError(
+                    f'HTTP Content-Length mismatch: received {received}, expected {advertised}')
+    except Exception as exc:
+        if not isinstance(exc, Stopped):
+            exc.representation_diagnostic = {
+                'raw_bytes_received': received,
+                'raw_prefix_base64': base64.b64encode(prefix).decode('ascii'),
+                'expected_cdx_digest': str(expected_digest)[:100],
+                'actual_candidate_digest': getattr(exc, 'actual_digest', ''),
+            }
+        raise
+
+
+def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
+                                   stop_event: threading.Event, *,
+                                   expected_digest: str = "") -> Iterable[bytes]:
     """Bounded raw-wire decoder with gzip/deflate EOF and CRC verification.
 
     Libraries' convenience decoded iterators may accept an incomplete gzip
@@ -358,7 +434,9 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
     if repair_hash is not None:
         actual = base64.b32encode(repair_hash.digest()).decode("ascii").rstrip("=")
         if actual != repair_digest:
-            raise PayloadDigestMismatch("encoding-header recovery failed the selected capture's CDX digest")
+            error = PayloadDigestMismatch("encoding-header recovery failed the selected capture's CDX digest")
+            error.actual_digest = actual
+            raise error
         headers["x-archive-scout-encoding-recovery"] = "gzip header mismatch; CDX SHA-1 verified: " + actual
 
 
@@ -674,9 +752,6 @@ class HttpxBackend:
                     return self.download(next_url, headers, destination, max_bytes, stop_event,
                         retain_partial=False, expected_digest="", redirect_validator=redirect_validator,
                         _redirect_depth=_redirect_depth+1)
-            announced = response.headers.get("Content-Length")
-            if announced and announced.isdigit() and int(announced) > max_bytes:
-                raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
             fields = _copy_headers(response.headers.items())
             if not retain_partial:
                 _check_full_range(int(response.status_code), fields)
@@ -687,6 +762,9 @@ class HttpxBackend:
                 return TransportFileResponse(int(response.status_code), fields,
                     str(response.url), destination, 0, hashlib.sha256(b"").hexdigest(),
                     b"", self.name, time.monotonic()-started)
+            announced = response.headers.get("Content-Length")
+            if announced and announced.isdigit() and int(announced) > max_bytes:
+                raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
             try:
                 raw_chunks = response.iter_raw(64 * 1024) if not retain_partial else response.iter_bytes(64 * 1024)
                 verified_chunks = (_decoded_verified_chunks(raw_chunks, fields, stop_event, expected_digest=expected_digest)
@@ -695,6 +773,7 @@ class HttpxBackend:
                     verified_chunks,
                     destination, max_bytes, stop_event,
                     preserve_on_stream_error=retain_partial,
+                    response_metadata=response_diagnostic(response.status_code, fields, str(response.url)),
                 )
             except (Stopped, httpx.HTTPError, OSError, TimeoutError):
                 announced = response.headers.get("Content-Length", "")
@@ -882,9 +961,6 @@ class Urllib3Backend:
             else:
                 raise RuntimeError(f"too many redirects: {url}")
             assert response is not None
-            announced = response.headers.get("Content-Length")
-            if announced and str(announced).isdigit() and int(announced) > max_bytes:
-                raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
             fields = _copy_headers(response.headers.items())
             _check_full_range(int(response.status), fields)
             if int(response.status) in {429, 503}:
@@ -895,10 +971,14 @@ class Urllib3Backend:
                 return TransportFileResponse(status, fields,
                     current_url, destination, 0, hashlib.sha256(b"").hexdigest(),
                     b"", self.name, time.monotonic()-started)
+            announced = response.headers.get("Content-Length")
+            if announced and str(announced).isdigit() and int(announced) > max_bytes:
+                raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
             total, content_hash, preview = _write_limited(
                 _decoded_verified_chunks(response.stream(amt=64 * 1024, decode_content=False),
                                          fields, stop_event, expected_digest=expected_digest),
                 destination, max_bytes, stop_event,
+                response_metadata=response_diagnostic(response.status, fields, current_url),
             )
             result = TransportFileResponse(
                 status=int(response.status),
@@ -942,7 +1022,8 @@ class CurlBackend:
                 if key.casefold() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
 
     @staticmethod
-    def _early_control_status(path: Path, *, redirects: bool = False) -> tuple[int, dict[str, str]] | None:
+    def _early_control_status(path: Path, *, redirects: bool = False,
+                              process_finished: bool = False) -> tuple[int, dict[str, str]] | None:
         """Read a bounded complete header block, never a potentially huge body.
 
         Curl writes `--dump-header` as soon as response headers arrive. This
@@ -956,7 +1037,11 @@ class CurlBackend:
         if not prefix or len(prefix) >= 64 * 1024:
             return None
         normalized = prefix.replace(b"\r\n", b"\n")
-        blocks = [block for block in normalized.split(b"\n\n")[:-1] if block.startswith(b"HTTP/")]
+        header_blocks = normalized.split(b"\n\n")
+        # curl can exit on an oversized Content-Length before dumping the
+        # final blank line. Only after exit may complete header lines be used.
+        candidates = header_blocks if process_finished else header_blocks[:-1]
+        blocks = [block for block in candidates if block.startswith(b"HTTP/")]
         if not blocks:
             return None
         last = blocks[-1].decode("iso-8859-1", "replace")
@@ -965,7 +1050,10 @@ class CurlBackend:
         if len(parts) < 2 or parts[1] not in accepted:
             return None
         fields = {}
-        for line in last.splitlines()[1:]:
+        lines = last.splitlines()
+        if process_finished and not normalized.endswith(b'\n') and header_blocks[-1].startswith(b'HTTP/'):
+            lines = lines[:-1]  # Never interpret a partially written field.
+        for line in lines[1:]:
             if ":" in line:
                 key, value = line.split(":", 1)
                 fields[key.strip().casefold()] = value.strip()
@@ -1071,7 +1159,8 @@ class CurlBackend:
                 # A short redirect can finish (or close its irrelevant body)
                 # between polls. Its headers still take priority over curl's
                 # transfer/decompression error for that discarded body.
-                early_control = self._early_control_status(header_path, redirects=not follow_redirects)
+                early_control = self._early_control_status(header_path, redirects=not follow_redirects,
+                                                          process_finished=True)
             if early_control is not None:
                 status, fields = early_control
                 return TransportResponse(status, fields, url, b"", self.name,
@@ -1151,7 +1240,8 @@ class CurlBackend:
             if early_control is None:
                 early_control = self._early_control_status(header_path,
                     redirects=bool(redirect_validator or getattr(self, "redirect_pacer", None)
-                                   or getattr(self, "redirect_permit_checker", None)))
+                                   or getattr(self, "redirect_permit_checker", None)),
+                    process_finished=True)
             if early_control is not None:
                 status, fields = early_control
                 if status in {301,302,303,307,308} and not fields.get("location"):
@@ -1202,7 +1292,8 @@ class CurlBackend:
                 raw_chunks = iter(lambda: raw.read(64 * 1024), b"")
                 size, content_hash, preview = _write_limited(
                     _decoded_verified_chunks(raw_chunks, parsed_headers, stop_event, expected_digest=expected_digest),
-                    destination, max_bytes, stop_event)
+                    destination, max_bytes, stop_event,
+                    response_metadata=response_diagnostic(status, parsed_headers, final_url))
             return TransportFileResponse(
                 status=status, headers=parsed_headers, final_url=final_url,
                 path=destination, bytes_written=size, content_hash=content_hash,
@@ -1290,7 +1381,7 @@ class ResilientTransport:
             return {
                 "backend_waiters": self.backend_waiters,
                 "cooling_backends": tuple(name for name, until in self.cooldown_until.items() if until > now),
-                "cooldown_seconds": round(max((until-now for until in self.cooldown_until.values()), default=0.0), 1),
+                "cooldown_seconds": round(max(0.0, max((until-now for until in self.cooldown_until.values()), default=0.0)), 1),
                 "recovery_probes": len(self.recovery_probes),
                 "preferred_backend": self.last_success,
             }

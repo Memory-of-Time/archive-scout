@@ -25,6 +25,8 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
             return "incomplete_representation", status, True
         if isinstance(current, httpx.PoolTimeout) or isinstance(current, urllib3.exceptions.EmptyPoolError):
             return "connection_pool_timeout", status, True
+        if isinstance(current, urllib3.exceptions.NewConnectionError):
+            return "connection", status, True
         if isinstance(current, (httpx.ConnectTimeout, urllib3.exceptions.ConnectTimeoutError)):
             return "connect_timeout", status, True
         if isinstance(current, (httpx.ReadTimeout, urllib3.exceptions.ReadTimeoutError)):

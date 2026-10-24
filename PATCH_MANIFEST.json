@@ -1,0 +1,62 @@
+{
+  "base_zip_sha256": "6c47820e87f7fb14f719cb4c187c4543eaff94d7907a6efe497b52570bf7a9f7",
+  "version": "1.2.5",
+  "schema": 10,
+  "files": [
+    {
+      "path": "archive_scout/cdx/client.py",
+      "before_sha256": "e2e2cbf48a2522b6f0ea2d4b7415a4b441e5763aaf3a73cbe81326c00416e496",
+      "after_sha256": "638be5ce94962fcd6a508fe05819640c37beebb0b4d2fa064df1a9fa95350bd3"
+    },
+    {
+      "path": "archive_scout/downloads/diagnostics.py",
+      "before_sha256": null,
+      "after_sha256": "a18043b41f25ee3eff829d2fdfa0cf4cb46c00d1a582cd2fe568ca13c4937462"
+    },
+    {
+      "path": "archive_scout/downloads/downloader.py",
+      "before_sha256": "c834c3969a6e58226ae82c5eb5fbca017f8b802e2a3ad2fb9280924eeed049c4",
+      "after_sha256": "d895eb12431991837456148d9a64d5cbfadf6e99ec17f6d8ded1514b79c312e8"
+    },
+    {
+      "path": "archive_scout/downloads/retry.py",
+      "before_sha256": "a9aca7417452e8e0972ef90ec0e8b615b1b1a278701e89655be1c20dc8e7a6e3",
+      "after_sha256": "7c5d03c2b48cf8483dcd81536e45e0de41e36dad7a8871716313686f745ad83a"
+    },
+    {
+      "path": "archive_scout/downloads/schedule.py",
+      "before_sha256": "85d594ba09b0a5f3d7b51b7a82161898fcd827cd90d945a712acc436729dcf00",
+      "after_sha256": "b28f98f958b065742e7936c55a7a074f3251c80cbd7844649043651418b90052"
+    },
+    {
+      "path": "archive_scout/downloads/validation.py",
+      "before_sha256": "cc847f92585e11a23bbfab9d2ff14df2371f2c1a4dd26b2ad14dcd3f67b5debd",
+      "after_sha256": "4ae5190d5edf97ec8d55c345f2d482b8ec47add754344558892fbf623df39286"
+    },
+    {
+      "path": "archive_scout/network/transports.py",
+      "before_sha256": "06ffa5074a19ada3efaa45b7c19a61a16f7e89047cda1201f0859c51a4bb775f",
+      "after_sha256": "cdaa55f0062369cd7cc125ca57d8aa23d8fbded1239a1ed1ea59d6cb3c5c977d"
+    },
+    {
+      "path": "archive_scout/operations.py",
+      "before_sha256": "396f484f24804a0233ccabfae6b9e6a0a5790d3420f8899b49371ca18d2900bf",
+      "after_sha256": "a415835067cad95444422e8f428ebd6184d5a5392692860c52c7d8d8cd3fb9a8"
+    },
+    {
+      "path": "archive_scout/ui/main_window.py",
+      "before_sha256": "93c6b08070d8ee6d569149c5d7335dd445e22a5abba320bab19b9faa4466a035",
+      "after_sha256": "ddf251531983f0cdda3670c4d1b7208b3898c4289e5f2f0544beeeb5ab3a0020"
+    },
+    {
+      "path": "docs/V125_ERROR_RECOVERY_PATCH.md",
+      "before_sha256": null,
+      "after_sha256": "1a226f22f7ea9ed1f8393a4f73ed8b42d27f158aa54183551bb0ee786a3955c1"
+    },
+    {
+      "path": "tests/unit/test_v125_error_recovery_patch.py",
+      "before_sha256": null,
+      "after_sha256": "beb9c977ba56f24f9cd26523c49507910db8d21d07d121fed733d98103a442a1"
+    }
+  ]
+}

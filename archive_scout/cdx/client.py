@@ -105,7 +105,7 @@ def is_timeout_error(exc: BaseException) -> bool:
     )
     while current is not None and id(current) not in visited:
         visited.add(id(current))
-        if isinstance(current, timeout_types):
+        if isinstance(current, timeout_types) and not isinstance(current, urllib3.exceptions.NewConnectionError):
             return True
         reason = getattr(current, "reason", None)
         if isinstance(reason, BaseException) and reason is not current:
@@ -147,6 +147,7 @@ class HttpClient:
         coordinated_connection_recovery: bool = False,
         connection_failure_threshold: int = 3,
         connection_retry_seconds: float = 3.0,
+        response_callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.limiter = limiter
         self.retries = max(1, int(retries))
@@ -156,6 +157,7 @@ class HttpClient:
         self.user_agent = user_agent
         self.stop_event = stop_event
         self.retry_callback = retry_callback
+        self.response_callback = response_callback
         self.host_gate = host_gate or SharedHostGate()
         self.coordinated_connection_recovery = bool(coordinated_connection_recovery)
         self.connection_failure_threshold = max(2, int(connection_failure_threshold))
@@ -178,6 +180,19 @@ class HttpClient:
 
     def close(self) -> None:
         self.transport.close()
+
+    def _observe_response(self, response, url, gate_wait, turn_seconds, pause_seconds=0):
+        if self.response_callback is not None:
+            try:
+                self.response_callback({
+                    'status': int(response.status), 'url': url, 'backend': response.backend,
+                    'retry_after': str(response.headers.get('retry-after', response.headers.get('Retry-After', '')))[:100],
+                    'pause_seconds': pause_seconds, 'gate_wait_seconds': gate_wait,
+                    'request_turn_seconds': turn_seconds,
+                    'backend_elapsed_seconds': float(response.elapsed),
+                })
+            except Exception:
+                pass  # Diagnostics cannot alter acquisition or retry outcomes.
 
     def _finish_failed_transport_turn(self, exc, url, permit, *, splittable):
         """Persistent owners retry failed turns; do not multiply physical trials."""
@@ -213,7 +228,9 @@ class HttpClient:
 
         while True:
             ensure_frozen_bundle_available()
+            gate_started = time.monotonic()
             permit = self.host_gate.acquire_request(self.stop_event)
+            turn_started = time.monotonic()
             try:
                 with (nullcontext() if isinstance(self.transport, ResilientTransport)
                       else self.limiter.slot(self.stop_event)):
@@ -406,7 +423,9 @@ class HttpClient:
             from ..network.transports import _partial_metadata_path
             if destination.exists() and not _partial_metadata_path(destination).is_file():
                 destination.unlink(missing_ok=True)
+            gate_started = time.monotonic()
             permit = self.host_gate.acquire_request(self.stop_event)
+            turn_started = time.monotonic()
             try:
                 with (nullcontext() if isinstance(self.transport, ResilientTransport)
                       else self.limiter.slot(self.stop_event)):
@@ -434,6 +453,8 @@ class HttpClient:
                     retry_after = parse_retry_after(retry_after_header)
                     rate_attempt += 1
                     wait_seconds = self.host_gate.pause_for_rate_limit(retry_after, f"HTTP {status}")
+                    self._observe_response(response, url, turn_started-gate_started,
+                                           time.monotonic()-turn_started, wait_seconds)
                     total_rate_wait += wait_seconds
                     if self.retry_callback:
                         self.retry_callback(
@@ -449,6 +470,8 @@ class HttpClient:
                         )
                     continue
 
+                self._observe_response(response, url, turn_started-gate_started,
+                                       time.monotonic()-turn_started)
                 self.host_gate.finish_request(permit, recovered=True)
                 if self.coordinated_connection_recovery:
                     self.host_gate.connection_success()

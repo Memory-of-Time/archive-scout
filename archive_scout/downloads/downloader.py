@@ -30,8 +30,9 @@ from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
-from .schedule import record_failure, clear_retry
+from .schedule import record_failure, clear_retry, prepare_retry_queue, select_due_retry
 from .checkpoint import write_receipt, discard_receipt, sync_directory
+from .diagnostics import AcquisitionDiagnostics
 from .redirects import make_replay_redirect_validator
 from ..network.transports import RedirectPolicyError, ResilientTransport
 
@@ -323,6 +324,8 @@ def prepare_download_rows(
     total = int(database.execute(
         "SELECT COUNT(*) FROM archive_scout_download_queue"
     ).fetchone()[0])
+    if config.network.persistent_retries and not capture_ids:
+        prepare_retry_queue(database)
 
     def iter_rows() -> Iterator[sqlite3.Row]:
         last_priority = -1
@@ -632,6 +635,10 @@ def download_archive(
         return
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+    diagnostics = AcquisitionDiagnostics(config.output_dir, callback,
+                                         enabled=config.network.diagnostics)
+    if callback and config.network.diagnostics:
+        callback(ProgressEvent('acquisition_health', f'Text acquisition build: {diagnostics.build}'))
 
     def on_retry(attempt: int, total_attempts: int, reason: str, wait_seconds: float) -> None:
         if callback:
@@ -663,6 +670,7 @@ def download_archive(
         connection_failure_threshold=config.network.connection_failure_pause_threshold,
         connection_retry_seconds=config.network.connection_retry_seconds,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
+        response_callback=diagnostics.response,
     )
     # The network pool should retain validated bytes, not burn connection slots
     # on HTML parsing and keyword matching. A separate local scanner commits
@@ -740,20 +748,7 @@ def download_archive(
                     # fresh work. Read only indexed SQLite eligibility; do
                     # not rebuild the complete acquisition queue or pool.
                     if config.network.persistent_retries and fresh_admitted >= 16 and not capture_ids:
-                        retry_row = database.execute("""SELECT c.* FROM text_retry_schedule sched
-                            JOIN captures c ON c.id=sched.capture_id
-                            WHERE c.state='error' AND sched.next_eligible_at<=?
-                              AND NOT EXISTS (SELECT 1 FROM archive_scout_download_queue q WHERE q.id=c.id)
-                              AND EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                                   AND e.operation='download' AND e.retryable=1
-                                   AND e.resolved=0 AND e.ignored=0)
-                              AND EXISTS (SELECT 1 FROM targets t
-                                JOIN archive_scout_download_scopes sc ON sc.pattern=t.pattern
-                                    AND sc.signature=c.query_signature
-                                WHERE t.id=c.target_id OR EXISTS (
-                                  SELECT 1 FROM capture_target_membership m
-                                  WHERE m.capture_id=c.id AND m.target_id=t.id))
-                            ORDER BY sched.next_eligible_at,c.id LIMIT 1""", (time.time(),)).fetchone()
+                        retry_row = select_due_retry(database, time.time())
                         fresh_admitted = 0
                     if retry_row is not None:
                         rows.append(retry_row)
@@ -797,6 +792,7 @@ def download_archive(
                 done, _ = concurrent.futures.wait(futures, timeout=5.0, return_when=concurrent.futures.FIRST_COMPLETED)
                 if not done:
                     now = time.monotonic()
+                    diagnostics.summary(saved_this_pass)
                     if callback and now-last_completion >= 30.0 and now-last_stall_message >= 30.0:
                         status = client.host_gate.snapshot()
                         transport_health = (client.transport.snapshot()
@@ -886,6 +882,7 @@ def download_archive(
                         # an explicit user Stop. Preserve the URL as due later;
                         # let independent local scans and permitted work continue.
                         failures += 1
+                        diagnostics.failure(row, 'rate_limit', exc)
                         with database_write_lock, database:
                             database.execute("UPDATE captures SET state='error',updated_at=? WHERE id=?",
                                 (utc_now(), row["id"]))
@@ -916,6 +913,7 @@ def download_archive(
                                                  (utc_now(), row["id"]))
                                 clear_retry(database, int(row["id"]))
                             failures += 1
+                            diagnostics.failure(row, exc.category, exc)
                         else:
                             outcome_state = 'skipped'
                             with database_write_lock, database:
@@ -986,6 +984,7 @@ def download_archive(
                                     target=str(row["original_url"]),
                                     http_status=status,
                                 )
+                        diagnostics.failure(row, category, exc)
                         if callback and should_surface_site_issue(category):
                             callback(ProgressEvent("site_issue", issue_message))
                         if retained_after_failure is not None:
@@ -1004,6 +1003,7 @@ def download_archive(
                     # not an invocation average diluted by hours of indexing,
                     # waiting, or older network faults. No database reads.
                     now = time.monotonic()
+                    diagnostics.summary(saved_this_pass)
                     while recent_commits and recent_commits[0] <= now - 30.0:
                         recent_commits.popleft()
                     rate = len(recent_commits) / min(30.0, elapsed)
@@ -1056,6 +1056,7 @@ def download_archive(
         if scanner_thread is not None:
             scanner_thread.join()
         client.close()
+        diagnostics.summary(saved_this_pass, force=True)
     if scanner_failures:
         raise RuntimeError("background scanner failed; retained bodies remain recoverable") from scanner_failures[0]
     # Final safeguard catches a small race between the last network commit and

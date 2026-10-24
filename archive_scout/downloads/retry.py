@@ -10,6 +10,7 @@ from ..events import ProgressEvent
 from ..scanning.jobs import ScanJob
 from ..scanning.rescanner import rescan_documents, rescan_keyword_sets
 from .downloader import download_archive, _populate_download_scopes
+from .schedule import explicit_error_predicate
 
 
 def retry_error_urls(
@@ -21,7 +22,7 @@ def retry_error_urls(
     scan_jobs: list[ScanJob] | None = None,
 ) -> None:
     _populate_download_scopes(database, config)
-    clauses = ["e.resolved=0", "e.ignored=0", "e.retryable=1", "e.capture_id IS NOT NULL",
+    clauses = ["e.resolved=0", "e.ignored=0", explicit_error_predicate(config), "e.capture_id IS NOT NULL",
         """EXISTS(SELECT 1 FROM captures c WHERE c.id=e.capture_id AND EXISTS(
             SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
             ON s.pattern=t.pattern AND s.signature=c.query_signature
