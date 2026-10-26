@@ -20,6 +20,7 @@ def import_text_folder(
     database: sqlite3.Connection,
     stop_event,
     callback: Callable[[ProgressEvent], None] | None = None,
+    *, max_bytes: int = 64 * 1024 * 1024,
 ) -> int:
     # Stream traversal by directory; never materialize a project-sized Python
     # list. Preserve all nine historical text suffixes from the scan policy.
@@ -37,6 +38,8 @@ def import_text_folder(
     for index, path in enumerate(files, 1):
         if stop_event.is_set():
             raise Stopped
+        if path.stat().st_size > max_bytes:
+            raise ValueError(f'Import input exceeds the {max_bytes:,}-byte body budget: {path}. Increase maximum text file size and retry; input was not truncated or certified.')
         data = path.read_bytes()
         # .dat may be binary even when explicitly imported; do not transcode
         # or certify bytes which do not pass the text-preservation predicate.
@@ -55,17 +58,21 @@ def import_text_folder(
         if not destination.exists() or destination.read_bytes() != data:
             atomic_write_bytes(destination, data)
         now = utc_now()
+        signature = "local-import"
+        prior = database.execute("SELECT d.content_hash FROM captures c JOIN documents d ON d.capture_id=c.id WHERE c.original_url=? AND c.timestamp=? AND c.query_signature=?", (original,timestamp,signature)).fetchone()
+        if prior and str(prior[0]) != hashlib.sha256(data).hexdigest():
+            signature = "local-import:" + hashlib.sha256(data).hexdigest()
         cursor = database.execute(
             """
             INSERT OR IGNORE INTO captures(
                 original_url,timestamp,target_id,query_signature,mimetype,state,created_at,updated_at
             ) VALUES(?,?,?,?,?,'downloaded',?,?)
             """,
-            (original, timestamp, target_id, "local-import", mime, now, now),
+            (original, timestamp, target_id, signature, mime, now, now),
         )
         row = database.execute(
-            "SELECT id FROM captures WHERE original_url=? AND timestamp=? AND query_signature='local-import'",
-            (original, timestamp),
+            "SELECT id FROM captures WHERE original_url=? AND timestamp=? AND query_signature=?",
+            (original, timestamp, signature),
         ).fetchone()
         capture_id = int(row["id"])
         title, visible, links = parse_text_representation(raw, original, mime)

@@ -1,0 +1,9 @@
+{
+  "iana_source": "https://data.iana.org/TLD/v1/tlds.json",
+  "iana_generated": "2026-10-24T22:54:03+00:00",
+  "iana_registry_sha256": "c05ea903901ed131c5dd601b85bfb9bbc3e53b1bd8f455c7b66cbb0f57c4a811",
+  "psl_source": "https://publicsuffix.org/list/public_suffix_list.dat",
+  "psl_sha256": "0232f4df0831911356e8ee1f4d5c3b6b12c0ed3f6bd66b0f81c8ab5d3d49e9ca",
+  "tld_count": 1590,
+  "policy": "full-hostname; pinned offline data; no runtime update"
+}

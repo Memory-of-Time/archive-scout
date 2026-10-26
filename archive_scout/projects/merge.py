@@ -12,6 +12,7 @@ from typing import Callable
 from ..database.connection import DATABASE_NAME
 from ..database.repositories import get_or_create_media_target, get_or_create_target
 from ..events import ProgressEvent, Stopped
+from .files import copy_verified, file_hash, DiskIdentityMap
 from ..media.downloader import media_path
 from ..utils import atomic_write_text, utc_now
 
@@ -56,15 +57,13 @@ def _source_file(source_root: Path, value: str) -> Path | None:
     return resolved
 
 
-def _copy_file(source: Path | None, destination_root: Path, category: str, fingerprint: str) -> Path | None:
+def _copy_file(source: Path | None, destination_root: Path, category: str, fingerprint: str, expected_hash: str = "", expected_size=None, stop_event=None) -> Path | None:
     if source is None or not source.exists() or not source.is_file():
         return None
     digest = hashlib.sha256(str(source).encode("utf-8", "replace")).hexdigest()[:16]
     destination = destination_root / category / "merged" / fingerprint / f"{digest}_{source.name}"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists():
-        shutil.copy2(source, destination)
-    return destination
+    return copy_verified(source,destination,expected_hash,expected_size,stop_event)
 
 
 def _table_exists(database: sqlite3.Connection, table: str) -> bool:
@@ -142,15 +141,15 @@ def merge_projects(
         raise
     stop_event = stop_event or threading.Event()
     summary = {"captures": 0, "documents": 0, "media": 0, "scan_runs": 0, "matches": 0, "reviews": 0, "notes": 0, "extractions": 0}
-    target_map: dict[int, int] = {}
-    capture_map: dict[int, int] = {}
-    document_map: dict[int, int] = {}
-    media_target_map: dict[int, int] = {}
-    media_map: dict[int, int] = {}
-    keyword_set_map: dict[int, int] = {}
-    scan_map: dict[int, int] = {}
-    match_map: dict[int, int] = {}
-    tag_map: dict[int, int] = {}
+    target_map = DiskIdentityMap(database,"target_map")
+    capture_map = DiskIdentityMap(database,"capture_map")
+    document_map = DiskIdentityMap(database,"document_map")
+    media_target_map = DiskIdentityMap(database,"media_target_map")
+    media_map = DiskIdentityMap(database,"media_map")
+    keyword_set_map = DiskIdentityMap(database,"keyword_set_map")
+    scan_map = DiskIdentityMap(database,"scan_map")
+    match_map = DiskIdentityMap(database,"match_map")
+    tag_map = DiskIdentityMap(database,"tag_map")
 
     def emit(message: str, completed: int = 0, total: int = 0) -> None:
         if callback:
@@ -159,11 +158,13 @@ def merge_projects(
     try:
         with database:
             for row in source.execute("SELECT * FROM targets ORDER BY id"):
+                if stop_event.is_set(): raise Stopped
                 target_map[int(row["id"])] = get_or_create_target(database, str(row["pattern"]))
 
             capture_total = int(source.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
             capture_rows = source.execute("SELECT * FROM captures ORDER BY id")
             for index, row in enumerate(capture_rows, 1):
+                if stop_event.is_set(): raise Stopped
                 if stop_event.is_set():
                     raise Stopped
                 target_id = target_map.get(int(row["target_id"])) if row["target_id"] is not None else None
@@ -190,15 +191,19 @@ def merge_projects(
                     emit(f"Merged {index:,}/{capture_total:,} captures", index, capture_total)
 
             for row in source.execute("SELECT * FROM documents ORDER BY id"):
+                if stop_event.is_set(): raise Stopped
                 old_capture = int(row["capture_id"])
                 if old_capture not in capture_map:
                     continue
                 existing_doc = database.execute(
-                    "SELECT id,content_hash FROM documents WHERE capture_id=?",
+                    "SELECT id,content_hash,path,size_bytes FROM documents WHERE capture_id=?",
                     (capture_map[old_capture],)
                 ).fetchone()
                 if existing_doc:
                     document_id = int(existing_doc["id"])
+                    actual_size,actual_hash = file_hash(existing_doc['path'],stop_event)
+                    if actual_hash != str(existing_doc['content_hash']) or actual_size != int(existing_doc['size_bytes']):
+                        raise RuntimeError('Existing merge destination evidence failed validation')
                     if (row["content_hash"] and existing_doc["content_hash"] and
                             str(row["content_hash"]) != str(existing_doc["content_hash"])):
                         raise RuntimeError(
@@ -210,7 +215,7 @@ def merge_projects(
                     # Repeated merges of a changing WAL must never recopy every
                     # previously imported file into a new fingerprint directory.
                     source_path = _source_file(source_root, str(row["path"]))
-                    destination_path = _copy_file(source_path, destination_root, "captures", fingerprint)
+                    destination_path = _copy_file(source_path, destination_root, "captures", fingerprint, str(row["content_hash"] or ""), int(row["size_bytes"]), stop_event)
                     reconstructed = destination_path is None
                     if reconstructed:
                         destination_path = (
@@ -251,17 +256,21 @@ def merge_projects(
 
             if _table_exists(source, "media_targets"):
                 for row in source.execute("SELECT * FROM media_targets ORDER BY id"):
+                    if stop_event.is_set(): raise Stopped
                     media_target_map[int(row["id"])] = get_or_create_media_target(database, str(row["pattern"]))
             if _table_exists(source, "media_captures"):
                 for row in source.execute("SELECT * FROM media_captures ORDER BY id"):
+                    if stop_event.is_set(): raise Stopped
                     target_id = media_target_map.get(int(row["target_id"])) if row["target_id"] is not None else None
                     source_document_id = document_map.get(int(row["source_document_id"])) if row["source_document_id"] is not None else None
                     source_path = _source_file(source_root, str(row["path"])) if row["path"] else None
                     destination_path = media_path(destination_root, row) if source_path else None
                     if source_path and source_path.exists() and source_path.is_file() and destination_path is not None:
                         destination_path.parent.mkdir(parents=True, exist_ok=True)
-                        if not destination_path.exists():
-                            shutil.copy2(source_path, destination_path)
+                        if destination_path.is_file() and file_hash(destination_path,stop_event)[1] != str(row['content_hash'] or ''):
+                            from ..media.downloader import _disambiguate_media_path
+                            destination_path = _disambiguate_media_path(destination_path,row)
+                        copy_verified(source_path,destination_path,str(row['content_hash'] or ''),int(row['bytes_saved'] or 0),stop_event)
                     media_file_missing = bool(row["path"]) and (destination_path is None or not destination_path.exists())
                     database.execute(
                         """
@@ -289,6 +298,7 @@ def merge_projects(
 
             keyword_columns = _columns(source, "keyword_sets")
             for row in source.execute("SELECT * FROM keyword_sets ORDER BY id"):
+                if stop_event.is_set(): raise Stopped
                 rules_json = _value(row, keyword_columns, "rules_json")
                 if not rules_json:
                     rules_json = _value(row, keyword_columns, "keywords_json", "[]")
@@ -304,6 +314,7 @@ def merge_projects(
 
             scan_columns = _columns(source, "scan_runs")
             for row in source.execute("SELECT * FROM scan_runs ORDER BY id"):
+                if stop_event.is_set(): raise Stopped
                 existing_link = database.execute(
                     "SELECT destination_run_id FROM project_merge_scan_links "
                     "WHERE source_path=? AND source_run_id=?", (source_key, int(row["id"]))
@@ -342,6 +353,7 @@ def merge_projects(
 
             match_columns = _columns(source, "document_matches")
             for row in source.execute("SELECT * FROM document_matches ORDER BY id"):
+                if stop_event.is_set(): raise Stopped
                 old_document = int(row["document_id"])
                 if old_document not in document_map:
                     continue
@@ -375,6 +387,7 @@ def merge_projects(
 
             if _table_exists(source, "reviews"):
                 for row in source.execute("SELECT * FROM reviews ORDER BY id"):
+                    if stop_event.is_set(): raise Stopped
                     if int(row["match_id"]) not in match_map:
                         continue
                     database.execute(
@@ -390,6 +403,7 @@ def merge_projects(
                     summary["reviews"] += 1
             if _table_exists(source, "notes"):
                 for row in source.execute("SELECT * FROM notes ORDER BY id"):
+                    if stop_event.is_set(): raise Stopped
                     match_id = match_map.get(int(row["match_id"])) if row["match_id"] is not None else None
                     capture_id = capture_map.get(int(row["capture_id"])) if row["capture_id"] is not None else None
                     if match_id is None and capture_id is None:
@@ -408,10 +422,12 @@ def merge_projects(
                     summary["notes"] += 1
             if _table_exists(source, "tags"):
                 for row in source.execute("SELECT * FROM tags ORDER BY id"):
+                    if stop_event.is_set(): raise Stopped
                     database.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (row["name"],))
                     tag_map[int(row["id"])] = int(database.execute("SELECT id FROM tags WHERE name=?", (row["name"],)).fetchone()["id"])
             if _table_exists(source, "match_tags"):
                 for row in source.execute("SELECT * FROM match_tags"):
+                    if stop_event.is_set(): raise Stopped
                     if int(row["match_id"]) in match_map and int(row["tag_id"]) in tag_map:
                         database.execute(
                             "INSERT OR IGNORE INTO match_tags(match_id,tag_id) VALUES(?,?)",
@@ -420,6 +436,7 @@ def merge_projects(
             if _table_exists(source, "extractions"):
                 columns = {item[1] for item in source.execute("PRAGMA table_info(extractions)")}
                 for row in source.execute("SELECT * FROM extractions ORDER BY id"):
+                    if stop_event.is_set(): raise Stopped
                     if int(row["document_id"]) not in document_map:
                         continue
                     if database.execute(

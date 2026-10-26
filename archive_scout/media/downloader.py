@@ -128,7 +128,7 @@ def _known_binary_prefix(prefix: bytes) -> bool:
     )
 
 
-def validate_media_representation(response: dict, *, path_hint: str = "") -> None:
+def _validate_media_representation(response: dict, *, path_hint: str = "") -> None:
     """Reject demonstrably non-media and incomplete transfers in constant memory.
 
     Unknown containers remain eligible for their configured formats; this is
@@ -138,8 +138,10 @@ def validate_media_representation(response: dict, *, path_hint: str = "") -> Non
     size = int(response.get("bytes") or 0)
     prefix = bytes(response.get("preview") or b"")[:8192]
     status = int(response.get("status") or 0)
-    if status not in (200, 206) or size <= 0:
-        raise RuntimeError("media response is not a complete successful representation")
+    if status not in (200, 206):
+        raise RuntimeError("invalid_wayback_replay: media response is not successful")
+    if size <= 0:
+        raise RuntimeError("incomplete_media_length: empty media representation")
     content_range = headers.get("content-range", "")
     if status == 206:
         matched = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range)
@@ -190,6 +192,19 @@ def validate_media_representation(response: dict, *, path_hint: str = "") -> Non
             raise RuntimeError("invalid_wayback_replay: HTML document instead of media payload")
 
 
+def validate_media_representation(response: dict, *, path_hint: str = '') -> None:
+    try:
+        _validate_media_representation(response,path_hint=path_hint)
+    except RuntimeError as exc:
+        from ..network.transports import response_diagnostic
+        exc.status = int(response.get('status') or 0) or None
+        exc.representation_diagnostic = {**response_diagnostic(exc.status or 0,response.get('headers',{}),''),
+            'decoded_bytes_received':int(response.get('bytes') or 0),
+            'received_sha256':str(response.get('content_hash') or ''),
+            'decoded_prefix_base64':base64.b64encode(bytes(response.get('preview') or b'')[:4096]).decode('ascii')}
+        raise
+
+
 def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
                 destination: Path | None = None) -> dict:
     path = Path(destination) if destination is not None else media_path(config.output_dir, row)
@@ -236,9 +251,6 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
         or response["headers"].get("Content-Type")
         or ""
     ).casefold()
-    if not int(response["bytes"]):
-        temp.unlink(missing_ok=True)
-        raise RuntimeError("empty media response")
     try:
         validate_media_representation(response, path_hint=str(row["original_url"]))
     except Exception:
@@ -347,6 +359,10 @@ def download_media(
             (media_signature,),
         ).fetchone():
             raise IndexCoveragePending("Embedded media lookup inventory is unfinished")
+    # Reapply the policy at admission too: explicit retry IDs must not revive
+    # a later duplicate that an older run left in an error/pending state.
+    from .indexer import _apply_snapshot_strategy
+    _apply_snapshot_strategy(database, media_signature or direct_signature, config.media.snapshot_strategy)
     clauses: list[str] = []
     params: list[object] = []
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_selection")
@@ -404,9 +420,11 @@ def download_media(
                 message = f"{reason}. Retry {attempt}/{total_attempts} in {wait_seconds:.1f}s…"
             callback(ProgressEvent(stage, message))
 
-    diagnostics = AcquisitionDiagnostics(config.output_dir, callback,
-        enabled=config.network.diagnostics, kind='media')
-    client = HttpClient(
+    from ..downloads.session import acquisition_client
+    diagnostics, _ = acquisition_client(('media_observations',id(database)), lambda: AcquisitionDiagnostics(config.output_dir, callback,
+        enabled=config.network.diagnostics, kind='media'))
+    diagnostics.begin_batch(callback)
+    client, owns_client = acquisition_client(("media", id(database)), lambda: HttpClient(
         limiter,
         1 if config.network.persistent_retries else max(5, config.retries),
         max(config.connect_timeout, config.read_timeout),
@@ -426,7 +444,8 @@ def download_media(
         connection_failure_threshold=config.network.connection_failure_pause_threshold,
         connection_retry_seconds=config.network.connection_retry_seconds,
         response_callback=diagnostics.response,
-    )
+    ))
+    client.response_callback = diagnostics.response
     complete = errors = saved = 0
     recent_saves = deque()
     started = time.monotonic()
@@ -552,7 +571,7 @@ def download_media(
                                 database, "media_download", category, repr(exc), media_capture_id=int(row["id"]),
                                 http_status=status, retryable=retryable
                             )
-                            record_media_failure(database, int(row["id"]), category, status, retryable, config)
+                            record_media_failure(database, int(row["id"]), category, status, retryable, config, exception=exc)
                             if should_surface_site_issue(category):
                                 record_site_issue(
                                     database,
@@ -586,7 +605,8 @@ def download_media(
     
     
     finally:
-        client.close()
+        if owns_client:
+            client.close()
         diagnostics.summary(saved, force=True)
 
 def retry_media_errors(

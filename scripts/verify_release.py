@@ -11,7 +11,7 @@ def main() -> int:
     sys.path.insert(0, str(root))
     from archive_scout.constants import APP_NAME, VERSION, SCHEMA_VERSION
 
-    assert (APP_NAME, VERSION, SCHEMA_VERSION) == ("Archive Scout", "1.2.5", 10), "release metadata mismatch"
+    assert (APP_NAME, VERSION, SCHEMA_VERSION) == ("Archive Scout", "1.2.6", 11), "release metadata mismatch"
     project = (root / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'(?m)^name\s*=\s*"archive-scout"', project), "distribution name"
     assert re.search(r'(?m)^version\s*=\s*"' + re.escape(VERSION) + r'"', project), "distribution version"

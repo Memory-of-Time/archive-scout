@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.config import KeywordSetConfig, MediaConfig, ProjectConfig
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target, upsert_captures, upsert_document
@@ -128,6 +129,8 @@ class ReleaseTests(unittest.TestCase):
                 ["timestamp", "original", "mimetype", "statuscode", "digest", "length"],
                 ["20080102000000", "http://cdn.example.net/media/clip.mp4", "video/mp4", "200", "B", "10"],
             ]
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.normalized()),))
+            database.commit()
             with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", return_value=payload):
                 index_external_embedded_media(config, database, threading.Event())
             row = database.execute(

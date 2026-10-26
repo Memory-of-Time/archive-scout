@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -223,24 +224,21 @@ def discover_media(raw: str, base_url: str, media: MediaConfig, known_links: lis
     return list(unique.values())
 
 
-def safe_document_text(output_dir: Path, path_value: str, max_bytes: int) -> str:
+def safe_document_text(output_dir: Path, path_value: str, max_bytes: int, *, expected_hash: str = '') -> str:
     root = output_dir.absolute()
     path = Path(path_value)
     candidate = path if path.is_absolute() else root / path
     try:
         resolved = candidate.resolve()
         resolved_root = root.resolve()
-    except (OSError, RuntimeError):
-        return ""
+    except (OSError, RuntimeError) as exc:
+        raise OSError('Cannot resolve saved media-discovery source') from exc
     if resolved != resolved_root and resolved_root not in resolved.parents:
-        return ""
-    try:
-        if not resolved.is_file():
-            return ""
-        with resolved.open("rb") as handle:
-            data = handle.read(max(1, int(max_bytes)) + 1)
-        if len(data) > max_bytes:
-            data = data[:max_bytes]
-        return decode_bytes(data)
-    except OSError:
-        return ""
+        raise OSError('Saved media-discovery source is outside the project')
+    with resolved.open('rb') as handle:
+        data = handle.read(max(1, int(max_bytes)) + 1)
+    if len(data) > max_bytes:
+        raise OSError(f'Saved page exceeds the media-discovery read limit ({max_bytes:,} bytes); increase the text size limit to inspect its complete contents')
+    if expected_hash and hashlib.sha256(data).hexdigest() != expected_hash:
+        raise OSError('Saved media-discovery source differs from its recorded SHA-256')
+    return decode_bytes(data)

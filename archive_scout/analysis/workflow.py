@@ -4,6 +4,8 @@ import concurrent.futures
 import hashlib
 import json
 import sqlite3
+import tempfile
+import os
 import threading
 import urllib.parse
 from pathlib import Path
@@ -32,12 +34,12 @@ def _emit(callback: Callable[[ProgressEvent], None] | None, stage: str, message:
         callback(ProgressEvent(stage, message, completed, total))
 
 
-def _read_source(path_value: str) -> str:
-    path = Path(path_value)
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
+def _read_source(path_value: str, content_type: str = '', expected_hash: str = '') -> str:
+    from ..content import decode_bytes
+    data = Path(path_value).read_bytes()
+    if expected_hash and hashlib.sha256(data).hexdigest() != expected_hash:
+        raise RuntimeError('analysis source differs from recorded raw evidence: ' + path_value)
+    return decode_bytes(data,content_type)
 
 
 def _target_hosts(config: ProjectConfig) -> set[str]:
@@ -202,8 +204,8 @@ def _lookup_external_assets(
 
 
 
-def _write_reports(config: ProjectConfig, database: sqlite3.Connection, summary: dict) -> dict[str, Path]:
-    folder = config.output_dir / "reports" / "analysis"
+def _write_reports(config: ProjectConfig, database: sqlite3.Connection, summary: dict, folder_override=None) -> dict[str, Path]:
+    folder = folder_override or config.output_dir / "reports" / "analysis"
     folder.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
 
@@ -260,14 +262,17 @@ def _write_reports(config: ProjectConfig, database: sqlite3.Connection, summary:
     return paths
 
 
-def run_analysis(
+def _run_analysis(
     config: ProjectConfig,
     database: sqlite3.Connection,
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None = None,
     forum_only: bool = False,
+    report_folder=None,
 ) -> dict[str, Path]:
     analysis = config.analysis.normalized()
+    if forum_only and not analysis.reconstruct_threads:
+        raise ValueError("Enable forum reconstruction before rebuilding forum threads")
     started = utc_now()
     cursor = database.execute(
         "INSERT INTO analysis_runs(status,started_at,metadata_json) VALUES('running',?,?)",
@@ -302,9 +307,11 @@ def run_analysis(
                 database.execute("DELETE FROM legacy_assets")
         rows = database.execute(
             """
-            SELECT d.id AS document_id,d.path,d.title,d.body_text,d.links_json,
-                   c.id AS capture_id,c.original_url,c.timestamp
+            SELECT d.id AS document_id,d.path,d.title,d.body_text,d.links_json,d.content_hash,
+                   c.id AS capture_id,c.original_url,c.timestamp,
+                   COALESCE(NULLIF(v.response_content_type,''),c.mimetype,'') AS response_content_type
             FROM documents d JOIN captures c ON c.id=d.capture_id
+            LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
             ORDER BY d.id
             """
         )
@@ -315,7 +322,7 @@ def run_analysis(
                 if pending_documents:
                     database.commit()
                 raise Stopped
-            raw = _read_source(str(row["path"]))
+            raw = _read_source(str(row["path"]), content_type=row['response_content_type'], expected_hash=str(row["content_hash"] or ""))
             original_url = str(row["original_url"])
             now = utc_now()
             if index == 1 or index == document_count or index % 25 == 0:
@@ -341,6 +348,7 @@ def run_analysis(
                         thread_id = int(database.execute(
                             "SELECT id FROM forum_threads WHERE canonical_key=?", (thread.canonical_key,)
                         ).fetchone()["id"])
+                        if len(thread_ids) >= 512: thread_ids.clear()
                         thread_ids[thread.canonical_key] = thread_id
                     database.executemany(
                         """
@@ -421,26 +429,26 @@ def run_analysis(
         if not forum_only:
             summary["extractions"] = int(database.execute("SELECT COUNT(*) FROM extractions").fetchone()[0])
             summary["legacy_assets"] = int(database.execute("SELECT COUNT(*) FROM legacy_assets").fetchone()[0])
-            summary["external_assets_found"] = _lookup_external_assets(config, database, stop_event, callback)
-            duplicate_summary = cluster_duplicates(database, analysis.duplicate_threshold)
+            summary["external_assets_found"] = 0  # remote enrichment follows atomic local publication
+            duplicate_summary = cluster_duplicates(database, analysis.duplicate_threshold, stop_event=stop_event)
             summary["exact_duplicate_groups"] = duplicate_summary.exact_groups
             summary["near_duplicate_groups"] = duplicate_summary.near_groups
             summary["grouped_documents"] = duplicate_summary.grouped_documents
             if analysis.compare_snapshots:
-                diff_summary = compare_snapshots(database)
+                diff_summary = compare_snapshots(database, stop_event=stop_event)
                 summary["snapshot_pairs"] = diff_summary.compared_pairs
                 summary["changed_snapshot_pairs"] = diff_summary.changed_pairs
                 extracted_values = [str(row[0]) for row in database.execute("SELECT DISTINCT value FROM extractions WHERE LENGTH(value)>=3 LIMIT 5000")]
                 summary["first_appearances"] = build_first_appearances(database, extracted_values)
             if analysis.build_provenance:
-                summary["provenance_edges"] = trace_provenance(database)
-        paths = _write_reports(config, database, summary)
+                summary["provenance_edges"] = trace_provenance(database, stop_event=stop_event)
+        paths = _write_reports(config, database, summary,report_folder)
         with database:
             database.execute(
-                "UPDATE analysis_runs SET status='complete',completed_at=?,summary_json=? WHERE id=?",
+                "UPDATE analysis_runs SET status='staged',completed_at=?,summary_json=? WHERE id=?",
                 (utc_now(), json.dumps(summary, ensure_ascii=False, sort_keys=True), run_id),
             )
-        _emit(callback, "analysis", f"Analysis complete: {summary['forum_threads']:,} threads, {summary['extractions']:,} extractions")
+        _emit(callback, "analysis", f"Local analysis staged: {summary['forum_threads']:,} threads, {summary['extractions']:,} extractions")
         return paths
     except Stopped:
         with database:
@@ -452,4 +460,56 @@ def run_analysis(
                 "UPDATE analysis_runs SET status='failed',completed_at=?,summary_json=? WHERE id=?",
                 (utc_now(), json.dumps({"error": f"{type(exc).__name__}: {exc}"}), run_id),
             )
+        raise
+
+
+class AnalysisPaths(dict):
+    def __init__(self, paths, status='complete'):
+        super().__init__(paths)
+        self.status = status
+
+
+def run_analysis(config, database, stop_event, callback=None, forum_only=False):
+    from ..database.staging import derived_generation
+    if forum_only and not config.analysis.normalized().reconstruct_threads:
+        raise ValueError('Enable forum reconstruction before rebuilding forum threads')
+    tables = ['forum_threads','forum_posts']
+    if not forum_only:
+        tables += ['extractions','legacy_assets','duplicate_groups','duplicate_members',
+                   'snapshot_diffs','first_appearances','provenance_edges']
+    reports = config.output_dir / 'reports'
+    reports.mkdir(parents=True,exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix='.analysis-',dir=reports))
+    before = database.execute('SELECT COALESCE(MAX(id),0) FROM analysis_runs').fetchone()[0]
+    try:
+        with derived_generation(database,tables,stop_event):
+            paths = _run_analysis(config,database,stop_event,callback,forum_only,stage)
+        destination = reports / 'analysis'
+        destination.mkdir(exist_ok=True)
+        published = {}
+        for name,path in paths.items():
+            target = destination / path.name
+            os.replace(path,target)
+            published[name] = target
+        remaining = 0
+        if not forum_only and config.analysis.normalized().search_external_assets:
+            found = _lookup_external_assets(config,database,stop_event,callback)
+            latest = database.execute('SELECT id,summary_json FROM analysis_runs WHERE id>? ORDER BY id DESC LIMIT 1',(before,)).fetchone()
+            summary = json.loads(latest['summary_json'] or '{}')
+            summary['external_assets_found'] = found
+            remaining = database.execute("SELECT COUNT(*) FROM legacy_assets WHERE archive_status='retry'").fetchone()[0]
+            summary['external_asset_retries'] = remaining
+            published = _write_reports(config,database,summary)
+            database.execute('UPDATE analysis_runs SET summary_json=? WHERE id=?',(json.dumps(summary,sort_keys=True),latest['id']))
+        with database:
+            database.execute("UPDATE analysis_runs SET status=? WHERE id>? AND status='staged'",('incomplete' if remaining else 'complete',before))
+        stage.rmdir()
+        _emit(callback,'analysis','Analysis has unfinished external lookups' if remaining else 'Analysis complete')
+        return AnalysisPaths(published,'incomplete' if remaining else 'complete')
+    except BaseException as exc:
+        with database:
+            database.execute("UPDATE analysis_runs SET status=?,completed_at=? WHERE id>? AND status IN ('running','staged')",
+                ('interrupted' if isinstance(exc,Stopped) else 'failed',utc_now(),before))
+        # Complete staged reports survive a publication/access failure. Their
+        # generation is not advertised as published; explicit regeneration is safe.
         raise

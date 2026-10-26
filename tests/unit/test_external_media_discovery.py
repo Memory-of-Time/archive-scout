@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from archive_scout.cdx.client import CDXRows
+from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.config import MediaConfig, ProjectConfig
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target, upsert_capture, upsert_document
@@ -111,6 +112,8 @@ class ExternalMediaDiscoveryTests(unittest.TestCase):
             )
             _EmbeddedCDXClient.calls = 0
             _EmbeddedCDXClient.seen_urls = []
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.normalized()),))
+            database.commit()
             with patch("archive_scout.media.indexer.HttpClient", _EmbeddedCDXClient):
                 index_external_embedded_media(config, database, threading.Event())
             self.assertEqual(_EmbeddedCDXClient.seen_urls, ["https://cdn.example.net/external.jpg"])
@@ -146,6 +149,8 @@ class ExternalMediaDiscoveryTests(unittest.TestCase):
                 cdx_delay=0,
             )
             _EmbeddedCDXClient.calls = 0
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.normalized()),))
+            database.commit()
             with patch("archive_scout.media.indexer.HttpClient", _EmbeddedCDXClient):
                 signature = index_external_embedded_media(config, database, threading.Event())
             self.assertEqual(_EmbeddedCDXClient.calls, 1)
@@ -158,6 +163,8 @@ class ExternalMediaDiscoveryTests(unittest.TestCase):
             self.assertEqual(row["state"], "pending")
 
             _EmbeddedCDXClient.calls = 0
+            database.execute("UPDATE captures SET query_signature=?", (cdx_query_signature(config.normalized()),))
+            database.commit()
             with patch("archive_scout.media.indexer.HttpClient", _EmbeddedCDXClient):
                 index_external_embedded_media(config, database, threading.Event())
             self.assertEqual(_EmbeddedCDXClient.calls, 0)

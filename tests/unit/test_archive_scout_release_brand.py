@@ -6,8 +6,8 @@ from archive_scout.constants import APP_NAME, VERSION, SCHEMA_VERSION
 class ScoutReleaseBrandTests(unittest.TestCase):
     def test_new_brand_preserves_schema(self):
         self.assertEqual(APP_NAME, "Archive Scout")
-        self.assertEqual(VERSION, "1.2.5")
-        self.assertEqual(SCHEMA_VERSION, 10)
+        self.assertEqual(VERSION, "1.2.6")
+        self.assertEqual(SCHEMA_VERSION, 11)
 
     def test_windows_numeric_version_metadata(self):
         source = (Path(__file__).resolve().parents[2] / "packaging/windows/version_info.txt").read_text()

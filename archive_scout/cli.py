@@ -56,7 +56,7 @@ def _readonly_database(config: ProjectConfig) -> sqlite3.Connection | None:
     path = config.output_dir / "archive_scout.sqlite3"
     if not path.is_file():
         return None
-    database = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=10)
+    database = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
     database.row_factory = sqlite3.Row
     database.execute("PRAGMA query_only=ON")
     return database
@@ -229,6 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--ai-provider", choices=("openai", "openrouter"), default="openai")
     init.add_argument("--ai-model", default="")
     init.add_argument("--research-backend", choices=("local-hash", "fastembed"), default="local-hash")
+    init.add_argument("--auto-research", action="store_true", help="Build Research Intelligence after scans")
+    init.add_argument("--extract-domains", action="store_true", help="Write an independent full-hostname domains report")
     init.add_argument("--no-auto-research", action="store_true", help="Do not build Research Intelligence automatically after normal scans")
     init.add_argument("--format", choices=FORMATS, default="text")
     return parser
@@ -356,7 +358,8 @@ def cli_main(argv: list[str] | None = None) -> int:
                 from_year=int(args.from_year),
                 to_year=int(args.to_year),
                 ai=AIConfig(provider=args.ai_provider, model=args.ai_model),
-                research=ResearchConfig(vector_backend=args.research_backend, auto_build=not args.no_auto_research),
+                research=ResearchConfig(vector_backend=args.research_backend, auto_build=args.auto_research and not args.no_auto_research),
+                extract_domains=args.extract_domains,
             ).normalized()
             project_path.parent.mkdir(parents=True, exist_ok=True)
             project_path.write_text(json.dumps(config.to_payload(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

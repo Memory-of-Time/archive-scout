@@ -432,7 +432,7 @@ class ProjectConfig:
     connect_timeout: float = 30.0
     read_timeout: float = 180.0
     max_attempts: int = 4
-    user_agent: str = "ArchiveScout/1.2.5 public web archive research client"
+    user_agent: str = "ArchiveScout/1.2.6 public web archive research client"
     retry_error_categories: list[str] = field(default_factory=list)
     retry_capture_ids: list[int] = field(default_factory=list)
     retry_media_capture_ids: list[int] = field(default_factory=list)
@@ -442,6 +442,7 @@ class ProjectConfig:
     research: ResearchConfig | dict = field(default_factory=ResearchConfig)
     network: NetworkConfig | dict = field(default_factory=NetworkConfig)
     report: ReportConfig | dict = field(default_factory=ReportConfig)
+    extract_domains: bool = False
     target_settings: dict[str, dict] = field(default_factory=dict)
     auto_backup: bool = True
     backup_keep: int = 5
@@ -566,7 +567,7 @@ class ProjectConfig:
             connect_timeout=max(1.0, float(self.connect_timeout)),
             read_timeout=max(1.0, float(self.read_timeout)),
             max_attempts=min(20, max(1, int(self.max_attempts))),
-            user_agent=self.user_agent.strip() or "ArchiveScout/1.2.5 public web archive research client",
+            user_agent=self.user_agent.strip() or "ArchiveScout/1.2.6 public web archive research client",
             retry_error_categories=list(dict.fromkeys(value.strip() for value in self.retry_error_categories if value.strip())),
             retry_capture_ids=sorted({int(value) for value in self.retry_capture_ids if int(value) > 0}),
             retry_media_capture_ids=sorted({int(value) for value in self.retry_media_capture_ids if int(value) > 0}),
@@ -576,6 +577,7 @@ class ProjectConfig:
             research=research,
             network=network,
             report=report,
+            extract_domains=bool(self.extract_domains),
             target_settings=target_settings,
             auto_backup=bool(self.auto_backup),
             backup_keep=min(50, max(1, int(self.backup_keep))),
@@ -800,7 +802,8 @@ def project_config_from_payload(payload: dict, path: Path) -> ProjectConfig:
         connect_timeout=float(payload.get("connect_timeout", 30.0)),
         read_timeout=float(payload.get("read_timeout", 180.0)),
         max_attempts=int(payload.get("max_attempts", 4)),
-        user_agent=str(payload.get("user_agent", "ArchiveScout/1.2.5 public web archive research client")),
+        user_agent=str(payload.get("user_agent", "ArchiveScout/1.2.6 public web archive research client")),
+        extract_domains=bool(payload.get("extract_domains", False)),
         retry_error_categories=list(payload.get("retry_error_categories") or []),
         retry_capture_ids=[int(value) for value in payload.get("retry_capture_ids") or []],
         retry_media_capture_ids=[int(value) for value in payload.get("retry_media_capture_ids") or []],
@@ -842,7 +845,7 @@ def project_config_from_payload(payload: dict, path: Path) -> ProjectConfig:
         ),
         research=ResearchConfig(
             enabled=bool(research_payload.get("enabled", True)),
-            auto_build=bool(research_payload.get("auto_build", True)),
+            auto_build=bool(research_payload.get("auto_build", False)),
             vector_backend=str(research_payload.get("vector_backend", "local-hash")),
             vector_dimensions=int(research_payload.get("vector_dimensions", 256)),
             candidate_limit=int(research_payload.get("candidate_limit", 3000)),

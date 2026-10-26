@@ -16,8 +16,8 @@ from archive_scout.scanning.jobs import ScanJob
 from archive_scout.downloads.diagnostics import _process_memory
 
 
-def run(count:int=90)->dict:
-    body=b'<html><body>archived needle '+b'x'*4096+b'</body></html>'
+def run(count:int=90,extract_domains:bool=False,body_bytes:int=4096)->dict:
+    body=b'<html><body>archived needle cdn.example.com '+b'x'*body_bytes+b' last.example.co.uk</body></html>'
     class Handler(BaseHTTPRequestHandler):
         protocol_version='HTTP/1.1'
         def do_GET(self):
@@ -29,7 +29,7 @@ def run(count:int=90)->dict:
     try:
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)
-            config=ProjectConfig(root,targets=['example.net/*'],keywords=['needle'],cdx_delay=0,download_delay=0.125).normalized()
+            config=ProjectConfig(root,targets=['example.net/*'],keywords=['needle'],cdx_delay=0,download_delay=0.125,extract_domains=extract_domains).normalized()
             config.network.trust_environment=False
             db=open_database(root)
             signature=cdx_query_signature(config)
@@ -64,13 +64,19 @@ def run(count:int=90)->dict:
                 files=list((root/'captures').rglob('*.txt'))
                 assert len(files)==count
                 assert all(hashlib.sha256(p.read_bytes()).digest()==hashlib.sha256(body).digest() for p in files)
+                if extract_domains:
+                    from archive_scout.domains import publish_domains
+                    domain_path,gaps=publish_domains(db,config)
+                    assert gaps==0
+                    assert domain_path.read_text().splitlines()==['*.cdn.example.com/*','*.last.example.co.uk/*']
+                    assert db.execute("SELECT COUNT(*) FROM domain_sources WHERE status='complete'").fetchone()[0]==count
                 windows=[]
                 for label,low,high in [('early',0,count//3),('middle',count//3,2*count//3),('late',2*count//3,count)]:
                     a=next((t for n,t in samples if n>=low),0.0) if low else 0
                     b=next((t for n,t in samples if n>=high),None)
                     windows.append({'phase':label,'saves_per_second':round((high-low)/(b-a),3) if b and b>a else None})
                 acquisition_seconds=samples[-1][1] if samples else elapsed
-                return {'validated':count,'documents_scanned':documented,'scores_persisted':scored,'elapsed_seconds':round(elapsed,3),'saves_per_second':round(count/elapsed,3),
+                return {'extract_domains':extract_domains,'body_bytes':len(body),'validated':count,'documents_scanned':documented,'scores_persisted':scored,'elapsed_seconds':round(elapsed,3),'saves_per_second':round(count/elapsed,3),
                         'acquisition_seconds':round(acquisition_seconds,3),
                         'acquisition_saves_per_second':round(count/max(.001,acquisition_seconds),3),
                         'scan_drain_seconds':round(max(0,elapsed-acquisition_seconds),3),
@@ -80,4 +86,5 @@ def run(count:int=90)->dict:
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--count',type=int,default=90);parser.add_argument('--output',type=Path,default=Path('validation/loopback.json'))
-    args=parser.parse_args();result=run(args.count);args.output.parent.mkdir(parents=True,exist_ok=True);args.output.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2))
+    parser.add_argument('--extract-domains',action='store_true');parser.add_argument('--body-bytes',type=int,default=4096)
+    args=parser.parse_args();result=run(args.count,args.extract_domains,args.body_bytes);args.output.parent.mkdir(parents=True,exist_ok=True);args.output.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2))

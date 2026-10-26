@@ -179,9 +179,9 @@ def emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent)
 
 def _scan_scope_identity(config: ProjectConfig) -> str:
     """Stable inventory scope; excludes request pacing and project location."""
-    targets = sorted((target, cdx_query_signature(config.for_target(target)))
-                     for target in config.targets)
-    data = {"targets": targets, "from": config.from_date, "to": config.to_date}
+    from .database.scope import scope_rows
+    targets = scope_rows(config)
+    data = {"targets": targets, "from": config.from_date, "to": config.to_date, "scoring_recipe": 3}
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -213,9 +213,26 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
         return None
     if not isinstance(metadata, dict):
         return None
+    if metadata.get("scoring_recipe") != 3 and database.execute("SELECT 1 FROM document_matches WHERE scan_run_id=? LIMIT 1",(run_id,)).fetchone():
+        from .scanning.keywords import compile_keywords
+        selected = config.selected_keyword_sets()
+        if not selected or len(compile_keywords(selected[0].rules)) != 1:
+            return None  # collisions and pair bonuses can alter multi-rule results
     if metadata.get("scope_identity"):
         if metadata["scope_identity"] != scope_id:
-            return None
+            # Preserve compatible interrupted scans from the earlier scope
+            # identity, but validate their actual scored corpus once before reuse.
+            old_targets = sorted((target, cdx_query_signature(config.for_target(target)))
+                                 for target in config.targets)
+            old_data = {'targets': old_targets, 'from': config.from_date, 'to': config.to_date}
+            old_id = hashlib.sha256(json.dumps(old_data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            from .database.scope import scope_rows
+            previous_scope = {'targets': scope_rows(config), 'from': config.from_date, 'to': config.to_date}
+            previous_id = hashlib.sha256(json.dumps(previous_scope,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
+            if metadata['scope_identity'] == old_id:
+                metadata.pop('saved_scope_proof', None)
+            elif metadata['scope_identity'] != previous_id:
+                return None
     else:
         # Legacy scan metadata cannot establish a completed run's scope when
         # it had no matches; only reuse interrupted legacy runs on Resume.
@@ -248,6 +265,15 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
         ).fetchone()
         if mismatch is not None:
             return None
+    if config.targets and metadata.get('saved_scope_proof') != 2:
+        from .database.scope import prepare_saved_scope, saved_scope_predicate
+        prepare_saved_scope(database, config)
+        if database.execute("""SELECT 1 FROM document_matches m JOIN documents d ON d.id=m.document_id
+            JOIN captures c ON c.id=d.capture_id WHERE m.scan_run_id=? AND NOT ("""
+            + saved_scope_predicate() + ") LIMIT 1", (run_id,)).fetchone():
+            return None
+    metadata['saved_scope_proof'] = 2
+    metadata['scoring_recipe'] = 3
     metadata["scope_identity"] = scope_id
     database.execute(
         "UPDATE scan_runs SET status='running',completed_at=NULL,metadata_json=? WHERE id=?",
@@ -285,10 +311,15 @@ def prepare_scan_jobs(
                 config.minimum_score,
                 mode,
                 {"keyword_set": keyword_set.name, "rules": keyword_set.rules,
-                 "scope_identity": scope_id,
+                 "scope_identity": scope_id, "saved_scope_proof": 2, "scoring_recipe": 3,
                  "historical_backfill_complete": False,
                  "historical_backfill_cursor": 0},
             )
+        storage = config.report.normalized()
+        meta_row = database.execute('SELECT metadata_json FROM scan_runs WHERE id=?',(run_id,)).fetchone()
+        metadata = json.loads(meta_row[0] or '{}')
+        metadata['storage_policy'] = {key:getattr(storage,key) for key in ('store_keyword_counts','store_keyword_fields','store_snippets','store_interesting_links','create_default_reviews')}
+        database.execute('UPDATE scan_runs SET metadata_json=? WHERE id=?',(json.dumps(metadata),run_id))
         jobs.append(ScanJob.create(run_id, keyword_set.name, keyword_set.rules))
     database.commit()
     return jobs
@@ -309,7 +340,7 @@ def scan_prior_documents_once(database: sqlite3.Connection, jobs: list[ScanJob],
         return
     rescan_keyword_sets(database, jobs, stop_event, callback,
                         workers=config.workers, missing_only=True,
-                        scope_pairs=scopes,
+                        scope_config=config,
                         empty_message="Existing-document check complete: no outstanding saved-body scans; continuing with this operation.")
 
 
@@ -323,7 +354,7 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
                 signature = cdx_query_signature(config.for_target(target))
                 gap = database.execute(
                     """SELECT 1 FROM captures c
-                       WHERE c.query_signature=? AND EXISTS (SELECT 1 FROM targets t
+                       WHERE c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS (SELECT 1 FROM targets t
                            WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS
                                (SELECT 1 FROM capture_target_membership m
                                 WHERE m.capture_id=c.id AND m.target_id=t.id))) AND
@@ -335,7 +366,7 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
                                  WHERE m.document_id=d.id AND m.scan_run_id=?)))) OR
                          EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
                              AND e.operation='scan' AND e.resolved=0)) LIMIT 1""",
-                    (signature, target, job.scan_run_id),
+                    (signature, config.for_target(target).from_date, config.for_target(target).to_date, target, job.scan_run_id),
                 ).fetchone()
                 if gap:
                     actual = "interrupted"
@@ -369,12 +400,13 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
     # Reuse a bounded, disk-backed scope table so target-specific CDX overrides
     # are not silently filtered out by the global signature on retry.
     database.execute("""CREATE TEMP TABLE IF NOT EXISTS archive_scout_retry_scopes(
-        pattern TEXT NOT NULL, signature TEXT NOT NULL,
-        PRIMARY KEY(pattern,signature)) WITHOUT ROWID""")
+        pattern TEXT NOT NULL, signature TEXT NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL,
+        PRIMARY KEY(pattern,signature,start,end)) WITHOUT ROWID""")
     database.execute("DELETE FROM archive_scout_retry_scopes")
     database.executemany(
-        "INSERT OR IGNORE INTO archive_scout_retry_scopes VALUES(?,?)",
-        ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
+        "INSERT OR IGNORE INTO archive_scout_retry_scopes VALUES(?,?,?,?)",
+        ((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
+         for target in config.targets for scoped in [config.for_target(target)]),
     )
     from .downloads.schedule import retry_selection, explicit_error_predicate
     selection, selected_params = retry_selection(database, config) if respect_selection else ("", [])
@@ -389,7 +421,7 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
             """SELECT c.id FROM captures c
                WHERE c.id>? AND EXISTS (SELECT 1 FROM targets t
                   JOIN archive_scout_retry_scopes s ON s.pattern=t.pattern
-                   AND s.signature=c.query_signature
+                   AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
                    WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                      WHERE m.capture_id=c.id AND m.target_id=t.id))
                AND ((c.state='error' AND EXISTS (
@@ -420,7 +452,7 @@ def remaining_acquisition_gaps(config: ProjectConfig, database: sqlite3.Connecti
     return int(database.execute(
         """SELECT COUNT(*) FROM captures c
            WHERE EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-                ON s.pattern=t.pattern AND s.signature=c.query_signature
+                ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
                 WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                      WHERE m.capture_id=c.id AND m.target_id=t.id))
              AND c.state IN ('error','pending','downloading')""",
@@ -624,6 +656,8 @@ def run_project(
             original_callback(event)
 
     callback = operation_callback
+    from .downloads.session import begin_session, end_session
+    acquisition_session_token = begin_session()
     def report_progress(name: str, count: int, done: bool) -> None:
         emit(callback, ProgressEvent(
             "report", f"{'Wrote' if done else 'Writing'} {name}.txt: {count:,} rows"
@@ -631,6 +665,15 @@ def run_project(
     report_finalization_started = False
 
     def result_paths(paths: dict[str, Path]) -> OperationPaths:
+        if config.extract_domains and mode in {'all','download','resume','rescan','retry_errors','download_only','report'}:
+            from .domains import backfill_domains,publish_domains
+            if mode != 'report':
+                backfill_domains(database,config,stop_event,callback)
+            domain_path, domain_gaps = publish_domains(database,config)
+            paths['domains'] = domain_path
+            if domain_gaps and mode != 'report':
+                finish_operation_run(database,operation_run_id,'incomplete',f'Domain extraction has {domain_gaps:,} unresolved saved inputs')
+                database.commit()
         row = database.execute("SELECT status,message FROM operation_runs WHERE id=?", (operation_run_id,)).fetchone()
         if row and row[0] == "complete" and mode in RESUMABLE_MODES:
             _complete_resume_request(database, operation_run_id)
@@ -655,7 +698,7 @@ def run_project(
             database.commit()
             return {"backup": path}
         if mode == "repair":
-            path = repair_project(config.output_dir, database, callback, keep_backups=config.backup_keep)
+            path = repair_project(config.output_dir, database, callback, keep_backups=config.backup_keep,stop_event=stop_event)
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
             return {"repair": path}
@@ -670,21 +713,21 @@ def run_project(
                 raise ValueError("choose an existing folder to import")
             if config.auto_backup and (config.output_dir / "archive_scout.sqlite3").exists():
                 create_project_backup(config.output_dir, reason="before_import", keep=config.backup_keep)
-            imported = import_text_folder(config.output_dir, source, database, stop_event, callback)
+            imported = import_text_folder(config.output_dir, source, database, stop_event, callback,max_bytes=config.max_file_bytes)
             report = config.output_dir / "reports" / "import_summary.txt"
             report.write_text(f"Archive Scout import\n\nSource: {source}\nImported: {imported}\n", encoding="utf-8")
             finish_operation_run(database, operation_run_id, "complete", f"Imported {imported}")
             database.commit()
             return {"import_summary": report}
         if mode == "integrity":
-            path = check_project_integrity(config.output_dir, database, callback)
+            path = check_project_integrity(config.output_dir, database, callback,stop_event=stop_event)
             emit(callback, ProgressEvent("integrity", f"Integrity report written to {path}"))
             finish_operation_run(database, operation_run_id, "complete", str(path))
             database.commit()
             return {"integrity": path}
         if mode == "analysis":
             paths = run_analysis(config, database, stop_event, callback, forum_only=False)
-            finish_operation_run(database, operation_run_id, "complete", "Analysis complete")
+            finish_operation_run(database, operation_run_id, getattr(paths,'status','complete'), "Analysis complete" if getattr(paths,'status','complete') == 'complete' else "Analysis has unfinished external lookups")
             database.commit()
             return result_paths(paths)
         if mode == "research_index":
@@ -806,16 +849,6 @@ def run_project(
                 index_deferred = index_archive(config, database, stop_event, callback)
             require_text_coverage(database, config)
             record_admission(database, operation_run_id, "text", config)
-            # Direct media can be indexed without downloading text. Embedded
-            # candidates discovered from future documents need the later gate.
-            direct_media_phase = ((mode == "all" and config.media.enabled)
-                                  or (mode == "download_only" and config.media.enabled)
-                                  or (mode == "resume" and pending_media_phase == "direct"))
-            if direct_media_phase:
-                if media_coverage_gaps(database, config):
-                    index_media(config, database, stop_event, callback)
-                require_media_coverage(database, config)
-                record_admission(database, operation_run_id, "media", config)
 
         # Acquisition-only runs never create scan jobs, even without a keyword set.
         if mode in {"download_only", "retry_download_errors"}:
@@ -829,6 +862,10 @@ def run_project(
                 recover_transient_text_errors(config, database, 0, [], stop_event,
                                               callback, continuous=True, acquire_only=True,
                                               respect_selection=True)
+            if mode == "download_only" and config.extract_domains:
+                from .scanning.pending import scan_pending_saved
+                for target in config.targets:
+                    scan_pending_saved(database,config.for_target(target),[],stop_event,callback,workers=config.workers)
             if mode == "download_only" and config.media.enabled:
                 if remaining_acquisition_gaps(config, database):
                     raise IndexCoveragePending("Text acquisition is unfinished; dependent media discovery was not started")
@@ -870,6 +907,8 @@ def run_project(
             # part of the searchable inventory.  Scanning documents first
             # avoids reprocessing any newly recovered pending body twice.
             rescan_keyword_sets(database, jobs, stop_event, callback, workers=config.workers,
+                                scope_config=config if config.targets else None,
+                                extract_domains=config.extract_domains,
                                 missing_only=all(database.execute(
                                     "SELECT source_operation,status FROM scan_runs WHERE id=?", (job.scan_run_id,)
                                 ).fetchone()["source_operation"] == "rescan" and
@@ -1060,4 +1099,7 @@ def run_project(
         database.commit()
         raise
     finally:
-        database.close()
+        try:
+            end_session(acquisition_session_token)
+        finally:
+            database.close()

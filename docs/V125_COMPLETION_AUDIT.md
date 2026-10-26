@@ -1,3 +1,5 @@
+> Historical v1.2.5 checkpoint. For current cumulative behavior and audit disposition, see V126_AUDIT_IMPLEMENTATION.md.
+
 # Archive Scout v1.2.5 completion, acquisition and report audit
 
 Date: 25 October 2026. Version remains 1.2.5; database schema remains 10.

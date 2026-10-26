@@ -68,7 +68,7 @@ from .extensions import allowed_media_url, selected_extensions
 ALL_EXTENSIONS_STATE = "__all__"
 
 
-def media_query_signature(config: ProjectConfig, page_size: int | None = None) -> str:
+def media_query_signature(config: ProjectConfig, page_size: int | None = None, *, discovery_version: int = 2) -> str:
     media = config.media.normalized()
     payload = {
         "from": config.from_date,
@@ -97,6 +97,10 @@ def media_query_signature(config: ProjectConfig, page_size: int | None = None) -
         "single_query_per_target": True,
         "network_strategy": config.network.normalized().index_strategy,
     }
+    if media.discover_embedded and discovery_version >= 2:
+        from ..database.scope import scope_rows, discovery_scope_config
+        payload['saved_page_scope'] = scope_rows(discovery_scope_config(config))
+        payload['discovery_proof'] = 'selected_full_body_v2'
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
@@ -106,7 +110,14 @@ def media_query_signatures(config: ProjectConfig) -> tuple[str, ...]:
     return tuple(dict.fromkeys(media_query_signature(config, size) for size in sizes))
 
 
-def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int = 4) -> str:
+def _extra_collapse_affects_extreme(config: ProjectConfig) -> bool:
+    return config.media.snapshot_strategy in {'earliest', 'latest'} and any(
+        key == 'collapse' for key, _ in parse_cdx_parameter_lines(config.cdx_extra_params))
+
+
+def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int | None = None) -> str:
+    if revision is None:
+        revision = 5 if _extra_collapse_affects_extreme(config) else 4
     payload = {"media_query_signature": media_query_signature(config, page_size), "index_revision": int(revision)}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -115,11 +126,14 @@ def media_index_state_signature(config: ProjectConfig, *, page_size: int | None 
 def media_signature_candidates(config: ProjectConfig) -> tuple[tuple[str, str], ...]:
     values: list[tuple[str, str]] = []
     for size in [config.page_size, 5000, 25000, 1000, 10000, 50000, 100000, 150000]:
-        media_signature = media_query_signature(config, size)
-        for revision in (4, 3, 2):
-            item = (media_signature, media_index_state_signature(config, page_size=size, revision=revision))
-            if item not in values:
-                values.append(item)
+        for discovery_version in (2, 1):
+            media_signature = media_query_signature(config, size, discovery_version=discovery_version)
+            for revision in (5, 4, 3, 2):
+                raw = json.dumps({'media_query_signature': media_signature, 'index_revision': revision},
+                                 sort_keys=True, separators=(',', ':'))
+                item = (media_signature, hashlib.sha256(raw.encode()).hexdigest()[:20])
+                if item not in values:
+                    values.append(item)
     return tuple(values)
 
 
@@ -168,7 +182,10 @@ def build_media_params(
         # One regex filter covers every selected extension. Archive Scout never
         # performs an extension-by-extension CDX index.
         params.append(("filter", "original:" + extension_filter_regex(extensions)))
-    params.extend(parse_cdx_parameter_lines(config.cdx_extra_params))
+    extras = parse_cdx_parameter_lines(config.cdx_extra_params)
+    if config.media.normalized().snapshot_strategy != 'all':
+        extras = [(key, value) for key, value in extras if key != 'collapse']
+    params.extend(extras)
     params.extend([("limit", str(page_size or config.page_size)), ("showResumeKey", "true")])
     if resume:
         params.append(("resumeKey", resume))
@@ -313,11 +330,12 @@ def _adopt_compatible_media_state(
         page_size = next((size for size in candidate_sizes
                          if media_query_signature(identity_config, size) == candidate_signature),
                         identity_config.page_size)
-        old_revision = candidate_state != media_index_state_signature(
-            identity_config, page_size=page_size)
+        proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': 5 if _extra_collapse_affects_extreme(config) else 4},
+                           sort_keys=True, separators=(',', ':'))
+        old_revision = candidate_state != hashlib.sha256(proof.encode()).hexdigest()[:20]
         if state['complete'] and old_revision and (
                 int(state['seen'] or 0) >= min(100, page_size) or
-                (config.media.snapshot_strategy in {'earliest', 'latest'} and config.cdx_collapses)):
+                (config.media.snapshot_strategy in {'earliest', 'latest'} and (config.cdx_collapses or _extra_collapse_affects_extreme(config)))):
             continue
         if candidate_signature != signature:
             database.execute(
@@ -354,7 +372,8 @@ def _reuse_completed_main_index(
     state_signature: str,
 ) -> tuple[bool, int, int]:
     """Populate media rows from a completed normal index without another CDX pass."""
-    if config.media.snapshot_strategy in {"earliest", "latest"} and config.cdx_collapses:
+    if config.media.snapshot_strategy in {"earliest", "latest"} and (
+            config.cdx_collapses or any(k == 'collapse' for k, _ in parse_cdx_parameter_lines(config.cdx_extra_params))):
         # A digest/urlkey representative is not proof of either timestamp
         # extreme. Only the uncollapsed timestamp inventory is sufficient.
         return False, 0, 0
@@ -1142,7 +1161,8 @@ def _discover_document_media(
     if not path.is_file():
         raise FileNotFoundError(f"Saved document required for media discovery is missing: {document_id}")
     known_links = [str(value) for value in json_value(row.get("links_json"), []) if str(value).strip()]
-    raw = safe_document_text(output_dir, str(row.get("path") or ""), max_file_bytes)
+    raw = safe_document_text(output_dir, str(row.get("path") or ""), max_file_bytes,
+                             expected_hash=content_hash)
     found = discover_media(raw, str(row.get("original_url") or ""), media, known_links)
     batch: list[tuple[str, int | None, str, str]] = []
     for item in found:
@@ -1184,9 +1204,14 @@ def _discover_embedded_queue(
     # In the dedicated external-after-scan workflow, "external" is defined
     # relative to the site(s) that were actually indexed and scanned. Stale or
     # optional direct-media targets must not change that boundary.
-    discovery_targets = config.targets if external_only else (media.targets or config.targets)
+    from ..database.scope import discovery_scope_config
+    source_config = discovery_scope_config(config)
+    discovery_targets = source_config.targets
     targets = target_hosts(discovery_targets)
-    total = int(database.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+    from ..database.scope import prepare_saved_scope, saved_scope_predicate
+    prepare_saved_scope(database, source_config)
+    scope = saved_scope_predicate()
+    total = int(database.execute('SELECT COUNT(*) FROM documents d JOIN captures c ON c.id=d.capture_id WHERE ' + scope).fetchone()[0])
     scanned = queued = 0
     cursor = database.execute(
         """
@@ -1196,57 +1221,73 @@ def _discover_embedded_queue(
         JOIN captures c ON c.id=d.capture_id
         LEFT JOIN media_discovery_documents mdd
           ON mdd.document_id=d.id AND mdd.query_signature=?
-        ORDER BY d.id
-        """,
+        WHERE """ + scope + " ORDER BY d.id",
         (signature,),
     )
     workers = min(8, max(1, int(config.workers)))
-    batch_size = max(64, workers * 16)
+    byte_budget = 64 * 1024 * 1024
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="archive-discovery") as pool:
         while True:
-            rows = cursor.fetchmany(batch_size)
+            rows = cursor.fetchmany(64)
             if not rows:
                 break
-            futures: list[concurrent.futures.Future] = []
-            for row in rows:
+            remaining = iter(rows)
+            next_row = next(remaining, None)
+            futures = {}
+            inflight_bytes = 0
+            while next_row is not None or futures:
                 if stop_event.is_set():
+                    for future in futures:
+                        future.cancel()
                     raise Stopped
-                document_id = int(row["id"])
-                content_hash = str(row["content_hash"] or "")
-                if str(row["discovery_content_hash"] or "") == content_hash and content_hash:
-                    scanned += 1
+                while next_row is not None and len(futures) < workers:
+                    row = next_row
+                    content_hash = str(row['content_hash'] or '')
+                    if content_hash and str(row['discovery_content_hash'] or '') == content_hash:
+                        scanned += 1
+                        next_row = next(remaining, None)
+                        continue
+                    path = Path(str(row['path']))
+                    if not path.is_absolute():
+                        path = config.output_dir / path
+                    try:
+                        estimate = min(path.stat().st_size, config.max_file_bytes + 1) * 3
+                    except OSError:
+                        estimate = 1
+                    estimate = max(1, estimate)
+                    if futures and inflight_bytes + estimate > byte_budget:
+                        break
+                    future = pool.submit(_discover_document_media, config.output_dir,
+                        config.max_file_bytes, media, targets, external_only, dict(row))
+                    futures[future] = (int(row['id']), estimate)
+                    inflight_bytes += estimate
+                    next_row = next(remaining, None)
+                if not futures:
                     continue
-                futures.append(pool.submit(
-                    _discover_document_media,
-                    config.output_dir,
-                    config.max_file_bytes,
-                    media,
-                    targets,
-                    external_only,
-                    dict(row),
-                ))
-            completed_results: list[tuple[int, str, list[tuple[str, int | None, str, str]]]] = []
-            for future in concurrent.futures.as_completed(futures):
-                if stop_event.is_set():
-                    for pending in futures:
-                        pending.cancel()
-                    raise Stopped
-                completed_results.append(future.result())
-            # One transaction per local discovery batch instead of one fsync/
-            # transaction boundary per document. Worker threads never touch SQLite.
-            if completed_results:
+                done, _ = concurrent.futures.wait(futures, timeout=0.25,
+                    return_when=concurrent.futures.FIRST_COMPLETED)
                 with database:
-                    for document_id, content_hash, discovered in completed_results:
+                    for future in done:
+                        document_id, estimate = futures.pop(future)
+                        inflight_bytes -= estimate
+                        try:
+                            document_id, content_hash, discovered = future.result()
+                        except OSError as exc:
+                            record_error(database, 'media_discovery', 'local_source_unavailable',
+                                str(exc), document_id=document_id, retryable=True)
+                            if callback:
+                                callback(ProgressEvent('media_embed',
+                                    f'Document {document_id}: complete media discovery remains unresolved: {exc}'))
+                            continue
                         queued += queue_media_discovery_candidates(database, signature, discovered)
                         mark_media_discovery_document(database, signature, document_id, content_hash, len(discovered))
+                        resolve_errors(database, document_id=document_id, operations=('media_discovery',))
                         scanned += 1
-            if callback and (scanned == total or scanned % 100 == 0):
-                callback(ProgressEvent(
-                    "media_embed",
-                    f"Discovering embedded media in saved pages {scanned:,}/{total:,}; {queued:,} new URLs queued",
-                    scanned,
-                    total,
-                ))
+            if callback:
+                callback(ProgressEvent('media_embed',
+                    f'Discovering embedded media in selected saved pages {scanned:,}/{total:,}; {queued:,} new URLs queued',
+                    scanned, total))
+
     return queued
 
 
@@ -1273,7 +1314,7 @@ def _embedded_lookup(
                 client, endpoints, params, max_bytes=8 * 1024 * 1024, prefer_text=True
             )
             validate_cdx_scope(result.rows,url,config.from_date,config.to_date,config.cdx_filters,'exact')
-            return row, result.rows[:1], None
+            return row, result.rows, None
         if strategy == "latest":
             params = build_media_params(config, url, config.from_date, config.to_date, exact=True, page_size=1)
             params = [(key, value) for key, value in params if key not in {"limit", "showResumeKey", "resumeKey", "fastLatest"}]
@@ -1282,7 +1323,7 @@ def _embedded_lookup(
                 client, endpoints, params, max_bytes=8 * 1024 * 1024, prefer_text=True
             )
             validate_cdx_scope(result.rows,url,config.from_date,config.to_date,config.cdx_filters,'exact')
-            return row, result.rows[-1:] if result.rows else [], None
+            return row, result.rows, None
 
         raise ValueError("All-snapshot embedded indexing requires the persistent page queue")
     except BaseException as exc:

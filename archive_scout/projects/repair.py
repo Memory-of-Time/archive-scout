@@ -4,13 +4,13 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-from ..events import ProgressEvent
+from ..events import ProgressEvent, Stopped
 from ..projects.backups import create_project_backup
 from ..utils import atomic_write_text, utc_now
 from ..database.repositories import record_error
 
 
-def rebuild_full_text_index(database: sqlite3.Connection, batch_size: int = 500) -> int:
+def rebuild_full_text_index(database: sqlite3.Connection, batch_size: int = 500, *, stop_event=None) -> int:
     enabled = database.execute("SELECT value FROM project_meta WHERE key='fts5'").fetchone()
     if not enabled or enabled[0] != "1":
         return 0
@@ -23,6 +23,7 @@ def rebuild_full_text_index(database: sqlite3.Connection, batch_size: int = 500)
     )
     rebuilt = 0
     while True:
+        if stop_event is not None and stop_event.is_set(): raise Stopped
         rows = cursor.fetchmany(max(1, int(batch_size)))
         if not rows:
             break
@@ -43,6 +44,7 @@ def repair_project(
     callback: Callable[[ProgressEvent], None] | None = None,
     *,
     keep_backups: int = 5,
+    stop_event=None,
 ) -> Path:
     root = Path(root)
     backup = create_project_backup(root, reason="before_repair", keep=keep_backups)
@@ -75,6 +77,7 @@ def repair_project(
             last_id = int(rows[-1]["id"])
             invalid = []
             for row in rows:
+                if stop_event is not None and stop_event.is_set(): raise Stopped
                 path = Path(row["path"])
                 if not path.is_file() or path.stat().st_size == 0:
                     invalid.append((int(row["id"]), int(row["capture_id"])))
@@ -94,7 +97,21 @@ def repair_project(
                              capture_id=capture_id, document_id=document_id,
                              retryable=True)
             missing += len(invalid)
-        rebuilt = rebuild_full_text_index(database)
+        media_missing = 0
+        from .files import file_hash
+        for media in database.execute("SELECT id,path,content_hash,bytes_saved FROM media_captures WHERE state='downloaded'"):
+            if stop_event is not None and stop_event.is_set(): raise Stopped
+            try:
+                size,digest = file_hash(Path(media['path'] or ''),stop_event)
+                valid = size > 0 and size == int(media['bytes_saved']) and digest == str(media['content_hash'])
+            except OSError:
+                valid = False
+            if not valid:
+                database.execute("UPDATE media_captures SET state='pending',download_attempts=0,updated_at=? WHERE id=?",(utc_now(),media['id']))
+                record_error(database,'media_download','missing_local_media','Repair queued missing or changed media; historical evidence preserved',media_capture_id=media['id'],retryable=True)
+                media_missing += 1
+        actions.append(f'Missing or changed media queued: {media_missing}')
+        rebuilt = rebuild_full_text_index(database,stop_event=stop_event)
         database.execute("INSERT INTO repair_actions(action,details,created_at) VALUES(?,?,?)", ("repair", f"capture_reset={capture_reset}; media_reset={media_reset}; missing={missing}; fts={rebuilt}", utc_now()))
 
     removed_parts = preserved_parts = 0

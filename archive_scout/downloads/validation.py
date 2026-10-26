@@ -7,6 +7,7 @@ import urllib.error
 
 def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     message = str(exc).casefold()
+    category_token = message.split(":",1)[0]
     status = getattr(exc, "status", None)
     # Resolve nested transport exceptions by type before guessing from their
     # textual messages. Pool exhaustion is not an archive read timeout.
@@ -57,8 +58,9 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
         "origin_unavailable": ("origin_unavailable", None, True),
         "soft_404": ("missing_capture", 404, False),
     }
-    if message in replay_categories:
-        return replay_categories[message]
+    if category_token in replay_categories:
+        category, default_status, retryable = replay_categories[category_token]
+        return category, status if status is not None else default_status, retryable
     if "excluded from the wayback machine" in message or "blocked site error" in message:
         return "wayback_excluded", 403, False
     if "robots.txt" in message:

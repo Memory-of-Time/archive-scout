@@ -30,8 +30,8 @@ external archived media hosts, while ordinary same-site archived media redirects
 remain followable. Legacy config key `download_external_redirects` is preserved.
 
 Every acquisition mode requires positive coverage for its required inventory.
-Combined operations index direct text/media inventory before text acquisition,
-then refresh embedded discovery after new text is retained and parsed. Embedded
+Combined operations admit and acquire proven text inventory first, then index
+optional direct media and refresh embedded discovery after text is retained and parsed. Embedded
 URLs unknowable before reading archived text must be resolved before **media**
 acquisition. A failed required lookup or missing body blocks the dependent phase;
 an authoritative zero-result lookup is recorded as unavailable. Index timeout,
@@ -62,4 +62,14 @@ Historical scan regeneration uses the same worker with an explicitly selected sc
 
 `archive-scout run project.json --mode <mode> --format json` returns `status: complete` or `status: incomplete` (with an incomplete exit code) based on the actual operation row, not just whether a report file was written. JSONL similarly distinguishes an `incomplete` final result. Existing Python callers receive a dictionary-compatible mapping of paths with `.status` and `.message` properties; no stored schema migration is required.
 
-Resumability preserves saved scan results including zero-hit documents, downloaded bytes, CDX cursors and unfinished media state. v1.2.5 uses **schema 10** and backs up supported schema-9 projects before adding persistent media-retry metadata. The previous data remains in place; nevertheless make an independent project backup before upgrading and do not open the upgraded project in v1.2.4.
+Resumability preserves saved scan results including zero-hit documents, downloaded bytes, CDX cursors and unfinished media state. v1.2.6 uses **schema 11** and backs up supported schema-10 projects before adding independent domain coverage, current retry decisions and derivation revisions. The previous data remains in place; nevertheless make an independent project backup before upgrading and do not open the upgraded project in v1.2.5.
+
+## Domains and corrected scan recipes
+
+Enable **Extract domains** in Reports, or set `extract_domains: true` in project.json. CLI initialization accepts `--extract-domains`. Scan/Rescan processes all selected eligible bodies, including keyword nonmatches and exclusions. Report-only exports committed domain results without scanning or fetching. Acquisition-only runs process this requested local consumer without creating a keyword scan. Output is one `*.full.hostname/*` per line in `reports/domains.txt`, including separate apex, www and other subdomains when observed. No new target is enqueued.
+
+First enablement backfills available eligible saved bodies; missing or changed inputs remain unresolved. Existing valid extraction checkpoints prevent repeated reads. Domain detection is high recall: a filename such as `version.py` is also domain-like because `.py` is a real ending. No offline recognizer can prove historical registration or recover arbitrary encrypted JavaScript.
+
+Old single-rule scans unaffected by the scoring corrections can be adopted after their scope checks. Potentially affected multi-rule scans stay historical while a new scoring generation processes retained inputs; this one-time local work fixes demonstrated label/proximity errors without downloading them again. Explicit saved research choices remain intact; omitted auto-research now consistently defaults off.
+
+After upgrade, use the usual dependency installation/update procedure or rebuild the executable. The build scripts include offline suffix assets in GUI and CLI bundles. Source tests are not native frozen-build certification.

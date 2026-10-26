@@ -74,12 +74,13 @@ def capture_path(root: Path, capture_id: int, timestamp: str, original: str) -> 
 def _populate_download_scopes(database: sqlite3.Connection, config: ProjectConfig) -> None:
     """Keep target-specific inventory signatures in bounded SQLite temp storage."""
     database.execute("""CREATE TEMP TABLE IF NOT EXISTS archive_scout_download_scopes(
-        pattern TEXT NOT NULL, signature TEXT NOT NULL,
-        PRIMARY KEY(pattern,signature)) WITHOUT ROWID""")
+        pattern TEXT NOT NULL, signature TEXT NOT NULL, start TEXT NOT NULL,end TEXT NOT NULL,
+        PRIMARY KEY(pattern,signature,start,end)) WITHOUT ROWID""")
     database.execute("DELETE FROM archive_scout_download_scopes")
     database.executemany(
-        "INSERT OR IGNORE INTO archive_scout_download_scopes VALUES(?,?)",
-        ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
+        "INSERT OR IGNORE INTO archive_scout_download_scopes VALUES(?,?,?,?)",
+        ((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
+         for target in config.targets for scoped in [config.for_target(target)]),
     )
 
 
@@ -91,10 +92,10 @@ def _restore_changed_url_filter_skips(database: sqlite3.Connection, config: Proj
     on unchanged runs. The reset and identity update commit together so a crash
     cannot permanently hide rows when new keywords are chosen.
     """
+    from ..database.scope import scope_rows
     selection = {
         "scope": config.download_scope,
-        "targets": sorted((target, cdx_query_signature(config.for_target(target)))
-                          for target in config.targets),
+        "targets": scope_rows(config),
         "rules": [item.rules for item in config.selected_keyword_sets()],
     }
     digest = hashlib.sha256(json.dumps(selection, ensure_ascii=False,
@@ -111,13 +112,13 @@ def _restore_changed_url_filter_skips(database: sqlite3.Connection, config: Proj
                 SELECT 1 FROM capture_routing r WHERE r.capture_id=captures.id
                 AND r.routing='skipped_url_filter')
             AND EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-                ON s.pattern=t.pattern AND s.signature=captures.query_signature
+                ON s.pattern=t.pattern AND s.signature=captures.query_signature AND captures.timestamp BETWEEN s.start AND s.end
                 WHERE t.id=captures.target_id OR EXISTS
                     (SELECT 1 FROM capture_target_membership m WHERE m.capture_id=captures.id AND m.target_id=t.id))""", (utc_now(),))
         database.execute("""UPDATE capture_routing SET routing='pending',updated_at=?
             WHERE routing='skipped_url_filter' AND EXISTS (
                 SELECT 1 FROM captures c JOIN targets t JOIN archive_scout_download_scopes s
-                ON s.pattern=t.pattern AND s.signature=c.query_signature
+                ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
                 WHERE c.id=capture_routing.capture_id AND c.state='pending'
                 AND (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                     WHERE m.capture_id=c.id AND m.target_id=t.id)))""", (utc_now(),))
@@ -137,7 +138,7 @@ def _capture_progress_counts(database, config, capture_ids=None) -> dict[str, in
         source = "archive_scout_progress_selection p CROSS JOIN captures c ON c.id=p.id"
     rows = database.execute("SELECT c.state,COUNT(*) FROM " + source + """ WHERE EXISTS (
         SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-        ON s.pattern=t.pattern AND s.signature=c.query_signature
+        ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
         WHERE t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
             WHERE m.capture_id=c.id AND m.target_id=t.id)) GROUP BY c.state""")
     return {str(row[0]): int(row[1]) for row in rows}
@@ -192,7 +193,7 @@ def prepare_download_rows(
                 AND e.operation='download' AND e.resolved=0 AND e.ignored=0
                 AND e.category IN (""" + ",".join("?" for _ in redirect_categories) + """))
             AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-                ON s.pattern=t.pattern AND s.signature=captures.query_signature
+                ON s.pattern=t.pattern AND s.signature=captures.query_signature AND captures.timestamp BETWEEN s.start AND s.end
                 WHERE t.id=captures.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
                     WHERE m.capture_id=captures.id AND m.target_id=t.id))""",
             (utc_now(), *redirect_categories))
@@ -203,7 +204,7 @@ def prepare_download_rows(
                 WHERE state='skipped' AND EXISTS(SELECT 1 FROM capture_routing r
                     WHERE r.capture_id=captures.id AND r.routing='skipped_redirect_policy')
                 AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-                    ON s.pattern=t.pattern AND s.signature=captures.query_signature
+                    ON s.pattern=t.pattern AND s.signature=captures.query_signature AND captures.timestamp BETWEEN s.start AND s.end
                     WHERE t.id=captures.target_id OR EXISTS(
                         SELECT 1 FROM capture_target_membership m
                         WHERE m.capture_id=captures.id AND m.target_id=t.id))""", (utc_now(),))
@@ -224,7 +225,7 @@ def prepare_download_rows(
         )
         source = "archive_scout_capture_selection selected CROSS JOIN captures c ON c.id=selected.id"
     clauses.extend(["""EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-            ON s.pattern=t.pattern AND s.signature=c.query_signature
+            ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
             WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                 WHERE m.capture_id=c.id AND m.target_id=t.id))""",
             "1=1"])
@@ -637,8 +638,10 @@ def download_archive(
         return
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
-    diagnostics = AcquisitionDiagnostics(config.output_dir, callback,
-                                         enabled=config.network.diagnostics)
+    from .session import acquisition_client
+    diagnostics, _ = acquisition_client(("text_observations", id(database)), lambda: AcquisitionDiagnostics(config.output_dir, callback,
+                                         enabled=config.network.diagnostics))
+    diagnostics.begin_batch(callback)
     if callback and config.network.diagnostics:
         callback(ProgressEvent('acquisition_health', f'Text acquisition build: {diagnostics.build}'))
 
@@ -653,7 +656,14 @@ def download_archive(
                 message = f"{reason}. Retry {attempt}/{total_attempts} in {wait_seconds:.1f}s…"
             callback(ProgressEvent(stage, message))
 
-    client = HttpClient(
+    from .session import acquisition_client
+    # Settings may change between explicit operations, never between retries
+    # within one operation. The full transport key prevents incompatible reuse.
+    client_key = (config.workers, config.download_delay, config.retries,
+                  config.connect_timeout, config.read_timeout, config.user_agent,
+                  json.dumps(config.network.to_payload(), sort_keys=True),
+                  config.rate_limit_attempts, config.rate_limit_max_wait)
+    client, owns_client = acquisition_client(client_key, lambda: HttpClient(
         limiter,
         1 if config.network.persistent_retries else config.retries,
         max(config.connect_timeout, config.read_timeout),
@@ -673,7 +683,9 @@ def download_archive(
         connection_retry_seconds=config.network.connection_retry_seconds,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
         response_callback=diagnostics.response,
-    )
+    ))
+    client.response_callback = diagnostics.response
+    client.retry_callback = on_retry
     # The network pool should retain validated bytes, not burn connection slots
     # on HTML parsing and keyword matching. A separate local scanner commits
     # score-zero coverage and matches with its own WAL connection.
@@ -686,12 +698,11 @@ def download_archive(
     scanner_failures: list[BaseException] = []
     scanner_thread = None
     if jobs and not acquire_only:
-        # Reconciliation is a connection/scope migration, not per-retry work.
-        # The owner survives recovery batches; each new scanner connection does
-        # not. Doing it here prevents a full historical scan for 20 retry IDs.
-        from ..scanning.pending import _reconcile_legacy_pending
-        for target in config.targets:
-            _reconcile_legacy_pending(database, config.for_target(target))
+        # Reconcile legacy gaps on the local scanner while network work starts.
+        # Share its completed proof with the owner across tiny recovery batches.
+        from ..scanning.pending import reconciliation_done, mark_reconciled
+        needs_reconciliation = not reconciliation_done(database, config)
+        reconciliation_finished = []
 
         def local_scanner() -> None:
             from ..scanning.pending import scan_pending_saved
@@ -713,7 +724,9 @@ def download_archive(
                         # do not multiply network worker thread count here.
                         scan_pending_saved(connection, config.for_target(target), jobs,
                             stop_event, callback, workers=max(1, min(4, (os.cpu_count() or 2)//2)),
-                            write_lock=database_write_lock, reconcile_legacy=False)
+                            write_lock=database_write_lock, reconcile_legacy=needs_reconciliation)
+                    if needs_reconciliation and not stop_event.is_set():
+                        reconciliation_finished[:] = [True]
                     if scanner_finish.is_set():
                         break
             except Stopped:
@@ -1064,7 +1077,10 @@ def download_archive(
         scanner_wakeup.set()
         if scanner_thread is not None:
             scanner_thread.join()
-        client.close()
+        if owns_client:
+            client.close()
+        if scanner_thread is not None and reconciliation_finished:
+            mark_reconciled(database, config)
         diagnostics.summary(saved_this_pass, force=True)
     if scanner_failures:
         raise RuntimeError("background scanner failed; retained bodies remain recoverable") from scanner_failures[0]

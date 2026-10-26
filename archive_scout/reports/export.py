@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 import json
 import os
 import sqlite3
@@ -97,6 +98,15 @@ def export_scan(
     return destination
 
 
+@contextmanager
+def _read_snapshot(database):
+    database.execute('SAVEPOINT scout_review_export')
+    try:
+        yield
+    finally:
+        database.execute('RELEASE SAVEPOINT scout_review_export')
+
+
 def export_review_package(
     database: sqlite3.Connection,
     scan_run_id: int,
@@ -106,7 +116,7 @@ def export_review_package(
     search: str = "",
 ) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=destination.stem + ".", dir=str(destination.parent)) as temp:
+    with _read_snapshot(database), tempfile.TemporaryDirectory(prefix=destination.stem + ".", dir=str(destination.parent)) as temp:
         root = Path(temp)
         json_path = root / f"scan-{scan_run_id}.json"
         csv_path = root / f"scan-{scan_run_id}.csv"

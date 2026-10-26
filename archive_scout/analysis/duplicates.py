@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ..events import Stopped
 
 import hashlib
 import math
@@ -74,104 +75,82 @@ class _UnionFind:
             self.parent[max(a, b)] = min(a, b)
 
 
-def cluster_duplicates(database: sqlite3.Connection, threshold: float = 0.90) -> DuplicateSummary:
-    threshold = min(1.0, max(0.5, float(threshold)))
-    document_ids: list[int] = []
-    exact: dict[str, list[int]] = defaultdict(list)
-    for row in database.execute(
-        """
-        SELECT id,content_hash,normalized_hash
-        FROM documents WHERE COALESCE(body_text,'')<>'' ORDER BY id
-        """
-    ):
-        document_id = int(row["id"])
-        document_ids.append(document_id)
-        key = str(row["normalized_hash"] or row["content_hash"] or "")
-        if key:
-            exact[key].append(document_id)
+def cluster_duplicates(database: sqlite3.Connection, threshold: float = 0.90, *, stop_event=None) -> DuplicateSummary:
+    from ..database.staging import derived_generation
+    if database.execute("SELECT 1 FROM temp.sqlite_master WHERE type='table' AND name='duplicate_groups'").fetchone():
+        return _cluster(database,threshold,stop_event)
+    with derived_generation(database,['duplicate_groups','duplicate_members'],stop_event):
+        return _cluster(database,threshold,stop_event)
 
-    union = _UnionFind(document_ids)
-    method_for_pair: dict[tuple[int, int], tuple[str, float]] = {}
-    for ids in exact.values():
-        if len(ids) < 2:
-            continue
-        first = ids[0]
-        for other in ids[1:]:
-            union.union(first, other)
-            method_for_pair[(min(first, other), max(first, other))] = ("exact", 1.0)
 
-    # Body text can dominate project memory. Compute each SimHash while its row
-    # is current and retain only the 64-bit result and compact bucket IDs.
-    hashes: dict[int, int] = {}
-    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for row in database.execute(
-        "SELECT id,body_text FROM documents WHERE COALESCE(body_text,'')<>'' ORDER BY id"
-    ):
-        document_id = int(row["id"])
-        value = simhash64(str(row["body_text"] or ""))
-        hashes[document_id] = value
-        for band in range(4):
-            buckets[(band, (value >> (band * 16)) & 0xFFFF)].append(document_id)
-
-    for (band, _chunk), ids in buckets.items():
-        if len(ids) < 2:
-            continue
-        # Avoid pathological buckets created by empty or boilerplate-only pages.
-        if len(ids) > 2000:
-            ids = ids[:2000]
-        for index, left in enumerate(ids):
-            for right in ids[index + 1:]:
-                # The same pair can share multiple 16-bit bands. Process it only
-                # in the lowest shared band instead of retaining a project-wide
-                # set containing every candidate pair.
-                if any(
-                    ((hashes[left] >> (prior * 16)) & 0xFFFF)
-                    == ((hashes[right] >> (prior * 16)) & 0xFFFF)
-                    for prior in range(band)
-                ):
-                    continue
-                pair = (min(left, right), max(left, right))
-                similarity = hamming_similarity(hashes[left], hashes[right])
-                if similarity >= threshold:
-                    union.union(left, right)
-                    method_for_pair.setdefault(pair, ("near", similarity))
-
-    grouped: dict[int, list[int]] = defaultdict(list)
-    for document_id in document_ids:
-        grouped[union.find(document_id)].append(document_id)
-    groups = [sorted(ids) for ids in grouped.values() if len(ids) > 1]
-
-    with database:
-        database.execute("DELETE FROM duplicate_members")
-        database.execute("DELETE FROM duplicate_groups")
-        summary = DuplicateSummary()
-        for ids in sorted(groups, key=lambda item: (item[0], len(item))):
-            representative = ids[0]
-            all_exact = True
-            similarities: dict[int, float] = {representative: 1.0}
-            for document_id in ids[1:]:
-                pair = (min(representative, document_id), max(representative, document_id))
-                method, similarity = method_for_pair.get(
-                    pair,
-                    ("near", hamming_similarity(hashes[representative], hashes[document_id])),
-                )
-                if method != "exact":
-                    all_exact = False
-                similarities[document_id] = similarity
-            method = "exact" if all_exact else "near"
-            cursor = database.execute(
-                "INSERT INTO duplicate_groups(method,representative_document_id,created_at) VALUES(?,?,?)",
-                (method, representative, utc_now()),
-            )
-            group_id = int(cursor.lastrowid)
-            database.executemany(
-                "INSERT INTO duplicate_members(group_id,document_id,similarity) VALUES(?,?,?)",
-                ((group_id, document_id, similarities.get(document_id, 1.0)) for document_id in ids),
-            )
-            if method == "exact":
-                summary.exact_groups += 1
-            else:
-                summary.near_groups += 1
-            summary.grouped_documents += len(ids)
+def _cluster(database,threshold,stop_event):
+    threshold = min(1.0,max(0.5,float(threshold)))
+    def check():
+        if stop_event is not None and stop_event.is_set(): raise Stopped
+    # Full bodies are read only for changed/missing fingerprints.
+    for row in database.execute("""SELECT d.id,COALESCE(r.revision,0) AS revision,
+      d.normalized_hash,d.content_hash FROM documents d LEFT JOIN document_revisions r ON r.document_id=d.id
+      LEFT JOIN duplicate_fingerprints f ON f.document_id=d.id
+      WHERE COALESCE(d.body_text,'')<>'' AND (f.document_id IS NULL OR f.revision<>COALESCE(r.revision,0)) ORDER BY d.id"""):
+        check()
+        body=database.execute('SELECT body_text FROM documents WHERE id=?',(row['id'],)).fetchone()[0]
+        value=simhash64(body or '')
+        database.execute('INSERT OR REPLACE INTO duplicate_fingerprints VALUES(?,?,?,?,?,?,?,?)',
+            (row['id'],row['revision'],str(row['normalized_hash'] or row['content_hash'] or ''),f'{value:016x}',
+             *((value>>(band*16))&0xffff for band in range(4))))
+    database.execute("DELETE FROM duplicate_fingerprints WHERE document_id NOT IN (SELECT id FROM documents WHERE COALESCE(body_text,'')<>'')")
+    database.execute('DROP TABLE IF EXISTS temp.scout_duplicate_parents')
+    database.execute('CREATE TEMP TABLE scout_duplicate_parents(id INTEGER PRIMARY KEY,parent INTEGER NOT NULL)')
+    database.execute('INSERT INTO scout_duplicate_parents SELECT document_id,document_id FROM duplicate_fingerprints')
+    def find(value):
+        while True:
+            parent=database.execute('SELECT parent FROM scout_duplicate_parents WHERE id=?',(value,)).fetchone()[0]
+            if parent==value: return value
+            value=parent
+    def union(left,right):
+        a,b=find(left),find(right)
+        if a!=b: database.execute('UPDATE scout_duplicate_parents SET parent=? WHERE id=?',(min(a,b),max(a,b)))
+    # Exact groups are streamed, including groups beyond the near-search cap.
+    first=None;previous=None
+    for row in database.execute("SELECT document_id,exact_key FROM duplicate_fingerprints WHERE exact_key<>'' ORDER BY exact_key,document_id"):
+        check()
+        if row[1]!=previous: first=row[0];previous=row[1]
+        else: union(first,row[0])
+    # Approximate four-band policy is preserved; only one bounded bucket is in RAM.
+    for band in range(4):
+        check()
+        for bucket in database.execute(f'SELECT b{band} FROM duplicate_fingerprints GROUP BY b{band} HAVING COUNT(*)>1'):
+            check()
+            exact_count = database.execute(f"SELECT COUNT(DISTINCT exact_key),MIN(exact_key) FROM duplicate_fingerprints WHERE b{band}=?",(bucket[0],)).fetchone()
+            if exact_count[0] == 1 and exact_count[1]:
+                continue  # already unified exactly, no quadratic near comparisons
+            rows=database.execute(f'SELECT document_id,value,exact_key FROM duplicate_fingerprints WHERE b{band}=? ORDER BY document_id LIMIT 2000',(bucket[0],)).fetchall()
+            values=[(int(row[0]),int(row[1],16),str(row[2])) for row in rows]
+            for index,(left,lv,lk) in enumerate(values):
+                check()
+                for right,rv,rk in values[index+1:]:
+                    if lk and lk==rk: continue
+                    if any(((lv>>(prior*16))&0xffff)==((rv>>(prior*16))&0xffff) for prior in range(band)): continue
+                    if hamming_similarity(lv,rv)>=threshold: union(left,right)
+    for row in database.execute('SELECT id FROM scout_duplicate_parents ORDER BY id'):
+        check()
+        database.execute('UPDATE scout_duplicate_parents SET parent=? WHERE id=?',(find(row[0]),row[0]))
+    database.execute('CREATE INDEX IF NOT EXISTS scout_duplicate_parent_index ON scout_duplicate_parents(parent,id)')
+    database.execute('DELETE FROM duplicate_members');database.execute('DELETE FROM duplicate_groups')
+    summary=DuplicateSummary()
+    for group in database.execute('SELECT parent,COUNT(*) FROM scout_duplicate_parents GROUP BY parent HAVING COUNT(*)>1 ORDER BY parent'):
+        check()
+        representative=int(group[0])
+        fp=database.execute('SELECT exact_key,value FROM duplicate_fingerprints WHERE document_id=?',(representative,)).fetchone()
+        distinct=database.execute('SELECT COUNT(DISTINCT f.exact_key) FROM duplicate_fingerprints f JOIN scout_duplicate_parents p ON p.id=f.document_id WHERE p.parent=?',(representative,)).fetchone()[0]
+        method='exact' if distinct==1 and fp[0] else 'near'
+        cursor=database.execute('INSERT INTO duplicate_groups(method,representative_document_id,created_at) VALUES(?,?,?)',(method,representative,utc_now()))
+        group_id=cursor.lastrowid
+        for member in database.execute('SELECT p.id,f.value,f.exact_key FROM scout_duplicate_parents p JOIN duplicate_fingerprints f ON f.document_id=p.id WHERE p.parent=? ORDER BY p.id',(representative,)):
+            check()
+            similarity=1.0 if fp[0] and member[2]==fp[0] else hamming_similarity(int(fp[1],16),int(member[1],16))
+            database.execute('INSERT INTO duplicate_members VALUES(?,?,?)',(group_id,member[0],similarity))
+        if method=='exact': summary.exact_groups+=1
+        else: summary.near_groups+=1
+        summary.grouped_documents+=group[1]
     return summary
-

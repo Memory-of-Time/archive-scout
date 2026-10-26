@@ -48,7 +48,7 @@ def _retry_queue_exists(database):
 _ACTIVE_RETRY = '''EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
     AND e.operation='download' AND e.retryable=1 AND e.resolved=0 AND e.ignored=0)
     AND EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes sc
-      ON sc.pattern=t.pattern AND sc.signature=c.query_signature
+      ON sc.pattern=t.pattern AND sc.signature=c.query_signature AND c.timestamp BETWEEN sc.start AND sc.end
       WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
         WHERE m.capture_id=c.id AND m.target_id=t.id))'''
 
@@ -125,7 +125,7 @@ def next_due(database: sqlite3.Connection, config=None, *, respect_selection=Fal
         _populate_download_scopes(database, config)
         scope = """ AND EXISTS(SELECT 1 FROM targets t
             JOIN archive_scout_download_scopes sc ON sc.pattern=t.pattern
-            WHERE sc.signature=c.query_signature AND (t.id=c.target_id OR EXISTS
+            WHERE sc.signature=c.query_signature AND c.timestamp BETWEEN sc.start AND sc.end AND (t.id=c.target_id OR EXISTS
              (SELECT 1 FROM capture_target_membership m
               WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
     else:

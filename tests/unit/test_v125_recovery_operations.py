@@ -435,7 +435,7 @@ class OperationRecovery(unittest.TestCase):
              patch('archive_scout.operations.download_media', side_effect=media_download):
             result = run_project(cfg, 'all')
         self.assertEqual(result.status, 'complete')
-        self.assertEqual(indexed_document_counts, [0, 1])
+        self.assertEqual(indexed_document_counts, [1])
         self.assertEqual(acquired_document_counts, [1])
 
     def test_acquisition_only_materializes_embeds_without_keyword_jobs(self):
@@ -462,7 +462,7 @@ class OperationRecovery(unittest.TestCase):
              patch('archive_scout.operations.download_media'):
             result = run_project(cfg, 'download_only')
         self.assertEqual(result.status, 'complete')
-        self.assertEqual(counts, [0, 1])
+        self.assertEqual(counts, [1])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM scan_runs').fetchone()[0], 0)
 
 

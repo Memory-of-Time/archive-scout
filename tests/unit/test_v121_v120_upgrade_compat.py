@@ -79,7 +79,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             old_root = Path(temp)/"old"; new_root=Path(temp)/"relocated"
             signature, _ = self.make_old_project(old_root)
             original = snapshot(old_root)
-            self.assertEqual(original["schema_version"], 10)
+            self.assertEqual(original["schema_version"], 11)
             self.assertEqual(original["counts"]["captures"], 2100)
             self.assertEqual(original["counts"]["documents"], 1)
             shutil.move(str(old_root), str(new_root))
@@ -90,7 +90,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             self.assertEqual(cdx_query_signature(loaded), signature)
             db = open_database(new_root)
             try:
-                self.assertEqual(db.execute("SELECT version FROM schema_info").fetchone()[0], 10)
+                self.assertEqual(db.execute("SELECT version FROM schema_info").fetchone()[0], 11)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM captures").fetchone()[0], 2100)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)
@@ -111,7 +111,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             current = snapshot(new_root, [int(key) for key in original["capture_identity_samples"]])
             self.assertEqual(compare(original, current), [])
 
-    def test_resume_reuses_matching_interrupted_scan_without_resetting_results(self):
+    def test_resume_reuses_unaffected_single_rule_scan_without_resetting_results(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.make_old_project(root, 36)
@@ -128,7 +128,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
                 self.assertEqual(jobs[0].scan_run_id, original_run_id)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0],1)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM document_matches").fetchone()[0],1)
-                self.assertEqual(db.execute("SELECT status FROM scan_runs").fetchone()[0],"running")
+                self.assertEqual(db.execute("SELECT status FROM scan_runs WHERE id=?",(jobs[0].scan_run_id,)).fetchone()[0],"running")
                 db.execute("UPDATE scan_runs SET status='interrupted' WHERE id=?", (original_run_id,))
                 db.commit()
                 incompatible = ProjectConfig(root, targets=["other.example/*"], keywords=["needle"],

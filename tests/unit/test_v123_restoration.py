@@ -245,7 +245,7 @@ class MigrationRestorationTests(unittest.TestCase):
             database.execute('UPDATE schema_info SET version=8'); database.commit(); database.close()
             database=open_database(root)
             try:
-                self.assertEqual(database.execute('SELECT version FROM schema_info').fetchone()[0],10)
+                self.assertEqual(database.execute('SELECT version FROM schema_info').fetchone()[0],11)
                 self.assertEqual([tuple(row) for row in database.execute('SELECT * FROM capture_routing')],before)
                 self.assertEqual(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0],1)
                 result=search_with_hitlist(root,database,['needle'],threading.Event())

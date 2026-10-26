@@ -290,6 +290,6 @@ class DurableMediaRecovery(unittest.TestCase):
                 self.assertEqual(raw.execute('SELECT version FROM schema_info').fetchone()[0],9)
             db=open_database(root)
             try:
-                self.assertEqual(db.execute('SELECT version FROM schema_info').fetchone()[0],10)
+                self.assertEqual(db.execute('SELECT version FROM schema_info').fetchone()[0],11)
                 self.assertIsNotNone(db.execute("SELECT name FROM sqlite_master WHERE name='media_retry_schedule'").fetchone())
             finally: db.close()

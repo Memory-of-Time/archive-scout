@@ -45,7 +45,7 @@ python -m PyInstaller \
   --icon archive_scout/assets/archive_scout.icns \
   --add-data "archive_scout/assets/archive_scout.png:assets" \
   --target-arch universal2 \
-  --collect-all truststore --collect-all urllib3 --collect-all httpx --collect-all httpcore --collect-all dotenv \
+  --add-data "archive_scout/assets/domains:archive_scout/assets/domains" --collect-all truststore --collect-all urllib3 --collect-all httpx --collect-all httpcore --collect-all dotenv \
   "${SELECTOLAX_FLAGS[@]}" "${AHO_FLAGS[@]}" \
   run_app.py
 
@@ -53,7 +53,7 @@ python -m PyInstaller \
   --noconfirm --clean --console --onefile \
   --name "ArchiveScoutCLI" \
   --target-arch universal2 \
-  --collect-all truststore --collect-all urllib3 --collect-all httpx --collect-all httpcore --collect-all dotenv \
+  --add-data "archive_scout/assets/domains:archive_scout/assets/domains" --collect-all truststore --collect-all urllib3 --collect-all httpx --collect-all httpcore --collect-all dotenv \
   "${SELECTOLAX_FLAGS[@]}" "${AHO_FLAGS[@]}" \
   run_cli.py
 

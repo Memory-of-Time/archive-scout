@@ -309,6 +309,16 @@ def upsert_document(
 
 def save_match(database: sqlite3.Connection, scan_run_id: int, document_id: int, analysis: dict) -> int:
     now = utc_now()
+    metadata = database.execute('SELECT metadata_json FROM scan_runs WHERE id=?',(scan_run_id,)).fetchone()
+    policy = json.loads(metadata[0] or '{}').get('storage_policy',{}) if metadata else {}
+    analysis = dict(analysis)
+    previous_details = None
+    if policy and not all(policy.values()):
+        previous_details = database.execute("SELECT hits_json,fields_json,snippets_json,interesting_links_json FROM document_matches WHERE scan_run_id=? AND document_id=?",(scan_run_id,document_id)).fetchone()
+    for flag,key,empty in [('store_keyword_counts','hits',{}),('store_keyword_fields','hit_fields',{}),('store_snippets','snippets',[]),('store_interesting_links','interesting_links',[])]:
+        if not policy.get(flag,True):
+            columns = {"hits":0,"hit_fields":1,"snippets":2,"interesting_links":3}
+            analysis[key] = json.loads(previous_details[columns[key]] or json.dumps(empty)) if previous_details else empty
     values = (
         scan_run_id,
         document_id,
@@ -364,7 +374,8 @@ def save_match(database: sqlite3.Connection, scan_run_id: int, document_id: int,
                 "INSERT INTO keyword_hits(match_id,label,count,fields_json) VALUES(?,?,?,?)",
                 hit_rows,
             )
-    database.execute("INSERT OR IGNORE INTO reviews(match_id,status) VALUES(?,'unreviewed')", (match_id,))
+    if policy.get("create_default_reviews",True):
+        database.execute("INSERT OR IGNORE INTO reviews(match_id,status) VALUES(?,'unreviewed')", (match_id,))
     return match_id
 
 
@@ -962,11 +973,19 @@ def record_site_issue(
     return int(row[0])
 
 
-def list_site_issues(database: sqlite3.Connection, unresolved_only: bool = True, limit: int = 1000) -> list[sqlite3.Row]:
-    where = "WHERE resolved=0" if unresolved_only else ""
+def list_site_issues(database: sqlite3.Connection, unresolved_only: bool = True, limit: int = 1000,
+                     *, resolved: bool | None = None, category: str = "") -> list[sqlite3.Row]:
+    clauses, params = [], []
+    if resolved is not None or unresolved_only:
+        clauses.append("resolved=?")
+        params.append(int(resolved) if resolved is not None else 0)
+    if category:
+        clauses.append("category=?")
+        params.append(category)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
     return database.execute(
         f"SELECT * FROM site_issues {where} ORDER BY last_seen DESC,id DESC LIMIT ?",
-        (max(1, int(limit)),),
+        (*params, max(1, int(limit))),
     ).fetchall()
 
 

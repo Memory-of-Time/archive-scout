@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+import json
 import threading
 import time
 from typing import Callable
@@ -13,24 +15,43 @@ from .indexer import media_query_signature
 
 
 def record_media_failure(db: sqlite3.Connection, capture_id: int, category: str,
-                         status: int | None, retryable: bool, config: ProjectConfig) -> None:
+                         status: int | None, retryable: bool, config: ProjectConfig,
+                         exception: BaseException | None = None) -> None:
+    previous = db.execute("SELECT failure_count,fingerprint,repetitions FROM media_retry_decisions WHERE media_capture_id=?", (capture_id,)).fetchone()
+    if previous is None:
+        previous = db.execute("SELECT failure_count,'',0 FROM media_retry_schedule WHERE media_capture_id=?",(capture_id,)).fetchone()
+    failures = min(1000000, int(previous[0]) + 1 if previous else 1)
+    evidence = {}
+    if exception is not None:
+        from ..network.transports import exception_chain
+        for error in exception_chain(exception):
+            evidence.update(getattr(error,'transfer_diagnostic',{}))
+            evidence.update(getattr(error,'representation_diagnostic',{}))
+    # Only real response evidence can establish repeated identical bad bytes.
+    fingerprint = hashlib.sha256(json.dumps([category,status,evidence],sort_keys=True).encode()).hexdigest() if evidence else ''
+    repetitions = int(previous[2])+1 if previous and fingerprint and fingerprint == previous[1] else 1 if fingerprint else 0
+    db.execute("""INSERT INTO media_retry_decisions VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(media_capture_id) DO UPDATE SET failure_count=excluded.failure_count,
+      retryable=excluded.retryable,category=excluded.category,fingerprint=excluded.fingerprint,
+      repetitions=excluded.repetitions,updated_at=excluded.updated_at""",
+      (capture_id,failures,int(retryable),category,fingerprint,repetitions,utc_now()))
     if not retryable:
         db.execute("DELETE FROM media_retry_schedule WHERE media_capture_id=?", (capture_id,))
         return
-    previous = db.execute("SELECT failure_count FROM media_retry_schedule WHERE media_capture_id=?", (capture_id,)).fetchone()
-    failures = min(1000000, int(previous[0]) + 1 if previous else 1)
     network = config.network.normalized()
     delay = min(network.retry_max_seconds, network.retry_base_seconds * (2 ** min(12, failures - 1)))
+    if repetitions >= 3 and category in {'incomplete_representation','incomplete_media_representation','payload_digest_mismatch','content_encoding_mismatch'}:
+        delay = max(delay,min(60.0,network.retry_max_seconds))
     delay = max(0.1, delay) * (0.9 + (capture_id % 17) / 85.0)
     db.execute("""INSERT INTO media_retry_schedule(media_capture_id,next_eligible_at,failure_count,last_category,last_status,updated_at)
-                  VALUES(?,?,?,?,?,?) ON CONFLICT(media_capture_id) DO UPDATE SET
-                  next_eligible_at=excluded.next_eligible_at,failure_count=excluded.failure_count,
-                  last_category=excluded.last_category,last_status=excluded.last_status,updated_at=excluded.updated_at""",
-               (capture_id, time.time() + delay, failures, category, status, utc_now()))
+      VALUES(?,?,?,?,?,?) ON CONFLICT(media_capture_id) DO UPDATE SET next_eligible_at=excluded.next_eligible_at,
+      failure_count=excluded.failure_count,last_category=excluded.last_category,last_status=excluded.last_status,updated_at=excluded.updated_at""",
+      (capture_id,time.time()+delay,failures,category,status,utc_now()))
 
 
 def clear_media_retry(db: sqlite3.Connection, capture_id: int) -> None:
     db.execute("DELETE FROM media_retry_schedule WHERE media_capture_id=?", (capture_id,))
+    db.execute("DELETE FROM media_retry_decisions WHERE media_capture_id=?", (capture_id,))
 
 
 def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: threading.Event,
@@ -56,6 +77,7 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
         "SELECT mc.id, e.category, e.http_status FROM media_captures mc JOIN errors e ON e.media_capture_id=mc.id "
         "WHERE mc.query_signature IN (" + placeholders + ") AND mc.state='error' "
         "AND e.retryable=1 AND e.resolved=0 AND e.ignored=0 "
+        "AND NOT EXISTS(SELECT 1 FROM media_retry_decisions d WHERE d.media_capture_id=mc.id) "
         "AND NOT EXISTS(SELECT 1 FROM media_retry_schedule s WHERE s.media_capture_id=mc.id) "
         "GROUP BY mc.id LIMIT 256", signatures).fetchall()
         if outstanding:

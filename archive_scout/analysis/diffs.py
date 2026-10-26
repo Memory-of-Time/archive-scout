@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ..events import Stopped
 
 import difflib
 import json
@@ -36,7 +37,7 @@ def _summary(earlier: str, later: str) -> dict:
     }
 
 
-def compare_snapshots(database: sqlite3.Connection) -> DiffSummary:
+def compare_snapshots(database: sqlite3.Connection, *, stop_event=None) -> DiffSummary:
     summary = DiffSummary()
     previous: sqlite3.Row | None = None
     with database:
@@ -49,6 +50,7 @@ def compare_snapshots(database: sqlite3.Connection) -> DiffSummary:
             ORDER BY c.original_url,c.timestamp,c.id
             """
         ):
+            if stop_event is not None and stop_event.is_set(): raise Stopped
             if previous is not None and previous["original_url"] == row["original_url"]:
                 previous_hash = str(previous["normalized_hash"] or "")
                 current_hash = str(row["normalized_hash"] or "")

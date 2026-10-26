@@ -5,7 +5,7 @@ Use while Archive Scout is stopped:
   python scripts/check_project_resume.py PATH --compare before.json
 
 Never creates a missing SQLite database or modifies a project. Supports
-v1.2.5 schema-10 projects, v1.2.4 schema-9 projects, and earlier supported versions.
+v1.2.6 schema-10 projects, v1.2.4 schema-9 projects, and earlier supported versions.
 """
 from __future__ import annotations
 

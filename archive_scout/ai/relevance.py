@@ -351,6 +351,8 @@ class ProviderRelevanceClient:
         )
         try:
             parsed = self.service.generate_json(request, stop_event).data
+        except Stopped:
+            raise
         except Exception as exc:
             raise AIReviewError(str(exc)) from exc
         results: list[dict] = []

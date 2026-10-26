@@ -72,9 +72,9 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
             "recovery_events": database.execute("SELECT COUNT(*) FROM network_events WHERE stage LIKE '%recovery%'").fetchone()[0],
         })
         media={str(row[0]):int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM media_captures GROUP BY state")}
-        result.update({"media_candidates":sum(media.values()),"media_selected":sum(value for state,value in media.items() if state!='excluded'),"media_pending":media.get("pending",0),"media_downloading":media.get("downloading",0),"media_downloaded":media.get("downloaded",0),"media_excluded":media.get("excluded",0),"media_errors":media.get("error",0),"media_deferred_from_text":result.get("deferred",0)})
+        result.update({"media_candidates":sum(media.values()),"media_selected":sum(value for state,value in media.items() if state not in ('excluded','skipped_strategy','skipped')),"media_pending":media.get("pending",0),"media_downloading":media.get("downloading",0),"media_downloaded":media.get("downloaded",0),"media_excluded":sum(media.get(state,0) for state in ("excluded","skipped_strategy","skipped")),"media_errors":media.get("error",0),"media_deferred_from_text":result.get("deferred",0)})
         for kind in ("image","video"):
-            result["media_selected_"+("images" if kind=="image" else "videos")]=database.execute("SELECT COUNT(*) FROM media_captures WHERE media_kind=? AND state<>'excluded'",(kind,)).fetchone()[0]
+            result["media_selected_"+("images" if kind=="image" else "videos")]=database.execute("SELECT COUNT(*) FROM media_captures WHERE media_kind=? AND state NOT IN ('excluded','skipped_strategy','skipped')",(kind,)).fetchone()[0]
         return result
     except sqlite3.OperationalError as exc:
         if "interrupted" not in str(exc).casefold():

@@ -4,9 +4,9 @@ Archive Scout is a project-oriented desktop application. The UI is deliberately 
 
 ## Project storage
 
-Each project contains `archive_scout.sqlite3`, downloaded captures, downloaded media, reports, backups, and derived exports. SQLite is the authoritative work-state store. The current schema version is 6.
+Each project contains `archive_scout.sqlite3`, downloaded captures, downloaded media, reports, backups, and derived exports. SQLite is the authoritative work-state store. The current schema version is 11.
 
-Project connections use WAL mode, normal synchronous behavior, memory temporary storage, a bounded cache, memory mapping, busy timeouts, and foreign keys. Large queues are read with keyset pagination rather than large OFFSET scans.
+Project connections use WAL mode, normal synchronous behavior, disk-backed temporary storage, a bounded cache, memory mapping, busy timeouts, and foreign keys. Large queues are read with keyset pagination rather than large OFFSET scans.
 
 ## Indexing
 
@@ -16,7 +16,7 @@ Transient failures can rotate transport backends/endpoints and subdivide the fai
 
 ## Text downloading and scanning
 
-Pending captures are selected from SQLite, with known smaller downloads scheduled first. Workers download bounded text responses, parse visible content and links, save documents, and run selected keyword sets. Unchanged documents can reuse stored parse state during rescans.
+Pending captures are selected from SQLite, with known smaller downloads scheduled first. Network workers retain validated raw bytes. A bounded local scanner independently decodes/parses them, persists score-zero coverage and evaluates the selected keyword set. Explicit rescans reconstruct parsed content from validated bytes. Optional domain extraction shares these inputs but owns separate source coverage and hostname tables.
 
 Literal rule prefiltering uses an Aho-Corasick automaton. Full scoring retains required, excluded, exact, regular-expression, whole-word, field, weight, and proximity semantics.
 
@@ -30,7 +30,7 @@ Exact Wayback lookups are bounded and rate-limited. Resolved captures enter the 
 
 AI relevance is a separate analysis layer over existing deterministic matches. `ai_runs` stores the prompt/model/run metadata and `ai_results` stores one relevance result per match. The normal match score, review status, notes, tags, and scan data are not modified.
 
-Only a bounded candidate set is sent to the configured AI provider. Archive Scout currently implements the OpenAI Responses API and uses strict structured output.
+Only a bounded candidate set is sent to the configured AI provider. OpenAI and OpenRouter providers use structured output where supported. Evidence IDs and input hashes are recorded; provider output remains an AI draft, and ID validation does not establish entailment.
 
 ## UI threading
 
@@ -39,3 +39,11 @@ Tk owns the UI thread. Operations run in worker threads and communicate using a 
 ## Safety
 
 Project merge, repair, backup, migration, export, and diagnostic operations use path containment and atomic-write patterns where applicable. The program never intentionally bypasses Wayback exclusions or robots restrictions.
+
+## Derived work and operation ownership
+
+Selected saved-page scopes use one shared site/signature/membership/date predicate. Optional media indexing follows admitted text work. Replay clients and health observations live for the operation, surviving recovery batches. Retry decisions are current per-capture state; older category history cannot revive a newer non-retryable failure.
+
+Analysis builds connection-local disk TEMP generations, promoting valid derived rows in one main transaction. Research stores independent vector/entity recipes and document revisions; unchanged heavy inputs are not transferred into Python. Duplicate fingerprints persist across refreshes and clustering uses indexed disk state and bounded candidate buckets. Near matching remains approximate; exhaustive capture coverage is a separate contract.
+
+Domain extraction uses bundled, pinned IANA active/retired endings and public-suffix rules, with full-hostname IDNA normalization. It does not reduce hosts to site roots, query DNS, contact discovered domains or create match rows. `reports/domains.txt` is a sorted unique export of the current saved-input selection; its status file discloses missing processing independently of acquisition.

@@ -763,6 +763,44 @@ CREATE TABLE IF NOT EXISTS project_merges(
     merged_at TEXT NOT NULL,
     summary_json TEXT
 );
+CREATE TABLE IF NOT EXISTS media_retry_decisions(
+ media_capture_id INTEGER PRIMARY KEY REFERENCES media_captures(id) ON DELETE CASCADE,
+ failure_count INTEGER NOT NULL, retryable INTEGER NOT NULL, category TEXT NOT NULL,
+ fingerprint TEXT NOT NULL DEFAULT '', repetitions INTEGER NOT NULL DEFAULT 0,
+ updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_revisions(
+ document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+ revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS research_recipes(
+ document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+ document_revision INTEGER NOT NULL, vector_recipe TEXT NOT NULL, entity_recipe TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS duplicate_fingerprints(
+ document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+ revision INTEGER NOT NULL, exact_key TEXT NOT NULL, value TEXT NOT NULL,
+ b0 INTEGER NOT NULL,b1 INTEGER NOT NULL,b2 INTEGER NOT NULL,b3 INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS duplicate_fp_exact ON duplicate_fingerprints(exact_key,document_id);
+CREATE INDEX IF NOT EXISTS duplicate_fp_b0 ON duplicate_fingerprints(b0,document_id);
+CREATE INDEX IF NOT EXISTS duplicate_fp_b1 ON duplicate_fingerprints(b1,document_id);
+CREATE INDEX IF NOT EXISTS duplicate_fp_b2 ON duplicate_fingerprints(b2,document_id);
+CREATE INDEX IF NOT EXISTS duplicate_fp_b3 ON duplicate_fingerprints(b3,document_id);
+CREATE TABLE IF NOT EXISTS domain_recipes(
+ id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS domain_sources(
+ recipe INTEGER NOT NULL REFERENCES domain_recipes(id), capture_id INTEGER NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+ content_hash TEXT NOT NULL, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(recipe,capture_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS domain_hosts(
+ recipe INTEGER NOT NULL REFERENCES domain_recipes(id), capture_id INTEGER NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+ host TEXT NOT NULL, PRIMARY KEY(recipe,capture_id,host)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS domain_hosts_sorted ON domain_hosts(recipe,host,capture_id);
+
 """
 
 
@@ -871,13 +909,34 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v7_to_v8(database)
         elif version == 7:
             migrate_v7_to_v8(database)
-        elif version in (8, 9):
+        elif version in (8, 9, 10):
             database.executescript(BASE_SCHEMA_SQL)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
         else:
             database.executescript(BASE_SCHEMA_SQL)
     database.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
+
+    # Changes to parsed content invalidate local consumers without body-wide reads.
+    database.executescript("""
+    CREATE TRIGGER IF NOT EXISTS scout_document_revision_insert AFTER INSERT ON documents BEGIN
+      INSERT OR REPLACE INTO document_revisions VALUES(NEW.id,1);
+      INSERT INTO project_meta VALUES('documents_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS scout_document_revision_update AFTER UPDATE OF content_hash,title,body_text,links_json,normalized_hash ON documents
+    WHEN OLD.content_hash IS NOT NEW.content_hash OR OLD.title IS NOT NEW.title OR OLD.body_text IS NOT NEW.body_text OR OLD.links_json IS NOT NEW.links_json OR OLD.normalized_hash IS NOT NEW.normalized_hash
+    BEGIN
+      INSERT INTO document_revisions VALUES(NEW.id,1) ON CONFLICT(document_id) DO UPDATE SET revision=revision+1;
+      INSERT INTO project_meta VALUES('documents_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS scout_document_revision_delete AFTER DELETE ON documents BEGIN
+      INSERT INTO project_meta VALUES('documents_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
+    END;
+    """)
+    for table in ('duplicate_groups','duplicate_members','provenance_edges','forum_posts'):
+        for action in ('INSERT','UPDATE','DELETE'):
+            database.execute(f"""CREATE TRIGGER IF NOT EXISTS scout_{table}_{action.lower()} AFTER {action} ON {table}
+              BEGIN INSERT INTO project_meta VALUES('analysis_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1; END""")
     try:
         database.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(title,body_text,original_url)"

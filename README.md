@@ -1,4 +1,4 @@
-# Archive Scout v1.2.5
+# Archive Scout v1.2.6
 
 **Archive Scout** is an independent, cross-platform desktop and command-line tool for researching and preserving public Wayback Machine captures. It indexes archived URLs, acquires and validates saved bodies, scans selected keyword sets, supports media discovery, and produces reports.
 
@@ -42,7 +42,7 @@ An eight-requests-per-second admission target is **not** a guarantee of eight sa
 
 ## Projects and compatibility
 
-Archive Scout v1.2.5 uses **SQLite schema 10**. When a supported schema-9 project is opened, Scout first creates a required pre-upgrade backup and then adds the indexed media-retry metadata without replacing retained captures, local bodies, scan history, or checkpoints. If a safety backup fails, the upgrade is refused. Keep your original project folder and `project.json`, back up that folder before upgrading, and **do not reopen a migrated schema-10 project with v1.2.4**. Never edit `schema_info` to force a downgrade.
+Archive Scout v1.2.6 uses **SQLite schema 11**. When a supported schema-10 project is opened, Scout first creates a required pre-upgrade backup and then adds independent domain coverage, current retry decisions and local derivation revisions without replacing retained captures, local bodies, scan history, or checkpoints. If a safety backup fails, the upgrade is refused. Keep your original project folder and `project.json`, back up that folder before upgrading, and **do not reopen a migrated schema-11 project with v1.2.5**. Never edit `schema_info` to force a downgrade.
 
 Before replacing an installation, stop any active run and back up its project folder. Reopen the same `project.json`; there is no required project reindex. Old `Scout` CLI commands remain supported, and existing GUI preferences stored under the legacy `Scout` settings directory are recognized. See [Project migration](docs/MIGRATION.md), [Project recovery](docs/PROJECT_RECOVERY.md) and the [operations and report snapshot guide](docs/OPERATIONS.md).
 
@@ -58,3 +58,9 @@ python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-byt
 The [CI test workflow](.github/workflows/tests.yml) covers Python 3.11/3.12 on Windows, Linux, Intel macOS, and Apple Silicon macOS. The [build workflow](.github/workflows/build-and-release.yml) creates platform-native packages, and verifies their contents. See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), [Developer guide](docs/DEVELOPMENT.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
 
 MIT-licensed. Not affiliated with the Internet Archive.
+
+## v1.2.6 cumulative follow-up
+
+Current-selection Rescan and media discovery, full-read evidence checks, earliest-media admission, current retry decisions, corrected scoring and hostname search, generation-safe analysis, verified merge/import identities, bounded maintenance state, and independent optional full-hostname domain extraction. See `docs/V126_AUDIT_IMPLEMENTATION.md` for changes, costs and remaining limits.
+
+Projects migrate additively to schema 11 after a required backup. Keep an independent copy of project data and do not reopen the upgraded project with v1.2.5.

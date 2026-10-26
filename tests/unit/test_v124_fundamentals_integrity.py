@@ -147,10 +147,12 @@ class FundamentalsIntegrityTests(unittest.TestCase):
                 traced=[]
                 db.set_trace_callback(traced.append)
                 scan_pending_saved(db,cfg,[job],threading.Event(),workers=1)
+                migration_reads = sum('NOT EXISTS (SELECT 1 FROM documents' in statement for statement in traced)
+                self.assertGreater(migration_reads, 0)
                 scan_pending_saved(db,cfg,[job],threading.Event(),workers=1)
                 db.set_trace_callback(None)
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM documents').fetchone()[0],1)
-                self.assertEqual(sum('NOT EXISTS (SELECT 1 FROM documents' in statement for statement in traced),1)
+                self.assertEqual(sum('NOT EXISTS (SELECT 1 FROM documents' in statement for statement in traced),migration_reads)
             finally: db.close()
 
 if __name__=='__main__':

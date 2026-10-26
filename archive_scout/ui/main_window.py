@@ -70,7 +70,7 @@ MODE_HELP = {
     "retry_download_errors": "Retries unresolved text acquisition failures without creating scan jobs or scanning.",
     "download": "Downloads pending text captures and scans them with the keyword set marked Use in next scan.",
     "resume": "Continues unfinished indexing, downloads, scans and the original optional media phase, with retained checkpoints.",
-    "rescan": "Scans saved files locally, reusing an interrupted run with the same keywords and scope; no Wayback requests.",
+    "rescan": "Scans saved files for the selected sites, dates and query settings locally, reusing a compatible interrupted run; no Wayback requests.",
     "retry_errors": "Retries unresolved text-page and media errors. Valid local text files are rescanned before redownloading.",
     "hitlist": "Searches all indexed URLs and saved text captures with a resumable literal hitlist; writes a CSV and coverage summary without downloading.",
     "report": "Exports current text/index and available media reports without acquiring or rescanning. The Reports tab also supports independent snapshots during a run.",
@@ -282,6 +282,7 @@ class ArchiveScoutApp(tk.Tk):
         self.report_snippets_var = tk.StringVar(value="0")
         self.report_chars_var = tk.StringVar(value="0")
         self.report_links_var = tk.StringVar(value="0")
+        self.extract_domains_var = tk.BooleanVar(value=False)
         self.report_retain_var = tk.BooleanVar(value=True)
         self.report_output_vars = {name: tk.BooleanVar(value=True) for name in REPORT_FIELD_NAMES}
         self.report_field_vars = {name: {field: tk.BooleanVar(value=True) for field in fields}
@@ -330,10 +331,7 @@ class ArchiveScoutApp(tk.Tk):
         self.hitlist_file_var = tk.StringVar()
         self.target_override_status_var = tk.StringVar(value="No per-target override on the current line.")
         self.error_detail_var = tk.StringVar()
-        self.scan_workers_var = tk.StringVar(value="0")
         self.scan_backend_var = tk.StringVar(value="auto")
-        self.scan_overlap_var = tk.BooleanVar(value=True)
-        self.scan_memory_mb_var = tk.StringVar(value="256")
         self.download_external_redirects_var = tk.BooleanVar(value=False)
         self.backup_max_var = tk.StringVar(value="1024")
         self.dashboard_recovery_var = tk.StringVar(value="0")
@@ -853,7 +851,7 @@ class ArchiveScoutApp(tk.Tk):
             row=0, column=2, sticky="w", padx=(12, 0), pady=(0, 8))
         ttk.Checkbutton(options, text="Videos", variable=self.media_videos_var).grid(
             row=0, column=3, sticky="w", padx=(12, 0), pady=(0, 8))
-        ttk.Checkbutton(options, text="Discover media linked inside saved pages", variable=self.media_embedded_var).grid(
+        ttk.Checkbutton(options, text="Discover media linked inside selected saved pages", variable=self.media_embedded_var).grid(
             row=1, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(
             row=1, column=2, columnspan=2, sticky="w", padx=(12, 0))
@@ -934,6 +932,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(controls, text="Sort matches").grid(row=0, column=5, sticky="w")
         ttk.Combobox(controls, textvariable=self.report_sort_var, values=("score", "oldest", "newest", "url"), state="readonly", width=12).grid(row=1, column=5, sticky="w")
         ttk.Label(controls, text="Limits: 0 = all available. Match sorting/limits apply consistently to all match-derived reports.", style="Muted.TLabel").grid(row=2, column=0, columnspan=6, sticky="w", pady=4)
+        ttk.Checkbutton(controls, text="Extract domains to a separate domains.txt (full hostnames)", variable=self.extract_domains_var).grid(row=6, column=0, columnspan=6, sticky="w")
         ttk.Checkbutton(controls, text="Retain full scan details for later reports, review and AI (recommended)", variable=self.report_retain_var).grid(row=3, column=0, columnspan=6, sticky="w")
         ttk.Label(controls, text="Unchecked: future scans omit unused enrichment; enabling it later requires a local rescan.", wraplength=1000, style="Muted.TLabel").grid(row=4, column=0, columnspan=6, sticky="w")
         presets = ttk.Frame(controls)
@@ -1234,7 +1233,7 @@ class ArchiveScoutApp(tk.Tk):
             ttk.Entry(recovery, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
         ttk.Checkbutton(recovery, text="Experimental: coordinate recovery after confirmed host connection failures", variable=self.network_connection_gate_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 2))
-        ttk.Label(recovery, text="Recommended and enabled by default. A recovery-cycle threshold pauses archive admissions and schedules another shared probe; it does not end the operation. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(recovery, text="Persistent recovery retains failures for later attempts. The experimental connection gate above is optional. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         redirects = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
         redirects.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)
@@ -1886,6 +1885,7 @@ class ArchiveScoutApp(tk.Tk):
                 research=research,
                 network=network,
                 report=self.current_report_config(),
+                extract_domains=self.extract_domains_var.get(),
                 target_settings=self.target_settings,
                 auto_backup=self.auto_backup_var.get(),
                 backup_keep=int(self.backup_keep_var.get()),
@@ -2875,7 +2875,11 @@ class ArchiveScoutApp(tk.Tk):
         try:
             self.site_issues_tree.delete(*self.site_issues_tree.get_children())
             self.site_issue_row_map.clear()
-            for row in list_site_issues(database, unresolved_only=False, limit=1000):
+            status_filter = self.error_status_filter_var.get()
+            category_filter = self.error_category_var.get()
+            for row in list_site_issues(database, unresolved_only=False, limit=1000,
+                    resolved=False if status_filter == "Open" else True if status_filter == "Resolved" else None,
+                    category="" if category_filter == "All" else category_filter):
                 status_filter = self.error_status_filter_var.get()
                 category_filter = self.error_category_var.get()
                 if status_filter == "Ignored" or (status_filter == "Open" and row["resolved"]) or (status_filter == "Resolved" and not row["resolved"]):
@@ -3038,6 +3042,7 @@ class ArchiveScoutApp(tk.Tk):
         research = config.research.normalized()
         self.research_backend_var.set(research.vector_backend)
         self.research_auto_var.set(research.auto_build)
+        self.extract_domains_var.set(config.extract_domains)
         self.research_limit_var.set(str(research.result_limit))
         analysis = config.analysis
         self.forum_profile_var.set(analysis.forum_profile)

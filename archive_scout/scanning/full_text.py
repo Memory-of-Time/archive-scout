@@ -28,8 +28,13 @@ def search_documents(
     clauses = ["documents_fts MATCH ?"]
     params: list[object] = [fts_query]
     if domain.strip():
-        clauses.append("LOWER(c.original_url) LIKE ?")
-        params.append("%" + domain.casefold().strip() + "%")
+        from ..domains import canonical_host
+        requested = canonical_host(domain.removeprefix('*.').rstrip('/'))
+        if not requested:
+            return []
+        database.create_function('scout_host',1,canonical_host,deterministic=True)
+        clauses.append("(scout_host(c.original_url)=? OR scout_host(c.original_url) LIKE ?)")
+        params.extend((requested,'%.'+requested))
     if from_timestamp.strip():
         clauses.append("c.timestamp>=?")
         params.append(from_timestamp.strip())

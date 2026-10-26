@@ -16,6 +16,7 @@ from ..cdx.parameters import cdx_query_signature
 from ..content import decode_bytes, parse_page, classify_replay_content
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
+from ..domains import domain_text
 from ..utils import hash_text, utc_now
 from .jobs import ScanJob
 
@@ -47,7 +48,7 @@ def _sqlite_write_busy(exc: BaseException) -> bool:
     return "database is locked" in message or "database table is locked" in message
 
 
-def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
+def _scan_one(row: dict, jobs: list[ScanJob], extract_domains: bool = False) -> dict:
     path = Path(row["path"])
     data = path.read_bytes()
     actual_hash = hashlib.sha256(data).hexdigest()
@@ -76,34 +77,78 @@ def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
         "links": links, "bytes_saved": len(data),
         "content_hash": actual_hash,
         "normalized_hash": hash_text(normalized["body"]), "analyses": analyses,
+        "domain_source": domain_text(raw,visible,links) if extract_domains else None,
     }
 
 
-def _reconcile_legacy_pending(database: sqlite3.Connection, config) -> None:
-    """Once per connection, migrate legacy saved-without-document states into the
-    indexed explicit pending queue. Never sweep completed history at every wake.
+def _reconciliation_keys(config):
+    return [(cdx_query_signature(scoped) + ':' + scoped.from_date + ':' + scoped.to_date, target)
+            for target in config.targets for scoped in [config.for_target(target)]]
 
-    The one-time scan is safe for existing project databases and new target
-    signatures: any future save without a document must use
-    ``downloaded_unscanned`` at the time of the acquisition commit.
-    """
+
+def _reconciliation_table(database):
     database.execute("CREATE TEMP TABLE IF NOT EXISTS scout_scan_reconciled(signature TEXT,pattern TEXT,PRIMARY KEY(signature,pattern)) WITHOUT ROWID")
+
+
+def reconciliation_done(database, config):
+    _reconciliation_table(database)
+    return all(database.execute("SELECT 1 FROM scout_scan_reconciled WHERE signature=? AND pattern=?", key).fetchone()
+               for key in _reconciliation_keys(config))
+
+
+def mark_reconciled(database, config):
+    _reconciliation_table(database)
+    with database:
+        database.executemany("INSERT OR IGNORE INTO scout_scan_reconciled VALUES(?,?)", _reconciliation_keys(config))
+
+
+def _reconcile_legacy_pending(database: sqlite3.Connection, config, stop_event=None, write_lock=None) -> None:
+    """Bounded legacy migration; new saves already use the indexed pending state."""
+    _reconciliation_table(database)
     for target in config.targets:
-        signature = cdx_query_signature(config.for_target(target))
-        done = database.execute("SELECT 1 FROM scout_scan_reconciled WHERE signature=? AND pattern=?", (signature,target)).fetchone()
-        if done:
+        scoped = config.for_target(target)
+        key = _reconciliation_keys(scoped)[0]
+        if database.execute("SELECT 1 FROM scout_scan_reconciled WHERE signature=? AND pattern=?", key).fetchone():
             continue
-        # Update only the legacy gap, without materializing IDs in Python.
-        # The indexed hot queue is the *only* discovery path after this.
-        with database:
-            database.execute("""UPDATE captures SET state='downloaded_unscanned',updated_at=?
-                WHERE state='downloaded' AND query_signature=?
-                AND EXISTS (SELECT 1 FROM targets t WHERE t.pattern=? AND
-                    (t.id=captures.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-                        WHERE m.capture_id=captures.id AND m.target_id=t.id)))
-                AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=captures.id)""",
-                (utc_now(),signature,target))
-            database.execute("INSERT OR IGNORE INTO scout_scan_reconciled(signature,pattern) VALUES(?,?)", (signature,target))
+        last_id = 0
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise Stopped
+            # Walk row IDs once and materialize only actual legacy gaps. A
+            # signature/timestamp index would sort the whole history per page.
+            if stop_event is not None:
+                database.set_progress_handler(lambda: int(stop_event.is_set()), 10000)
+            try:
+                rows = database.execute("""SELECT c.id FROM captures c NOT INDEXED
+                    WHERE c.id>? AND c.state='downloaded' AND c.query_signature=?
+                    AND c.timestamp BETWEEN ? AND ?
+                    AND EXISTS(SELECT 1 FROM targets t WHERE t.pattern=? AND
+                        (t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
+                            WHERE m.capture_id=c.id AND m.target_id=t.id)))
+                    AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=c.id)
+                    ORDER BY c.id LIMIT 500""",
+                    (last_id, cdx_query_signature(scoped), scoped.from_date, scoped.to_date, target)).fetchall()
+            except sqlite3.OperationalError:
+                if stop_event is not None and stop_event.is_set():
+                    raise Stopped
+                raise
+            finally:
+                if stop_event is not None:
+                    database.set_progress_handler(None, 0)
+            if not rows:
+                break
+            if stop_event is not None and stop_event.is_set():
+                raise Stopped
+            with (write_lock if write_lock is not None else nullcontext()), database:
+                database.executemany("""UPDATE captures SET state='downloaded_unscanned',updated_at=?
+                    WHERE id=? AND state='downloaded'
+                    AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.capture_id=captures.id)""",
+                    ((utc_now(), int(row[0])) for row in rows))
+            last_id = int(rows[-1][0])
+        if stop_event is not None and stop_event.is_set():
+            raise Stopped
+        with (write_lock if write_lock is not None else nullcontext()), database:
+            database.execute("INSERT OR IGNORE INTO scout_scan_reconciled VALUES(?,?)", key)
 
 
 def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
@@ -124,12 +169,12 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
                LEFT JOIN documents d ON d.capture_id=c.id
                LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                WHERE c.state='downloaded_unscanned'
-               AND c.query_signature=? AND EXISTS (SELECT 1 FROM targets t
+               AND c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS (SELECT 1 FROM targets t
                    WHERE t.pattern IN (""" + target_slots + """) AND
                    (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                        WHERE m.capture_id=c.id AND m.target_id=t.id)))
                AND c.id>? ORDER BY c.id LIMIT 500""",
-            (signature, *targets, cursor_id),
+            (signature, config.from_date, config.to_date, *targets, cursor_id),
         ).fetchall()
         if not batch:
             return
@@ -167,8 +212,7 @@ def scan_pending_saved(
     if reconcile_legacy:
         while True:
             try:
-                with (write_lock if write_lock is not None else nullcontext()):
-                    _reconcile_legacy_pending(database, config)
+                _reconcile_legacy_pending(database, config, stop_event, write_lock)
                 break
             except sqlite3.OperationalError as exc:
                 if not _sqlite_write_busy(exc):
@@ -180,11 +224,11 @@ def scan_pending_saved(
     has_pending = database.execute(
         """SELECT 1 FROM captures c
            WHERE c.state='downloaded_unscanned'
-             AND c.query_signature=? AND EXISTS (SELECT 1 FROM targets t
+             AND c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS (SELECT 1 FROM targets t
                  WHERE t.pattern IN (""" + target_slots + """) AND
                  (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                    WHERE m.capture_id=c.id AND m.target_id=t.id))) LIMIT 1""",
-        (signature, *targets),
+        (signature, config.from_date, config.to_date, *targets),
     ).fetchone()
     if not has_pending:
         return 0
@@ -219,7 +263,7 @@ def scan_pending_saved(
                     break
                 row = next_row
                 # Oversized single bodies are processed without dropping evidence.
-                futures[pool.submit(_scan_one, row, jobs)] = (row, estimate)
+                futures[pool.submit(_scan_one, row, jobs, config.extract_domains)] = (row, estimate)
                 in_flight_bytes += estimate
                 next_row = next(rows, None)
             if not futures:
@@ -258,6 +302,9 @@ def scan_pending_saved(
                                     result["visible"], result["links"], result["content_hash"],
                                     result["normalized_hash"], result["bytes_saved"],
                                 )
+                                if result.get("domain_source") is not None:
+                                    from ..domains import commit_domains
+                                    commit_domains(database,result["capture_id"],result["content_hash"],result["domain_source"])
                                 for run_id, analysis in result["analyses"].items():
                                     save_match(database, int(run_id), document_id, analysis)
                                 database.execute(
@@ -363,13 +410,13 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                    FROM captures c
                    LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                LEFT JOIN documents d ON d.capture_id=c.id
-               WHERE c.id>? AND c.query_signature=? AND EXISTS(SELECT 1 FROM targets t
+               WHERE c.id>? AND c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS(SELECT 1 FROM targets t
                  WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS(
                    SELECT 1 FROM capture_target_membership m WHERE m.capture_id=c.id AND m.target_id=t.id)))
                  AND ((c.state IN ('pending','error') AND c.download_attempts>0)
                    OR (c.state='downloaded_unscanned' AND v.capture_id IS NULL))
                  AND d.id IS NULL ORDER BY c.id LIMIT 500""",
-            (cursor, sig, target),
+            (cursor, sig, config.from_date, config.to_date, target),
         ).fetchall()
         if not rows:
             break

@@ -13,6 +13,7 @@ from collections import deque
 from ..content import decode_bytes, parse_page, parse_text_representation
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
+from ..domains import domain_text
 from ..utils import hash_text, normalize_search
 from .jobs import ScanJob
 from .scoring import analyze_content, prepare_analysis_fields
@@ -21,14 +22,14 @@ from .scoring import analyze_content, prepare_analysis_fields
 RESCAN_BYTE_BUDGET = 64 * 1024 * 1024
 
 
-def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob]) -> dict[str, object]:
+def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob], extract_domains: bool = False) -> dict[str, object]:
     path = Path(str(row["path"]))
     if not path.exists():
         return {"kind": "missing", "row": row, "path": path}
     try:
         saved_bytes = path.read_bytes()
         content_hash = hashlib.sha256(saved_bytes).hexdigest()
-        is_import = str(row.get("query_signature") or "") == "local-import"
+        is_import = str(row.get("query_signature") or "").startswith("local-import")
         authoritative = str(row.get("expected_hash") or "")
         if not is_import and authoritative and (
             content_hash != authoritative or len(saved_bytes) != int(row.get("expected_size") or 0)
@@ -88,6 +89,7 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob]) -> dict
             "size_bytes": path.stat().st_size,
             "document_changed": document_changed,
             "analyses": analyses,
+            "domain_source": domain_text(raw,visible,links) if extract_domains else None,
         }
     except Exception as exc:
         return {"kind": "error", "row": row, "error": repr(exc)}
@@ -132,11 +134,17 @@ def rescan_keyword_sets(
     missing_only: bool = False,
     scope_pairs: list[tuple[str, str]] | None = None,
     empty_message: str = "No saved documents to rescan.",
+    scope_config=None,
+    extract_domains: bool = False,
 ) -> None:
     if not jobs or any(not job.patterns for job in jobs):
         raise ValueError("at least one keyword rule is required in every selected keyword set")
     clauses: list[str] = ["d.id>?"] if after_document_id else []
     params: list[object] = [int(after_document_id)] if after_document_id else []
+    if scope_config is not None:
+        from ..database.scope import prepare_saved_scope, saved_scope_predicate
+        prepare_saved_scope(database, scope_config)
+        clauses.append(saved_scope_predicate())
     if missing_only:
         # Reacquisition-pending documents (including those flagged by Repair)
         # do not have validated local bytes. Do not reread and overwrite their
@@ -230,7 +238,7 @@ def rescan_keyword_sets(
                 if futures and in_flight_bytes + estimate > RESCAN_BYTE_BUDGET:
                     deferred_row = row
                     return
-                future = pool.submit(_analyze_saved_document, row, jobs)
+                future = pool.submit(_analyze_saved_document, row, jobs, extract_domains or bool(scope_config and scope_config.extract_domains))
                 futures[future] = (row, estimate)
                 in_flight_bytes += estimate
                 submitted_order.append(int(row["id"]))
@@ -302,6 +310,9 @@ def rescan_keyword_sets(
                             )
                         else:
                             saved_document_id = document_id
+                        if result.get("domain_source") is not None:
+                            from ..domains import commit_domains
+                            commit_domains(database,capture_id,result["content_hash"],result["domain_source"])
                         for scan_run_id, analysis in result["analyses"]:
                             save_match(database, int(scan_run_id), saved_document_id, analysis)
                         resolve_errors(

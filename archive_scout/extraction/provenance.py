@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ..events import Stopped
 
 import sqlite3
 from urllib.parse import urlsplit
@@ -6,7 +7,7 @@ from urllib.parse import urlsplit
 from ..utils import utc_now
 
 
-def trace_provenance(database: sqlite3.Connection) -> int:
+def trace_provenance(database: sqlite3.Connection, *, stop_event=None) -> int:
     created = 0
 
     def write_group(items: list[sqlite3.Row]) -> int:
@@ -16,6 +17,7 @@ def trace_provenance(database: sqlite3.Connection) -> int:
         source_host = (urlsplit(str(source["original_url"])).hostname or "").casefold()
         values: list[tuple] = []
         for mirror in items[1:]:
+            if stop_event is not None and stop_event.is_set(): raise Stopped
             mirror_host = (urlsplit(str(mirror["original_url"])).hostname or "").casefold()
             if source_host == mirror_host and source["original_url"] == mirror["original_url"]:
                 continue
@@ -57,6 +59,7 @@ def trace_provenance(database: sqlite3.Connection) -> int:
             ORDER BY dg.id,c.timestamp,dm.document_id
             """
         ):
+            if stop_event is not None and stop_event.is_set(): raise Stopped
             group_id = int(row["group_id"])
             if current_group is not None and group_id != current_group:
                 created += write_group(group_rows)

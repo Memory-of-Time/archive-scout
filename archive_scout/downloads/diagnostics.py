@@ -28,7 +28,7 @@ def build_fingerprint():
     found = False
     for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
                  'downloads/validation.py', 'network/transports.py', 'cdx/client.py',
-                 'media/indexer.py', 'media/downloader.py', 'media/embedded_pages.py', 'scanning/pending.py'):
+                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'domains.py', 'scanning/scoring.py', 'operations.py'):
         path = root / name
         if path.is_file():
             try:
@@ -104,8 +104,18 @@ class AcquisitionDiagnostics:
         self.controls = deque(maxlen=8)
         self.failures = Counter()
         self.samples = set()
+        self.phase_saved_base = 0
+        self.batch_saved = 0
         self.last_summary = time.monotonic()
         self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
+
+    def close(self):
+        pass  # memory-only operation observations
+
+    def begin_batch(self, callback):
+        self.phase_saved_base += self.batch_saved
+        self.batch_saved = 0
+        self.callback = callback
 
     def _emit(self, event):
         if self.callback:
@@ -153,7 +163,8 @@ class AcquisitionDiagnostics:
                  'capture_id': int(row['id']), 'capture_timestamp': str(row['timestamp']),
                  'original_url': _safe_url(row['original_url']),
                  'expected_cdx_digest': str(dict(row).get('digest') or '')[:100],
-                 'exception_type': type(exc).__name__, 'evidence': evidence,
+                 'exception_type': type(exc).__name__, 'exception_message': _safe_url(str(exc))[:1500],
+                 'exception_chain': [{'type':type(error).__name__, 'message':_safe_url(str(error))[:500]} for error in list(exception_chain(exc))[:8]], 'evidence': evidence,
                  'notice': 'Unvalidated diagnostic prefixes. Never use as saved capture or resume proof.'}
         if self.kind == 'media':
             value['media_capture_id'] = value.pop('capture_id')
@@ -163,6 +174,12 @@ class AcquisitionDiagnostics:
         try:
             self.summary_path.mkdir(parents=True, exist_ok=True)
             path = self.summary_path / f'sample-{slot:02}.json'
+            if path.exists():
+                try:
+                    if json.loads(path.read_text()).get('build_id') != self.build:
+                        path.unlink()
+                except (OSError,ValueError):
+                    pass
             temporary = path.with_suffix('.tmp')
             temporary.write_bytes(encoded)
             os.replace(temporary, path)
@@ -181,9 +198,9 @@ class AcquisitionDiagnostics:
             return {'build_id': self.build, 'response_counts': dict(self.responses),
                     'validation_rejected_response_counts': dict(self.rejected_responses),
                     'failure_categories': dict(self.failures),
-                    'avg_gate_wait_seconds': self.timings['gate_wait_seconds']/max(1,self.timing_counts['gate_wait_seconds']),
-                    'avg_request_turn_seconds': self.timings['request_turn_seconds']/max(1,self.timing_counts['request_turn_seconds']),
-                    'avg_backend_elapsed_seconds': self.timings['backend_elapsed_seconds']/max(1,self.timing_counts['backend_elapsed_seconds']),
+                    'avg_gate_wait_seconds': self.timings['gate_wait_seconds']/self.timing_counts['gate_wait_seconds'] if self.timing_counts['gate_wait_seconds'] else None,
+                    'avg_request_turn_seconds': self.timings['request_turn_seconds']/self.timing_counts['request_turn_seconds'] if self.timing_counts['request_turn_seconds'] else None,
+                    'avg_backend_elapsed_seconds': self.timings['backend_elapsed_seconds']/self.timing_counts['backend_elapsed_seconds'] if self.timing_counts['backend_elapsed_seconds'] else None,
                     'recent_30s': {'responses':len(recent),
                         'mean_decoded_bytes':mean('decoded_bytes'),
                         'mean_gate_wait_seconds':mean('gate_wait_seconds'),
@@ -191,14 +208,21 @@ class AcquisitionDiagnostics:
                     'process_cpu_seconds': time.process_time(),
                     'process_threads': threading.active_count(),
                     'memory': _process_memory(),
-                    'recent_control_responses': list(self.controls)}
+                    'timing_sample_counts':dict(self.timing_counts), 'recent_control_responses': list(self.controls)}
+
+    @staticmethod
+    def _timing(value):
+        return "unknown (no samples)" if value is None else f"{value:.3f}s"
 
     def summary(self, saved, *, force=False):
+        self.batch_saved = saved
+        total_saved = self.phase_saved_base + saved
         if not self.enabled or (not force and time.monotonic()-self.last_summary < 30):
             return
         self.last_summary = time.monotonic()
         detail = self.snapshot()
-        detail['new_saves'] = saved
+        detail['new_saves'] = total_saved
+        detail['batch_new_saves'] = saved
         try:
             self.summary_path.mkdir(parents=True, exist_ok=True)
             path = self.summary_path / 'latest.json'
@@ -209,8 +233,8 @@ class AcquisitionDiagnostics:
             pass
         if self.callback:
             self._emit(ProgressEvent('acquisition_health',
-                f"{self.kind.title()} acquisition health: build {self.build}; new saves {saved:,}; "
+                f"{self.kind.title()} acquisition health: build {self.build}; new saves {total_saved:,}; "
                 f"failures {dict(self.failures)}; responses {detail['response_counts']}; "
-                f"mean gate wait {detail['avg_gate_wait_seconds']:.3f}s; "
-                f"mean backend transfer/write time {detail['avg_backend_elapsed_seconds']:.3f}s. "
+                f"mean gate wait {self._timing(detail['avg_gate_wait_seconds'])}; "
+                f"mean backend transfer/write time {self._timing(detail['avg_backend_elapsed_seconds'])}. "
                 'Unfinished captures remain checkpointed.', detail=detail))

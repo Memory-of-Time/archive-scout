@@ -26,7 +26,7 @@ if (-not $SkipBuild) {
         --version-file packaging/windows/version_info.txt `
         --add-data "archive_scout/assets/archive_scout.png;assets" `
         --add-data "archive_scout/assets/archive_scout.ico;assets" `
-        --collect-all truststore `
+        --add-data "archive_scout/assets/domains;archive_scout/assets/domains" --collect-all truststore `
         --collect-all urllib3 `
         --collect-all httpx `
         --collect-all httpcore `
@@ -42,7 +42,7 @@ if (-not $SkipBuild) {
         --noupx `
         --name ArchiveScoutCLI `
         --version-file packaging/windows/version_info.txt `
-        --collect-all truststore `
+        --add-data "archive_scout/assets/domains;archive_scout/assets/domains" --collect-all truststore `
         --collect-all urllib3 `
         --collect-all httpx `
         --collect-all httpcore `

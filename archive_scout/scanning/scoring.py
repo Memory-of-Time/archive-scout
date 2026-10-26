@@ -38,6 +38,11 @@ def link_is_interesting(
     return keyword_url_match(link, patterns)
 
 
+def _rule_identity(item):
+    rule = item.rule
+    return (rule.expression, rule.kind, rule.case_sensitive, rule.whole_word, rule.weight)
+
+
 def _matches(item: CompiledRule, value: str, normalized_value: str):
     """Yield regex matches without materializing a per-rule list."""
     haystack = value if item.rule.case_sensitive else normalized_value
@@ -75,8 +80,12 @@ def _proximity_bonus(text: str, patterns: list[CompiledRule], window_words: int 
         if item.rule.kind == "excluded":
             continue
         bucket = positions.setdefault(item.rule.label, [])
-        for match in item.pattern.finditer(normalized):
-            bucket.append(max(0, bisect.bisect_right(starts, match.start()) - 1))
+        haystack = text if item.rule.case_sensitive else normalized
+        source_starts = [m.start() for m in WORD_PATTERN.finditer(text)] if item.rule.case_sensitive else starts
+        for match in item.pattern.finditer(haystack):
+            bucket.append(max(0, bisect.bisect_right(source_starts, match.start()) - 1))
+        bucket.sort()
+    positions = {label: values for label,values in positions.items() if values}
     close_pairs = 0
     minimum_distance: int | None = None
     for left, right in combinations(positions, 2):
@@ -165,9 +174,10 @@ def analyze_content(
     hits: Counter[str] = Counter()
     hit_fields: dict[str, set[str]] = {}
     score = 0.0
-    matched_rules: dict[str, CompiledRule] = {}
+    matched_rules: dict[tuple, CompiledRule] = {}
+    matched_identities = set()
     excluded_labels: set[str] = set()
-    required_labels = {item.rule.label for item in patterns if item.rule.kind == "required"}
+    required_rules = [item for item in patterns if item.rule.kind == "required"]
 
     for field_name, value in fields.items():
         normalized_value = normalized_fields[field_name]
@@ -178,7 +188,8 @@ def analyze_content(
             label = item.rule.label
             hits[label] += count
             hit_fields.setdefault(label, set()).add(field_name)
-            matched_rules[label] = item
+            matched_rules[_rule_identity(item)] = item
+            matched_identities.add(_rule_identity(item))
             if item.rule.kind == "excluded":
                 excluded_labels.add(label)
                 continue
@@ -186,7 +197,7 @@ def analyze_content(
             contribution = min(count, 10) * multipliers[field_name] * item.rule.weight * exact_bonus
             score += contribution
 
-    missing_required = sorted(required_labels - set(hits))
+    missing_required = sorted({item.rule.label for item in required_rules if _rule_identity(item) not in matched_identities})
     excluded = bool(excluded_labels)
     distinct = len([label for label in hits if label not in excluded_labels])
     if distinct >= 2:
