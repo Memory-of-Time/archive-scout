@@ -24,6 +24,9 @@ from ..cdx.indexer import (
     encode_plan,
     index_windows,
     validate_cdx_scope,
+    uncovered_index_ranges,
+    _reconcile_paged_completion,
+    _query_is_oversized,
     split_window,
     window_label,
 )
@@ -103,7 +106,7 @@ def media_query_signatures(config: ProjectConfig) -> tuple[str, ...]:
     return tuple(dict.fromkeys(media_query_signature(config, size) for size in sizes))
 
 
-def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int = 3) -> str:
+def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int = 4) -> str:
     payload = {"media_query_signature": media_query_signature(config, page_size), "index_revision": int(revision)}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -113,7 +116,7 @@ def media_signature_candidates(config: ProjectConfig) -> tuple[tuple[str, str], 
     values: list[tuple[str, str]] = []
     for size in [config.page_size, 5000, 25000, 1000, 10000, 50000, 100000, 150000]:
         media_signature = media_query_signature(config, size)
-        for revision in (3, 2):
+        for revision in (4, 3, 2):
             item = (media_signature, media_index_state_signature(config, page_size=size, revision=revision))
             if item not in values:
                 values.append(item)
@@ -279,6 +282,7 @@ def _adopt_compatible_media_state(
     config: ProjectConfig,
     signature: str,
     state_signature: str,
+    scope_config: ProjectConfig | None = None,
 ) -> None:
     existing = database.execute(
         "SELECT 1 FROM media_index_state WHERE target_id=? AND extension=? AND year=? AND query_signature=?",
@@ -286,10 +290,10 @@ def _adopt_compatible_media_state(
     ).fetchone()
     if existing:
         return
-    if year == 0:
-        return  # range state has a disjoint slot; annual evidence is not range evidence
-    start, end = cdx_year_window(config, year) or (f"{year:04d}0101000000", f"{year:04d}1231235959")
-    for candidate_signature, candidate_state in media_signature_candidates(config):
+    start, end = ((config.from_date, config.to_date) if year == 0 else
+                  cdx_year_window(config, year) or (f"{year:04d}0101000000", f"{year:04d}1231235959"))
+    identity_config = scope_config or config
+    for candidate_signature, candidate_state in media_signature_candidates(identity_config):
         if candidate_state == state_signature:
             continue
         state = database.execute(
@@ -299,21 +303,40 @@ def _adopt_compatible_media_state(
         ).fetchone()
         if not state:
             continue
+        # Revision 4 closes two old false-completion paths: terminal pages
+        # with a lost cursor, and earliest/latest reused from a collapsed text
+        # index. Keep all capture rows/files; only uncertain coverage is redone.
+        # Valid unfinished cursors remain restartable. Small proven terminal
+        # inventories and revision-4 evidence remain directly reusable.
+        candidate_sizes = [identity_config.page_size, 5000, 25000, 1000,
+                           10000, 50000, 100000, 150000]
+        page_size = next((size for size in candidate_sizes
+                         if media_query_signature(identity_config, size) == candidate_signature),
+                        identity_config.page_size)
+        old_revision = candidate_state != media_index_state_signature(
+            identity_config, page_size=page_size)
+        if state['complete'] and old_revision and (
+                int(state['seen'] or 0) >= min(100, page_size) or
+                (config.media.snapshot_strategy in {'earliest', 'latest'} and config.cdx_collapses)):
+            continue
         if candidate_signature != signature:
             database.execute(
                 "UPDATE OR IGNORE media_captures SET query_signature=? "
                 "WHERE target_id=? AND query_signature=? AND timestamp BETWEEN ? AND ?",
                 (signature, target_id, candidate_signature, start, end),
             )
-            database.execute(
-                "DELETE FROM media_captures WHERE target_id=? AND query_signature=? AND timestamp BETWEEN ? AND ?",
-                (target_id, candidate_signature, start, end),
-            )
+            # Conflicting historical identities remain available with their
+            # files and errors. Never delete them merely to adopt a page size.
         database.execute(
             "INSERT INTO media_index_state(target_id,extension,year,query_signature,resume_key,complete,seen,error_id,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
             (target_id, ALL_EXTENSIONS_STATE, year, state_signature, state["resume_key"], state["complete"], state["seen"], state["error_id"], state["updated_at"]),
         )
+        database.execute("""INSERT OR IGNORE INTO media_index_pages
+            (target_id,year,state_signature,window_start,window_end,layout_signature,page,row_count,updated_at)
+            SELECT target_id,year,?,window_start,window_end,layout_signature,page,row_count,updated_at
+            FROM media_index_pages WHERE target_id=? AND year=? AND state_signature=?""",
+            (state_signature, target_id, year, candidate_state))
         database.execute(
             "DELETE FROM media_index_state WHERE target_id=? AND extension=? AND year=? AND query_signature=?",
             (target_id, ALL_EXTENSIONS_STATE, year, candidate_state),
@@ -331,32 +354,39 @@ def _reuse_completed_main_index(
     state_signature: str,
 ) -> tuple[bool, int, int]:
     """Populate media rows from a completed normal index without another CDX pass."""
+    if config.media.snapshot_strategy in {"earliest", "latest"} and config.cdx_collapses:
+        # A digest/urlkey representative is not proof of either timestamp
+        # extreme. Only the uncollapsed timestamp inventory is sufficient.
+        return False, 0, 0
     target_row = database.execute("SELECT id FROM targets WHERE pattern=?", (target,)).fetchone()
     if not target_row:
         return False, 0, 0
     normal_target_id = int(target_row["id"])
-    if year == 0:
-        return False, 0, 0  # an annual completion cannot certify this range
+    start, end = ((config.from_date, config.to_date) if year == 0 else
+                  cdx_year_window(config, year) or (f"{year:04d}0101000000", f"{year:04d}1231235959"))
     reusable_signature = None
     for candidate in cdx_query_signatures(config):
         row = database.execute(
             "SELECT complete FROM index_state WHERE target_id=? AND year=? AND query_signature=?",
             (normal_target_id, year, candidate),
         ).fetchone()
-        if row and row["complete"]:
+        if (((year == 0 or config.text_collapse_scope == 'range')
+             and not uncovered_index_ranges(database, normal_target_id, candidate, start, end))
+                or (year != 0 and row and row["complete"])):
             reusable_signature = candidate
             break
     if reusable_signature is None:
         return False, 0, 0
 
-    start, end = cdx_year_window(config, year) or (f"{year:04d}0101000000", f"{year:04d}1231235959")
     media = config.media.normalized()
     seen = 0
     changed = 0
     cursor = database.execute(
         "SELECT original_url,timestamp,mimetype,statuscode,digest,length FROM captures "
-        "WHERE target_id=? AND query_signature=? AND timestamp BETWEEN ? AND ? ORDER BY id",
-        (normal_target_id, reusable_signature, start, end),
+        "WHERE (target_id=? OR EXISTS (SELECT 1 FROM capture_target_membership m "
+        "WHERE m.capture_id=captures.id AND m.target_id=?)) "
+        "AND query_signature=? AND timestamp BETWEEN ? AND ? ORDER BY id",
+        (normal_target_id, normal_target_id, reusable_signature, start, end),
     )
     while True:
         batch = cursor.fetchmany(10000)
@@ -408,6 +438,11 @@ def _defer_media_window(
     yield_to_other_tasks: bool = False,
 ) -> int:
     current.failures += 1
+    if current.strategy == 'resume' and _query_is_oversized(exc):
+        # Page length is transport layout, not membership. Preserve the exact
+        # cursor and date/collapse scope while reducing an explicitly oversized
+        # response. Repeating the same over-budget media page cannot recover.
+        current.page_size = max(100, (current.page_size or config.page_size) // 2)
     current.next_eligible_at = time.time() + _wait_seconds(config,current.failures)
     # HTTP 5xx/429/refusal is not evidence that a previously selected
     # pagination grouping or a collapsed resume window is too large.
@@ -545,7 +580,8 @@ def _request_media_resume(
     target: str,
     current: PendingWindow,
     extensions: list[str],
-) -> tuple[list[dict[str, str]], bool, str | None]:
+    *, exact: bool = False,
+) -> tuple[list[CDXRow], bool, str | None]:
     # Cursor advancement must be atomic with inserted media inventory rows.
     page_size = current.page_size or config.page_size
     result = request_cdx_rows(
@@ -559,6 +595,7 @@ def _request_media_resume(
             current.resume_key,
             page_size=page_size,
             extensions=extensions,
+            exact=exact,
         ),
         max_bytes=cdx_response_budget(page_size),
         prefer_text=True,
@@ -568,6 +605,18 @@ def _request_media_resume(
         if next_resume == current.resume_key:
             raise TransientRequestError("CDX returned the same media resume key twice", splittable=True)
         return rows, False, next_resume
+    if len(rows) >= page_size and isinstance(client, HttpClient):
+        confirmation = request_cdx_rows(
+            client, cdx_endpoints(config),
+            build_media_params(config, target, current.start, current.end, current.resume_key,
+                               page_size=page_size + 1, extensions=extensions, exact=exact),
+            max_bytes=cdx_response_budget(page_size + 1), prefer_text=False)
+        if confirmation.resume_key and confirmation.resume_key != current.resume_key:
+            return confirmation.rows, False, confirmation.resume_key
+        if confirmation.resume_key or confirmation.rows != rows:
+            from ..cdx.client import MalformedCDXResponse
+            raise MalformedCDXResponse(
+                "Full-sized media CDX page has unconfirmed terminal membership", splittable=False)
     return rows, True, None
 
 
@@ -701,7 +750,8 @@ def index_direct_media(
         target_id = get_or_create_media_target(database, target)
         with database:
             _adopt_compatible_media_state(
-                database, target_id, year, target_config, signature, state_signature
+                database, target_id, year, target_config, signature, state_signature,
+                scope_config=config,
             )
         state = database.execute(
             """
@@ -846,9 +896,7 @@ def index_direct_media(
                             current.failures = 0
                             connection_failure_streak = 0
                             transient_failure_streak = 0
-                        if batch.finished and (
-                            current.page_count >= 0 and len(completed_pages) == current.page_count
-                        ):
+                        if batch.finished and _reconcile_paged_completion(current, completed_pages):
                             plan.pending.pop(0)
                             plan.completed += 1
                             completed += 1
@@ -1224,6 +1272,7 @@ def _embedded_lookup(
             result = request_cdx_rows(
                 client, endpoints, params, max_bytes=8 * 1024 * 1024, prefer_text=True
             )
+            validate_cdx_scope(result.rows,url,config.from_date,config.to_date,config.cdx_filters,'exact')
             return row, result.rows[:1], None
         if strategy == "latest":
             params = build_media_params(config, url, config.from_date, config.to_date, exact=True, page_size=1)
@@ -1232,27 +1281,10 @@ def _embedded_lookup(
             result = request_cdx_rows(
                 client, endpoints, params, max_bytes=8 * 1024 * 1024, prefer_text=True
             )
+            validate_cdx_scope(result.rows,url,config.from_date,config.to_date,config.cdx_filters,'exact')
             return row, result.rows[-1:] if result.rows else [], None
 
-        rows: list[CDXRow] = []
-        resume: str | None = None
-        while True:
-            result = request_cdx_rows(
-                client,
-                endpoints,
-                build_media_params(
-                    config, url, config.from_date, config.to_date, resume, exact=True, page_size=config.page_size
-                ),
-                max_bytes=cdx_response_budget(config.page_size),
-                prefer_text=True,
-            )
-            rows.extend(result.rows)
-            if not result.resume_key:
-                break
-            if result.resume_key == resume:
-                raise TransientRequestError("CDX returned the same embedded-media resume key twice", splittable=True)
-            resume = result.resume_key
-        return row, rows, None
+        raise ValueError("All-snapshot embedded indexing requires the persistent page queue")
     except BaseException as exc:
         return row, [], exc
 
@@ -1294,6 +1326,10 @@ def index_embedded_media(
         return
     if discover_documents:
         _discover_embedded_queue(config, database, stop_event, callback, signature, external_only=external_only)
+    if media.snapshot_strategy == 'all':
+        from .embedded_pages import index_all_embedded_pages
+        index_all_embedded_pages(config, database, client, stop_event, callback, signature)
+        return
     attempt_limit = (2**63-1 if config.network.persistent_retries else config.max_attempts)
     pending_total = int(database.execute(
         """SELECT COUNT(*) FROM media_discovery_queue

@@ -243,6 +243,9 @@ class FastIndexingTests(unittest.TestCase):
                 from_date="2001",
                 to_date="2001",
                 cdx_delay=0,
+                # Earliest media requires every eligible timestamp. A collapsed
+                # representative cannot support this local reuse shortcut.
+                cdx_collapses=[],
                 network=NetworkConfig(index_strategy="paged"),
                 media=MediaConfig(
                     enabled=True,

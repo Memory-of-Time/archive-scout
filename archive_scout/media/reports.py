@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import threading
 from pathlib import Path
 
 from ..config import ProjectConfig
 from ..downloads.downloader import replay_url
-from ..utils import atomic_write_lines, utc_now
+from ..utils import atomic_write_lines, atomic_write_text, utc_now
 
 
 def generate_media_reports(config: ProjectConfig, database: sqlite3.Connection,
@@ -98,10 +99,39 @@ def generate_media_reports(config: ProjectConfig, database: sqlite3.Connection,
         "excluded_extensions": f"Excluded extensions: {', '.join(config.media.exclude_extensions) or '(none)'}",
     }
     if opts.output_enabled("media_summary"):
+        from .indexer import media_query_signature
+        from ..coverage import media_coverage_gaps, require_embedded_coverage, IndexCoveragePending
+        signature = media_query_signature(config)
+        active_counts = {str(row[0]): int(row[1]) for row in database.execute(
+            "SELECT state,COUNT(*) FROM media_captures WHERE query_signature=? GROUP BY state", (signature,))}
+        gaps = media_coverage_gaps(database, config)
+        try:
+            require_embedded_coverage(database, config, signature)
+        except IndexCoveragePending as exc:
+            gaps.append(str(exc))
+        unfinished = sum(value for state,value in active_counts.items()
+                         if state not in {'downloaded','skipped','skipped_strategy'})
+        completeness = {
+            'format': 'archive-scout-media-completeness-v1', 'generated_utc': utc_now(),
+            'query_signature': signature, 'scope': 'current configured targets, dates, filters and snapshot strategy',
+            'states': active_counts, 'coverage_gaps': gaps, 'unfinished_selected_captures': unfinished,
+            'complete': not gaps and unfinished == 0,
+            'note': 'Committed acquisition evidence, not a new filesystem/hash audit. '
+                    'skipped_strategy captures are outside the selected earliest/latest policy; '
+                    'configured CDX filters/collapses define the requested inventory. '
+                    'Historical signatures remain in the existing media reports.'}
+        proof_path = reports / 'media_completeness.json'
+        atomic_write_text(proof_path, json.dumps(completeness, indent=2, ensure_ascii=False) + '\n')
+        paths['media_completeness'] = proof_path
         summary = [summary_values[key] for key in opts.fields_for("media_summary") if key in summary_values]
         summary.extend((
-            f"Pending excluded by attempt ceiling (UNFINISHED): {over_attempt:,}",
-            f"Errors with exhausted attempts (UNFINISHED): {over_attempt_errors:,}",
+            "The counts above include all project inventory signatures.",
+            f"Pending at/above configured attempt count (still eligible): {over_attempt:,}",
+            f"Errors at/above configured attempt count (UNFINISHED): {over_attempt_errors:,}",
+            f"Current inventory {signature}: {json.dumps(active_counts, sort_keys=True)}",
+            f"Current inventory completeness: {'complete' if completeness['complete'] else 'INCOMPLETE'}; "
+            f"unfinished captures {unfinished:,}; coverage gaps {len(gaps):,}",
+            "Detailed current-scope evidence: media_completeness.json",
         ))
         path = reports / "media_summary.txt"
         atomic_write_lines(path, summary)

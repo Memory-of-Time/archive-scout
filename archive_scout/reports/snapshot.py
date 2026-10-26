@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -28,6 +29,40 @@ from ..utils import atomic_write_text
 
 _REPORT_LOCKS: dict[str, threading.Lock] = {}
 _REPORT_LOCKS_MUTEX = threading.Lock()
+
+
+class ReportSnapshotPublishError(OSError):
+    """Rendered reports are preserved, but their final folder was not published."""
+
+    def __init__(self, staging: Path, final: Path) -> None:
+        self.staging_path, self.final_path = staging, final
+        super().__init__(f"Report finalization was denied. Generated files are preserved at {staging}. "
+                         f"Close programs using that folder and retry export. Intended folder: {final}")
+
+
+def _publish_snapshot(staging: Path, final: Path, stop_event=None) -> None:
+    # Healthy exports pay no wait. Retry only access/sharing violations, never
+    # disk-full, missing paths, or a conflicting destination. No copy fallback:
+    # a partly copied directory must not masquerade as a published snapshot.
+    for delay in (0.0, 0.1, 0.25, 0.5, 1.0):
+        if stop_event is not None and stop_event.is_set():
+            raise Stopped
+        if delay:
+            if stop_event is not None:
+                if stop_event.wait(delay):
+                    raise Stopped
+            else:
+                time.sleep(delay)
+        try:
+            if final.exists():
+                raise FileExistsError(f"Report destination already exists: {final}")
+            os.replace(staging, final)
+            return
+        except OSError as exc:
+            if not (isinstance(exc, PermissionError) or getattr(exc, 'winerror', None) in {5, 32, 33}):
+                raise
+            last_error = exc
+    raise ReportSnapshotPublishError(staging, final) from last_error
 
 
 def _lock_for(root: Path) -> threading.Lock:
@@ -74,7 +109,8 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
     """Export a committed-state snapshot without changing scan/operation state.
 
     Root files are never replaced. Only the fully rendered private folder is
-    published, and failures delete their staging tree. No copy of the user's
+    published. Render failures remove staging; publish failures preserve the
+    fully rendered tree for recovery. No copy of the user's
     SQLite database or capture payloads is created.
     """
     root = Path(config.output_dir).expanduser().resolve()
@@ -89,6 +125,7 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
     parent = root / "reports" / "manual"
     staging = parent / f".partial-{timestamp}-{token}"
     final = parent / f"{timestamp}-{token}"
+    rendered = False
     try:
         parent.mkdir(parents=True, exist_ok=True)
         staging.mkdir()
@@ -160,10 +197,12 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
             db.rollback()  # End our read snapshot; never mutate project DB.
         finally:
             db.close()
-        os.replace(staging, final)
+        rendered = True
+        _publish_snapshot(staging, final, stop_event)
         return {"snapshot_folder": final, "manifest": final / "manifest.json"}
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        if not rendered:
+            shutil.rmtree(staging, ignore_errors=True)
         raise
     finally:
         lock.release()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 import errno
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 import gzip
 import io
 import zlib
@@ -125,6 +125,40 @@ class HttpClient:
     handled here so all workers follow the same Wayback policy.
     """
 
+    @property
+    def stop_event(self):
+        local = getattr(self, '_cancellation_local', None)
+        return getattr(local, 'event', None) or self._stop_event
+
+    @stop_event.setter
+    def stop_event(self, event):
+        self._stop_event = event
+
+    @contextmanager
+    def cancellation_scope(self, cancel):
+        """Cancel one page pool's waits without setting the user's Stop event."""
+        if not hasattr(self, '_cancellation_local'):
+            self._cancellation_local = threading.local()
+        parent = self.stop_event
+        class ScopedStop:
+            def is_set(self):
+                return parent.is_set() or cancel.is_set()
+
+            def wait(self, timeout=None):
+                deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+                while not self.is_set():
+                    remaining = 0.05 if deadline is None else deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    cancel.wait(min(0.05, remaining))
+                return self.is_set()
+        previous = getattr(self._cancellation_local, 'event', None)
+        self._cancellation_local.event = ScopedStop()
+        try:
+            yield
+        finally:
+            self._cancellation_local.event = previous
+
     def __init__(
         self,
         limiter: FixedRateLimiter,
@@ -156,6 +190,7 @@ class HttpClient:
         self.read_timeout = max(1.0, float(read_timeout if read_timeout is not None else timeout))
         self.user_agent = user_agent
         self.stop_event = stop_event
+        self._cancellation_local = threading.local()
         self.retry_callback = retry_callback
         self.response_callback = response_callback
         self.host_gate = host_gate or SharedHostGate()
@@ -190,6 +225,8 @@ class HttpClient:
                     'pause_seconds': pause_seconds, 'gate_wait_seconds': gate_wait,
                     'request_turn_seconds': turn_seconds,
                     'backend_elapsed_seconds': float(response.elapsed),
+                    'decoded_bytes': int(getattr(response, 'bytes_written',
+                        len(getattr(response, 'data', b'')))),
                 })
             except Exception:
                 pass  # Diagnostics cannot alter acquisition or retry outcomes.
@@ -199,6 +236,16 @@ class HttpClient:
         if any(isinstance(normalize_transport_error(error), IncompleteRepresentationError)
                for _, error in exc.failures):
             # The server answered. A bad body is not a failed connectivity probe.
+            if self.response_callback is not None:
+                for backend, error in exc.failures:
+                    detail = getattr(error, 'transfer_diagnostic', {})
+                    if detail.get('response_status') is not None:
+                        try:
+                            self.response_callback({'status': int(detail['response_status']),
+                                'url': url, 'backend': backend, 'validation_rejected': True,
+                                'decoded_bytes': int(detail.get('decoded_bytes_received', 0))})
+                        except Exception:
+                            pass
             self.host_gate.finish_request(permit, recovered=True)
             if self.coordinated_connection_recovery:
                 self.host_gate.connection_success()
@@ -1214,12 +1261,22 @@ def parse_cdx_text_rows(
             after_blank = False
             continue
         after_blank = False
-        if len(parts) != expected_parts:
+        offset = field_offset
+        # Some compatible servers omit urlkey despite the requested fl. Accept
+        # their established six-column layout only when it starts with a full
+        # timestamp. A truncated seven-column row still fails validation.
+        if has_urlkey and len(parts[0]) == 14 and parts[0].isdigit():
+            parts = line.split(None, 5)
+            offset = 0
+            row_parts = 6
+        else:
+            row_parts = expected_parts
+        if len(parts) != row_parts:
             malformed_count += 1
             if not malformed_preview:
                 malformed_preview = _decode_field(line)[:320]
             continue
-        timestamp = parts[field_offset]
+        timestamp = parts[offset]
         if not timestamp.isdigit():
             # Header rows are rare. Test for them only after the numeric fast
             # path fails rather than lower-casing the first field of every row.
@@ -1229,11 +1286,11 @@ def parse_cdx_text_rows(
             if not malformed_preview:
                 malformed_preview = _decode_field(line)[:320]
             continue
-        mimetype = parts[field_offset + 1]
-        statuscode = parts[field_offset + 2]
-        digest = parts[field_offset + 3]
-        length = parts[field_offset + 4]
-        original = parts[field_offset + 5]
+        mimetype = parts[offset + 1]
+        statuscode = parts[offset + 2]
+        digest = parts[offset + 3]
+        length = parts[offset + 4]
+        original = parts[offset + 5]
         rows.append((
             _decode_field(timestamp), _decode_field(original), _decode_field(mimetype),
             _decode_field(statuscode), _decode_field(digest), _decode_field(length),
@@ -1274,66 +1331,24 @@ def parse_cdx_text_response(
     endpoint: str = "",
     params: list[tuple[str, str]] | None = None,
 ) -> object:
-    raw = data.decode("utf-8", "replace").lstrip("\ufeff").replace("\x00", "").strip()
-    if not raw:
-        params = params or []
-        if any(key.casefold() == "shownumpages" and value.casefold() == "true" for key, value in params):
-            raise MalformedCDXResponse(
-                f"CDX page-count fallback returned an empty body from {endpoint}",
-                splittable=True,
-                endpoint=endpoint,
-            )
-        return [["timestamp", "mimetype", "statuscode", "digest", "length", "original"]]
-    lowered = raw[:1000].casefold()
-    if any(marker in lowered for marker in ("<!doctype", "<html", "bad gateway", "temporarily unavailable", "too many requests")):
-        raise MalformedCDXResponse(
-            f"CDX plain-text fallback returned an error page from {endpoint}: {clean_space(raw[:320])}",
-            splittable=True,
-            endpoint=endpoint,
-        )
-    params = params or []
-    if any(key.casefold() == "shownumpages" and value.casefold() == "true" for key, value in params):
-        token = next((line.strip() for line in raw.splitlines() if line.strip()), "")
-        if token.isdigit():
-            return int(token)
-        raise MalformedCDXResponse(
-            f"CDX page-count fallback was not numeric at {endpoint}: {clean_space(raw[:320])}",
-            splittable=True,
-            endpoint=endpoint,
-        )
-
+    # Keep the legacy object API and compact acquisition parser on exactly
+    # the same field layout, compression, header and continuation rules.
+    # The old six-column fallback could not read the seven columns it requested
+    # (urlkey first), causing valid text responses to be retried forever.
+    result = parse_cdx_text_rows(data, endpoint, params)
+    if any(key.casefold() == "shownumpages" and value.casefold() == "true"
+           for key, value in (params or [])):
+        if not result.rows:
+            raise MalformedCDXResponse("CDX page-count fallback returned an empty body", splittable=True)
+        return int(result.rows[0][0])
     fields = ["timestamp", "mimetype", "statuscode", "digest", "length", "original"]
-    blocks = re.split(r"\r?\n[ \t]*\r?\n", raw)
-    resume_key: str | None = None
-    row_text = raw
-    if len(blocks) > 1:
-        candidate = blocks[-1].strip()
-        if candidate and "\n" not in candidate and len(candidate.split()) == 1:
-            resume_key = candidate
-            row_text = "\n\n".join(blocks[:-1]).strip()
-
-    rows: list[list[str]] = []
-    malformed: list[str] = []
-    for line in row_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(None, len(fields) - 1)
-        if len(parts) != len(fields) or not parts[0].isdigit():
-            malformed.append(line)
-            continue
-        rows.append(parts)
-    if malformed:
-        raise MalformedCDXResponse(
-            f"CDX plain-text fallback contained {len(malformed)} malformed row(s) at {endpoint}: "
-            f"{clean_space(malformed[0][:320])}",
-            splittable=True,
-            endpoint=endpoint,
-        )
-    payload: list[object] = [fields, *rows]
-    if resume_key:
-        payload.extend([[], [resume_key]])
+    payload: list[object] = [fields]
+    payload.extend([[timestamp, mime, status, digest, length, original]
+                    for timestamp, original, mime, status, digest, length in result.rows])
+    if result.resume_key:
+        payload.extend([[], [result.resume_key]])
     return payload
+
 
 def parse_retry_after(value: str | None) -> float | None:
     if not value:

@@ -33,6 +33,15 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
             return "read_timeout", status, True
     if is_transport_connection_failure(exc):
         return "connection", status, True
+    from ..cdx.client import TransientRequestError, MalformedCDXResponse
+    if isinstance(exc, MalformedCDXResponse):
+        return "cdx_response_unverified", status, True
+    if isinstance(exc, TransientRequestError) and status is None:
+        return ("connection" if exc.connection_failed else
+                "read_timeout" if exc.timed_out else "transient_request"), None, True
+    if isinstance(exc, TransientRequestError):
+        return ("rate_limit" if status == 429 else
+                "http_server_error" if status >= 500 else "http_client_error"), status, True
     explicit_category = str(getattr(exc, "category", "") or "")
     if explicit_category in {"wayback_excluded", "robots_blocked", "wayback_forbidden", "missing_capture", "http_client_error"}:
         return explicit_category, int(status) if status else None, False

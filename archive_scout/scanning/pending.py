@@ -150,6 +150,7 @@ def scan_pending_saved(
     callback: Callable[[ProgressEvent], None] | None = None,
     workers: int | None = None,
     write_lock: threading.Lock | None = None,
+    reconcile_legacy: bool = True,
 ) -> int:
     """Scan after acquisition; unaffected by Wayback's request admission clock.
 
@@ -163,17 +164,18 @@ def scan_pending_saved(
     target_slots = ",".join("?" for _ in targets)
     # The expensive historical gap reconciliation is strictly once per
     # connection/scope, not on every background scanner wake.
-    while True:
-        try:
-            with (write_lock if write_lock is not None else nullcontext()):
-                _reconcile_legacy_pending(database, config)
-            break
-        except sqlite3.OperationalError as exc:
-            if not _sqlite_write_busy(exc):
-                raise
-            database.rollback()  # Retry a fresh write transaction, not BUSY_SNAPSHOT.
-            if stop_event.wait(0.15):
-                raise Stopped
+    if reconcile_legacy:
+        while True:
+            try:
+                with (write_lock if write_lock is not None else nullcontext()):
+                    _reconcile_legacy_pending(database, config)
+                break
+            except sqlite3.OperationalError as exc:
+                if not _sqlite_write_busy(exc):
+                    raise
+                database.rollback()  # Retry a fresh write transaction, not BUSY_SNAPSHOT.
+                if stop_event.wait(0.15):
+                    raise Stopped
     # Indexed existence test replaces an unconditional project-wide COUNT.
     has_pending = database.execute(
         """SELECT 1 FROM captures c

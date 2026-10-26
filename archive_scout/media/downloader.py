@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from collections import deque
 import base64
 import hashlib
 import os
@@ -16,9 +17,11 @@ from ..cdx.client import HttpClient, RateLimitDeferred
 from ..config import ProjectConfig
 from ..downloads.redirects import make_replay_redirect_validator
 from ..database.repositories import blocked_site_reasons, record_error, record_site_issue, save_media_success
-from ..downloads.downloader import replay_url
+from ..downloads.downloader import replay_url, _storage_full, StorageFullError
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
 from ..downloads.validation import classify_exception
+from ..downloads.diagnostics import AcquisitionDiagnostics
+from ..downloads.checkpoint import sync_directory
 from ..content import classify_replay_content
 from ..events import ProgressEvent, Stopped
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
@@ -243,7 +246,12 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
         # The error remains a recoverable capture obligation in the database.
         temp.unlink(missing_ok=True)
         raise
+    # Match text acquisition's publication order: bytes reach storage before
+    # the filename and database claim a successfully retained media payload.
+    with temp.open('rb+') as handle:
+        os.fsync(handle.fileno())
     os.replace(temp, path)
+    sync_directory(path.parent)
     return {
         "id": int(row["id"]),
         "path": path,
@@ -260,38 +268,43 @@ def iter_media_download_rows(
     params: list[object],
     batch_size: int = 1000,
 ):
-    """Stream selected media rows using keyset pagination."""
+    """Freeze one disk-backed ordered queue; never sort shrinking history again.
+
+    The persistent index has download_attempts before length, and cannot serve
+    the old COALESCE(length) ordering. Repeating that sort every 1,000 captures
+    becomes quadratic over a large run. TEMP IDs stay on disk, while Python
+    holds at most one batch and the bounded in-flight workers.
+    """
     where = " AND ".join(clauses)
-    total = int(database.execute(
-        "SELECT COUNT(*) FROM media_captures WHERE " + where, params
-    ).fetchone()[0])
+    database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_download_queue")
+    database.execute("""CREATE TEMP TABLE archive_scout_media_download_queue(
+        id INTEGER PRIMARY KEY,priority INTEGER NOT NULL,length INTEGER NOT NULL) WITHOUT ROWID""")
+    database.execute("CREATE INDEX archive_scout_media_download_order ON archive_scout_media_download_queue(priority,length,id)")
+    selected = any('archive_scout_media_selection' in clause for clause in clauses)
+    source = ("archive_scout_media_selection selected CROSS JOIN media_captures ON media_captures.id=selected.id"
+              if selected else "media_captures")
+    database.execute("""INSERT INTO archive_scout_media_download_queue
+        SELECT media_captures.id,CASE WHEN COALESCE(media_captures.length,0)>0 THEN 0 ELSE 1 END,
+               MAX(COALESCE(media_captures.length,0),0) FROM """ + source + " WHERE " + where, params)
+    total = int(database.execute("SELECT COUNT(*) FROM archive_scout_media_download_queue").fetchone()[0])
 
     def rows():
-        last_length = 0
+        last_priority = -1
+        last_length = -1
         last_id = 0
         while True:
             batch = database.execute(
-                "SELECT * FROM media_captures WHERE " + where
-                + " AND COALESCE(length,0)>0 AND (COALESCE(length,0),id)>(?,?)"
-                + " ORDER BY COALESCE(length,0),id LIMIT ?",
-                [*params, last_length, last_id, max(1, int(batch_size))],
-            ).fetchall()
-            if not batch:
-                break
-            for row in batch:
-                last_length = max(0, int(row["length"] or 0))
-                last_id = int(row["id"])
-                yield row
-        last_id = 0
-        while True:
-            batch = database.execute(
-                "SELECT * FROM media_captures WHERE " + where
-                + " AND COALESCE(length,0)<=0 AND id>? ORDER BY id LIMIT ?",
-                [*params, last_id, max(1, int(batch_size))],
+                """SELECT mc.* FROM archive_scout_media_download_queue q
+                   CROSS JOIN media_captures mc ON mc.id=q.id
+                   WHERE (q.priority,q.length,q.id)>(?,?,?)
+                   ORDER BY q.priority,q.length,q.id LIMIT ?""",
+                (last_priority, last_length, last_id, max(1, int(batch_size))),
             ).fetchall()
             if not batch:
                 return
             for row in batch:
+                last_length = max(0, int(row["length"] or 0))
+                last_priority = int(last_length <= 0)
                 last_id = int(row["id"])
                 yield row
 
@@ -359,17 +372,20 @@ def download_media(
         params.extend(states)
     # Resolve MIME-vs-extension conflicts from proven text replay evidence
     # before opening media replay slots. Never skip a different timestamp.
-    with database:
-        database.execute(
-            """UPDATE media_captures SET state='skipped' WHERE state='pending'
+    if 'pending' in states:
+        with database:
+            database.execute(
+                """UPDATE media_captures SET state='skipped' WHERE query_signature=? AND state='pending'
                AND EXISTS (SELECT 1 FROM captures c JOIN capture_routing r ON r.capture_id=c.id
                  WHERE c.original_url=media_captures.original_url AND c.timestamp=media_captures.timestamp
-                   AND r.resource_class='text' AND r.evidence='payload:validated_text')"""
-        )
+                   AND r.resource_class='text' AND r.evidence='payload:validated_text')""",
+                (media_signature or direct_signature,),
+            )
     media_root = config.output_dir / "media"
     (media_root / "images").mkdir(parents=True, exist_ok=True)
     (media_root / "videos").mkdir(parents=True, exist_ok=True)
-    total, row_iter = iter_media_download_rows(database, clauses, params)
+    with database:
+        total, row_iter = iter_media_download_rows(database, clauses, params)
     if not total:
         if callback:
             callback(ProgressEvent("media_download", "No media captures to download.", 0, 0))
@@ -388,9 +404,11 @@ def download_media(
                 message = f"{reason}. Retry {attempt}/{total_attempts} in {wait_seconds:.1f}s…"
             callback(ProgressEvent(stage, message))
 
+    diagnostics = AcquisitionDiagnostics(config.output_dir, callback,
+        enabled=config.network.diagnostics, kind='media')
     client = HttpClient(
         limiter,
-        max(5, config.retries),
+        1 if config.network.persistent_retries else max(5, config.retries),
         max(config.connect_timeout, config.read_timeout),
         config.user_agent,
         stop_event,
@@ -404,8 +422,13 @@ def download_media(
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
+        coordinated_connection_recovery=config.network.coordinated_connection_recovery,
+        connection_failure_threshold=config.network.connection_failure_pause_threshold,
+        connection_retry_seconds=config.network.connection_retry_seconds,
+        response_callback=diagnostics.response,
     )
-    complete = errors = 0
+    complete = errors = saved = 0
+    recent_saves = deque()
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     blocked_hosts = blocked_site_reasons(database)
@@ -475,7 +498,10 @@ def download_media(
                     for pending in futures:
                         pending.cancel()
                     raise Stopped
-                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                done, _ = concurrent.futures.wait(futures, timeout=5.0, return_when=concurrent.futures.FIRST_COMPLETED)
+                if not done:
+                    diagnostics.summary(saved)
+                    continue
                 for future in done:
                     row, destination = futures.pop(future)
                     in_flight_paths.discard(destination)
@@ -486,10 +512,13 @@ def download_media(
                                 database, result["id"], result["path"], result["bytes"], result["hash"], result["status"], result["final_url"]
                             )
                             clear_media_retry(database, int(result["id"]))
+                        saved += 1
+                        recent_saves.append(time.monotonic())
                     except RateLimitDeferred as exc:
                         # Remote pause exhaustion belongs to the media retry
                         # inventory, never to the user's global Stop event.
                         errors += 1
+                        diagnostics.failure(row, 'rate_limit', exc)
                         with database:
                             database.execute("UPDATE media_captures SET state='error',updated_at=? WHERE id=?",
                                 (utc_now(), row["id"]))
@@ -504,8 +533,13 @@ def download_media(
                             database.execute("UPDATE media_captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))
                         raise
                     except Exception as exc:
+                        if _storage_full(exc):
+                            for pending in futures:
+                                pending.cancel()
+                            raise StorageFullError("storage full while retaining or committing media; progress preserved") from exc
                         errors += 1
                         category, status, retryable = classify_exception(exc)
+                        diagnostics.failure(row, category, exc)
                         issue_message = site_issue_message(
                             category, str(row["original_url"]), "media download", status
                         )
@@ -535,18 +569,25 @@ def download_media(
                             callback(ProgressEvent("site_issue", issue_message))
                     complete += 1
                     elapsed = max(0.001, time.monotonic() - started)
+                    now = time.monotonic()
+                    while recent_saves and recent_saves[0] <= now - 30.0:
+                        recent_saves.popleft()
+                    rate = len(recent_saves) / min(30.0, elapsed)
+                    diagnostics.summary(saved)
                     if callback:
                         callback(ProgressEvent(
                             "media_download",
-                            f"Media {complete:,}/{total:,}; errors {errors:,}; {complete/elapsed:.1f}/s",
+                            f"Media outcomes {complete:,}/{total:,}; saved {saved:,}; errors {errors:,}; "
+                            f"recent successful saves {rate:.1f}/s (30s)",
                             complete, total,
-                            {"errors": errors},
+                            {"errors": errors, "new_saves": saved, "rate": rate},
                         ))
                     submit_available()
     
     
     finally:
         client.close()
+        diagnostics.summary(saved, force=True)
 
 def retry_media_errors(
     config: ProjectConfig,
@@ -574,6 +615,13 @@ def retry_media_errors(
         selection_sql = " AND EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=mc.id)"
     last_id = 0
     active_signature = media_query_signature(config)
+    error_predicate = ("(e.retryable=1 OR e.category='missing_capture')"
+                       if selected or 'missing_capture' in config.retry_error_categories else "e.retryable=1")
+    category_sql = ""
+    if config.retry_error_categories:
+        category_sql = " AND e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")"
+    pending_clause = (" OR (mc.state='pending' AND mc.download_attempts>=?)"
+                      if not config.retry_error_categories else "")
     while True:
         if stop_event.is_set():
             raise Stopped
@@ -581,10 +629,11 @@ def retry_media_errors(
             """SELECT mc.id FROM media_captures mc WHERE mc.query_signature=? AND mc.id>? AND
                 ((mc.state='error' AND EXISTS (
                     SELECT 1 FROM errors e WHERE e.media_capture_id=mc.id
-                    AND e.resolved=0 AND e.ignored=0 AND e.retryable=1))
-                  OR (mc.state='pending' AND mc.download_attempts>=?))"""
+                    AND e.resolved=0 AND e.ignored=0 AND """ + error_predicate + category_sql + "))"
+            + pending_clause + ")"
             + selection_sql + " ORDER BY mc.id LIMIT 1000",
-            (active_signature, last_id, config.max_attempts),
+            (active_signature, last_id, *config.retry_error_categories,
+             *([config.max_attempts] if pending_clause else [])),
         ).fetchall()
         if not rows:
             break

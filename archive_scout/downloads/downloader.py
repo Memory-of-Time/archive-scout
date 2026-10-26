@@ -181,34 +181,35 @@ def prepare_download_rows(
     _populate_download_scopes(database, config)
     if not capture_ids:
         _restore_changed_url_filter_skips(database, config)
-    # Earlier releases stored redirect-policy refusals as nonretryable errors.
-    # Recheck only exclusions whose meaning changed under the current policy;
-    # keep their history until a real response establishes the new outcome.
-    redirect_categories = (("external_redirect_blocked",) if config.download_external_redirects
-                           else ("external_redirect_blocked", "live_redirect_blocked"))
-    database.execute("""UPDATE captures SET state='pending',updated_at=? WHERE state='error'
-        AND EXISTS(SELECT 1 FROM errors e WHERE e.capture_id=captures.id
-            AND e.operation='download' AND e.resolved=0 AND e.ignored=0
-            AND e.category IN (""" + ",".join("?" for _ in redirect_categories) + """))
-        AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-            ON s.pattern=t.pattern AND s.signature=captures.query_signature
-            WHERE t.id=captures.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
-                WHERE m.capture_id=captures.id AND m.target_id=t.id))""",
-        (utc_now(), *redirect_categories))
-    if config.download_external_redirects:
-        # This policy is intentionally adjustable on Resume. Earlier explicit
-        # redirect exclusions must not become permanent hidden omissions.
-        database.execute("""UPDATE captures SET state='pending',updated_at=?
-            WHERE state='skipped' AND EXISTS(SELECT 1 FROM capture_routing r
-                WHERE r.capture_id=captures.id AND r.routing='skipped_redirect_policy')
+    if not capture_ids:
+        # Earlier releases stored redirect-policy refusals as nonretryable errors.
+        # Recheck only exclusions whose meaning changed under the current policy;
+        # keep their history until a real response establishes the new outcome.
+        redirect_categories = (("external_redirect_blocked",) if config.download_external_redirects
+                               else ("external_redirect_blocked", "live_redirect_blocked"))
+        database.execute("""UPDATE captures SET state='pending',updated_at=? WHERE state='error'
+            AND EXISTS(SELECT 1 FROM errors e WHERE e.capture_id=captures.id
+                AND e.operation='download' AND e.resolved=0 AND e.ignored=0
+                AND e.category IN (""" + ",".join("?" for _ in redirect_categories) + """))
             AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
                 ON s.pattern=t.pattern AND s.signature=captures.query_signature
-                WHERE t.id=captures.target_id OR EXISTS(
-                    SELECT 1 FROM capture_target_membership m
-                    WHERE m.capture_id=captures.id AND m.target_id=t.id))""", (utc_now(),))
-        database.execute("""UPDATE capture_routing SET routing='pending',updated_at=?
-            WHERE routing='skipped_redirect_policy' AND EXISTS(SELECT 1 FROM captures c
-                WHERE c.id=capture_routing.capture_id AND c.state='pending')""", (utc_now(),))
+                WHERE t.id=captures.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
+                    WHERE m.capture_id=captures.id AND m.target_id=t.id))""",
+            (utc_now(), *redirect_categories))
+        if config.download_external_redirects:
+            # This policy is intentionally adjustable on Resume. Earlier explicit
+            # redirect exclusions must not become permanent hidden omissions.
+            database.execute("""UPDATE captures SET state='pending',updated_at=?
+                WHERE state='skipped' AND EXISTS(SELECT 1 FROM capture_routing r
+                    WHERE r.capture_id=captures.id AND r.routing='skipped_redirect_policy')
+                AND EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+                    ON s.pattern=t.pattern AND s.signature=captures.query_signature
+                    WHERE t.id=captures.target_id OR EXISTS(
+                        SELECT 1 FROM capture_target_membership m
+                        WHERE m.capture_id=captures.id AND m.target_id=t.id))""", (utc_now(),))
+            database.execute("""UPDATE capture_routing SET routing='pending',updated_at=?
+                WHERE routing='skipped_redirect_policy' AND EXISTS(SELECT 1 FROM captures c
+                    WHERE c.id=capture_routing.capture_id AND c.state='pending')""", (utc_now(),))
 
     source = "captures c"
     clauses: list[str] = []
@@ -221,7 +222,7 @@ def prepare_download_rows(
             "INSERT OR IGNORE INTO archive_scout_capture_selection(id) VALUES(?)",
             ((int(value),) for value in capture_ids),
         )
-        source += " JOIN archive_scout_capture_selection s ON s.id=c.id"
+        source = "archive_scout_capture_selection selected CROSS JOIN captures c ON c.id=selected.id"
     clauses.extend(["""EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
             ON s.pattern=t.pattern AND s.signature=c.query_signature
             WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
@@ -606,8 +607,9 @@ def download_archive(
         if not selected:
             raise ValueError("URL-only downloads require a selected keyword set")
         combined_patterns = ScanJob.create(0, selected[0].name, selected[0].rules).patterns
-    with database:
-        database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
+    if not capture_ids:
+        with database:
+            database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
     queue_started = time.monotonic()
     if callback:
         callback(ProgressEvent("download_prepare", "Preparing disk-backed text acquisition queue; committed progress is retained."))
@@ -653,7 +655,7 @@ def download_archive(
 
     client = HttpClient(
         limiter,
-        config.retries,
+        1 if config.network.persistent_retries else config.retries,
         max(config.connect_timeout, config.read_timeout),
         config.user_agent,
         stop_event,
@@ -684,6 +686,13 @@ def download_archive(
     scanner_failures: list[BaseException] = []
     scanner_thread = None
     if jobs and not acquire_only:
+        # Reconciliation is a connection/scope migration, not per-retry work.
+        # The owner survives recovery batches; each new scanner connection does
+        # not. Doing it here prevents a full historical scan for 20 retry IDs.
+        from ..scanning.pending import _reconcile_legacy_pending
+        for target in config.targets:
+            _reconcile_legacy_pending(database, config.for_target(target))
+
         def local_scanner() -> None:
             from ..scanning.pending import scan_pending_saved
             from ..database.connection import DATABASE_NAME
@@ -704,7 +713,7 @@ def download_archive(
                         # do not multiply network worker thread count here.
                         scan_pending_saved(connection, config.for_target(target), jobs,
                             stop_event, callback, workers=max(1, min(4, (os.cpu_count() or 2)//2)),
-                            write_lock=database_write_lock)
+                            write_lock=database_write_lock, reconcile_legacy=False)
                     if scanner_finish.is_set():
                         break
             except Stopped:

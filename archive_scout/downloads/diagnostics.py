@@ -7,6 +7,9 @@ import os
 import re
 import threading
 import time
+import sys
+import marshal
+import importlib
 from collections import Counter, deque
 from functools import lru_cache
 from pathlib import Path
@@ -24,7 +27,8 @@ def build_fingerprint():
     digest = hashlib.sha256()
     found = False
     for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
-                 'downloads/validation.py', 'network/transports.py', 'cdx/client.py'):
+                 'downloads/validation.py', 'network/transports.py', 'cdx/client.py',
+                 'media/indexer.py', 'media/downloader.py', 'media/embedded_pages.py', 'scanning/pending.py'):
         path = root / name
         if path.is_file():
             try:
@@ -33,6 +37,18 @@ def build_fingerprint():
                 continue
             found = True
             digest.update(name.encode()); digest.update(content)
+        else:
+            # PyInstaller usually ships code objects rather than .py files.
+            # Hash those as well, so packaged builds are attributable instead
+            # of every patched executable saying frozen-unfingerprinted.
+            try:
+                module = importlib.import_module('archive_scout.' + name[:-3].replace('/', '.'))
+                code = module.__spec__.loader.get_code(module.__name__)
+                if code is not None:
+                    digest.update(name.encode()); digest.update(marshal.dumps(code))
+                    found = True
+            except (AttributeError, ImportError, OSError):
+                continue
     return VERSION + ':' + (digest.hexdigest()[:16] if found else 'frozen-unfingerprinted')
 
 
@@ -49,21 +65,47 @@ def _safe_url(value):
         return '[invalid URL]'
 
 
+def _process_memory():
+    """One cheap process sample per health summary, with no new dependency."""
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            from ctypes import wintypes
+            class Counters(ctypes.Structure):
+                _fields_ = [('cb', wintypes.DWORD), ('faults', wintypes.DWORD)] + [
+                    (name, ctypes.c_size_t) for name in ('peak_working_set', 'working_set',
+                    'peak_paged', 'paged', 'peak_nonpaged', 'nonpaged', 'pagefile', 'peak_pagefile')]
+            value = Counters(); value.cb = ctypes.sizeof(value)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.c_void_p(-1), ctypes.byref(value), value.cb):
+                return {'rss_bytes': value.working_set, 'peak_rss_bytes': value.peak_working_set}
+        else:
+            import resource
+            value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return {'peak_rss_bytes': int(value * (1 if sys.platform == 'darwin' else 1024))}
+    except Exception:
+        pass
+    return {}  # Unsupported metrics must not affect acquisition.
+
+
 class AcquisitionDiagnostics:
     MAX_SAMPLES = 16
     MAX_SAMPLE_BYTES = 20 * 1024
 
-    def __init__(self, root, callback, *, enabled=True):
+    def __init__(self, root, callback, *, enabled=True, kind="text"):
         self.root, self.callback, self.enabled = Path(root), callback, enabled
+        self.kind = "media" if kind == "media" else "text"
         self.build = build_fingerprint()
         self.lock = threading.Lock()
         self.responses = Counter()
         self.timings = Counter()
+        self.timing_counts = Counter()
+        self.rejected_responses = Counter()
+        self.recent_responses = deque(maxlen=2048)
         self.controls = deque(maxlen=8)
         self.failures = Counter()
         self.samples = set()
         self.last_summary = time.monotonic()
-        self.summary_path = self.root / 'diagnostics' / 'text-acquisition'
+        self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
 
     def _emit(self, event):
         if self.callback:
@@ -78,8 +120,13 @@ class AcquisitionDiagnostics:
             return
         with self.lock:
             self.responses[str(detail['status'])] += 1
+            self.recent_responses.append((time.monotonic(), dict(detail)))
+            if detail.get('validation_rejected'):
+                self.rejected_responses[str(detail['status'])] += 1
             for key in ('gate_wait_seconds', 'request_turn_seconds', 'backend_elapsed_seconds'):
-                self.timings[key] += max(0.0, float(detail.get(key, 0)))
+                if key in detail:
+                    self.timings[key] += max(0.0, float(detail[key]))
+                    self.timing_counts[key] += 1
             if detail['status'] in (429, 503):
                 self.controls.append({**detail, 'url': _safe_url(detail.get('url', '')),
                                       'observed_at': utc_now()})
@@ -90,7 +137,7 @@ class AcquisitionDiagnostics:
             return
         if self.callback and self.failures[category] == 1:
             self._emit(ProgressEvent('acquisition_health',
-                f'Text acquisition failure [{category}] for capture {row["id"]}; '
+                f'{self.kind.title()} acquisition failure [{category}] for capture {row["id"]}; '
                 f'build {self.build}. Bounded diagnostic sampling is enabled.'))
         slot = int(hashlib.sha256((category + ':' + str(row['id'])).encode()).hexdigest()[:8], 16) % self.MAX_SAMPLES
         if slot in self.samples:
@@ -108,6 +155,8 @@ class AcquisitionDiagnostics:
                  'expected_cdx_digest': str(dict(row).get('digest') or '')[:100],
                  'exception_type': type(exc).__name__, 'evidence': evidence,
                  'notice': 'Unvalidated diagnostic prefixes. Never use as saved capture or resume proof.'}
+        if self.kind == 'media':
+            value['media_capture_id'] = value.pop('capture_id')
         encoded = json.dumps(value, ensure_ascii=True, sort_keys=True).encode()
         if len(encoded) > self.MAX_SAMPLE_BYTES:
             return
@@ -122,12 +171,26 @@ class AcquisitionDiagnostics:
 
     def snapshot(self):
         with self.lock:
-            count = max(1, sum(self.responses.values()))
+            cutoff = time.monotonic() - 30.0
+            while self.recent_responses and self.recent_responses[0][0] < cutoff:
+                self.recent_responses.popleft()
+            recent = [item for _, item in self.recent_responses]
+            def mean(key):
+                values = [float(item[key]) for item in recent if key in item]
+                return sum(values)/len(values) if values else None
             return {'build_id': self.build, 'response_counts': dict(self.responses),
+                    'validation_rejected_response_counts': dict(self.rejected_responses),
                     'failure_categories': dict(self.failures),
-                    'avg_gate_wait_seconds': self.timings['gate_wait_seconds']/count,
-                    'avg_request_turn_seconds': self.timings['request_turn_seconds']/count,
-                    'avg_backend_elapsed_seconds': self.timings['backend_elapsed_seconds']/count,
+                    'avg_gate_wait_seconds': self.timings['gate_wait_seconds']/max(1,self.timing_counts['gate_wait_seconds']),
+                    'avg_request_turn_seconds': self.timings['request_turn_seconds']/max(1,self.timing_counts['request_turn_seconds']),
+                    'avg_backend_elapsed_seconds': self.timings['backend_elapsed_seconds']/max(1,self.timing_counts['backend_elapsed_seconds']),
+                    'recent_30s': {'responses':len(recent),
+                        'mean_decoded_bytes':mean('decoded_bytes'),
+                        'mean_gate_wait_seconds':mean('gate_wait_seconds'),
+                        'mean_backend_elapsed_seconds':mean('backend_elapsed_seconds')},
+                    'process_cpu_seconds': time.process_time(),
+                    'process_threads': threading.active_count(),
+                    'memory': _process_memory(),
                     'recent_control_responses': list(self.controls)}
 
     def summary(self, saved, *, force=False):
@@ -146,7 +209,7 @@ class AcquisitionDiagnostics:
             pass
         if self.callback:
             self._emit(ProgressEvent('acquisition_health',
-                f"Text acquisition health: build {self.build}; new saves {saved:,}; "
+                f"{self.kind.title()} acquisition health: build {self.build}; new saves {saved:,}; "
                 f"failures {dict(self.failures)}; responses {detail['response_counts']}; "
                 f"mean gate wait {detail['avg_gate_wait_seconds']:.3f}s; "
                 f"mean backend transfer/write time {detail['avg_backend_elapsed_seconds']:.3f}s. "

@@ -13,6 +13,7 @@ from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.downloads.downloader import download_archive
 from archive_scout.downloads.rate_limit import reset_shared_traffic_state_for_tests
 from archive_scout.scanning.jobs import ScanJob
+from archive_scout.downloads.diagnostics import _process_memory
 
 
 def run(count:int=90)->dict:
@@ -43,10 +44,14 @@ def run(count:int=90)->dict:
             keyword_set_id=get_or_create_keyword_set(db,'Test',['needle'])
             run_id=start_scan_run(db,keyword_set_id,'loopback test',1,'all',{})
             db.commit()
-            samples=[];started=time.perf_counter()
+            samples=[];resources=[];started=time.perf_counter();cpu_started=time.process_time()
             def progress(e):
                 if e.stage=='download' and e.detail and e.detail.get('new_saves'):
                     samples.append((int(e.detail['new_saves']),time.perf_counter()-started))
+                    if len(resources)<3 and int(e.detail['new_saves']) >= (len(resources)+1)*count//3:
+                        resources.append({'saved':int(e.detail['new_saves']), 'elapsed_seconds':time.perf_counter()-started,
+                            'cpu_seconds':time.process_time()-cpu_started, 'threads':threading.active_count(),
+                            **_process_memory()})
             reset_shared_traffic_state_for_tests()
             try:
                 with patch('archive_scout.downloads.downloader.replay_url',return_value=f'http://127.0.0.1:{server.server_port}/data'):
@@ -69,7 +74,7 @@ def run(count:int=90)->dict:
                         'acquisition_seconds':round(acquisition_seconds,3),
                         'acquisition_saves_per_second':round(count/max(.001,acquisition_seconds),3),
                         'scan_drain_seconds':round(max(0,elapsed-acquisition_seconds),3),
-                        'segment_rates':windows,'sha256_verified':True,'scope':'localhost HTTP, not live Wayback'}
+                        'segment_rates':windows,'sha256_verified':True,'resource_samples':resources,'scope':'localhost HTTP, not live Wayback'}
             finally:db.close()
     finally:server.shutdown();server.server_close();thread.join(timeout=3)
 

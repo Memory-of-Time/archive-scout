@@ -84,6 +84,11 @@ def require_embedded_coverage(database: sqlite3.Connection, config: ProjectConfi
     """Every saved document and lookup must be accounted for before media I/O."""
     if not config.media.discover_embedded:
         return
+    if (config.media.snapshot_strategy == 'all' and database.execute(
+            'SELECT 1 FROM media_discovery_queue WHERE query_signature=? LIMIT 1', (signature,)).fetchone()
+            and not database.execute('SELECT 1 FROM project_meta WHERE key=?',
+                (f'media_embedded_pages_proof_v1:{signature}',)).fetchone()):
+        raise IndexCoveragePending('All-snapshot embedded lookup coverage needs page-proof revalidation')
     if database.execute("""SELECT 1 FROM documents d
         LEFT JOIN media_discovery_documents m ON m.document_id=d.id AND m.query_signature=?
         WHERE m.document_id IS NULL OR m.content_hash IS NOT d.content_hash LIMIT 1""",

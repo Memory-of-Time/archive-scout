@@ -879,7 +879,11 @@ def validate_cdx_scope(
         possible_host, _, possible_port = host_pattern.rpartition(":")
         if possible_port.isdigit():
             host_pattern, target_port = possible_host, int(possible_port)
-    suffix = host_pattern[2:] if host_pattern.startswith("*.") else ""
+    # A trailing URL wildcard can occur before any slash (e.g. *.site.org*).
+    # Such a glob is not a literal DNS suffix. Treating 'site.org*' as one
+    # rejects every valid row and causes an endless unverified-response loop.
+    suffix = host_pattern[2:] if (host_pattern.startswith("*.")
+                                 and not any(ch in host_pattern[2:] for ch in "*?[]")) else ""
     literal_host = not any(ch in host_pattern for ch in "*?[]")
     mode = str(match_type or "").casefold()
     # Never assume Java's default SURT matching equals a Python glob.
@@ -911,9 +915,12 @@ def validate_cdx_scope(
         elif mode == "domain" and literal_host:
             host_ok = hostname == host_pattern or hostname.endswith("." + host_pattern)
         elif literal_host:
-            host_ok = hostname == host_pattern
+            # IA's canonical URL keys can merge www and the bare host. A
+            # returned spelling of that same key is not an unrelated domain.
+            host_ok = hostname.removeprefix("www.") == host_pattern.removeprefix("www.")
         else:
-            host_ok = fnmatch.fnmatchcase(hostname, host_pattern)
+            host_ok = fnmatch.fnmatchcase(hostname, host_pattern) or (
+                host_pattern.startswith("*.") and fnmatch.fnmatchcase(hostname, host_pattern[2:]))
         if not host_ok:
             raise MalformedCDXResponse(
                 f"CDX local scope check rejected unrelated host {hostname!r} for target {target!r} "
@@ -1086,12 +1093,15 @@ def _request_resume(
         confirmation = request_cdx_rows(
             client, cdx_endpoints(config),
             build_cdx_params(config, target, current.start, current.end,
-                             current.resume_key, page_size=page_size),
-            max_bytes=cdx_response_budget(page_size), prefer_text=False,
+                             current.resume_key, page_size=page_size + 1),
+            max_bytes=cdx_response_budget(page_size + 1), prefer_text=False,
         )
-        if (confirmation.resume_key or len(confirmation.rows) != len(rows)
-                or confirmation.rows[:3] != rows[:3]
-                or confirmation.rows[-3:] != rows[-3:]):
+        if confirmation.resume_key and confirmation.resume_key != current.resume_key:
+            # The alternate response supplied the missing continuation. Accept
+            # its complete rows and cursor together, rather than rejecting the
+            # very evidence needed to leave this page.
+            return confirmation.rows, False, confirmation.resume_key
+        if confirmation.resume_key or confirmation.rows != rows:
             raise MalformedCDXResponse(
                 "Full-sized CDX page had no continuation token and alternate "
                 "serialization did not confirm terminal membership", splittable=False)

@@ -45,6 +45,8 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
     from ..coverage import require_media_coverage
     if additional_signature is None:
         require_media_coverage(db, config)
+    if not config.network.persistent_retries:
+        return  # A one-pass operation still reports remaining work incomplete.
     signatures = (additional_signature,) if additional_signature else (media_query_signature(config),)
     placeholders = ','.join('?' for _ in signatures)
     # Legacy retryable active errors are adopted once, preserving their old
