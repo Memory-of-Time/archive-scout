@@ -19,7 +19,7 @@ from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
 from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
-from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload
+from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload, summarize_cdx_error
 from .parallel import PageFetchResult, effective_page_workers, memory_limited_page_workers, iter_cdx_pages
 from .parameters import (
     build_cdx_params,
@@ -493,6 +493,16 @@ def _can_split_cdx_window(current: PendingWindow, exc: TransientRequestError) ->
     """
     if not exc.splittable or exc.connection_failed:
         return False
+    if current.resume_key and (
+        current.failures < 3
+        or (_query_is_oversized(exc) and current.page_size > 100)
+    ):
+        # A CDX cursor follows URL-key order, not date order. Splitting a
+        # progressed date range discards the cursor and repeats earlier work.
+        # Retry it first; explicit size pressure shrinks its page before any
+        # restart. Keep the existing eligible fallback after repeated failures
+        # so an unusable cursor cannot strand the remaining inventory forever.
+        return False
     if getattr(exc, "status", None) in {408, 425, 429, 500, 502, 503, 504}:
         return False
     # Some client aggregators wrap multiple endpoint errors in a single error.
@@ -769,24 +779,19 @@ def _defer_transient_window(
 
     wait_seconds = transient_backoff(config, current.failures)
     if yield_to_other_tasks:
-        emit(callback, ProgressEvent("index", "Deferred one failed target; other unfinished targets will run while this exact cursor cools down.", completed_windows, total_windows))
+        emit(callback, ProgressEvent("index", "Deferred one failed target; other unfinished targets will run while this exact cursor cools down. "
+             + summarize_cdx_error(exc), completed_windows, total_windows, {"retain_notice": True}))
         return error_id
-    if not _can_split_cdx_window(current, exc):
-        emit(callback, ProgressEvent(
-            "index", ("CDX response failed validation" if isinstance(exc, MalformedCDXResponse) else "CDX service failure")
-            + f" for {window_label(current.start, current.end)}: "
-            f"keeping original saved date range and page size; {type(exc).__name__}: {str(exc)[:180]}",
-            completed_windows, total_windows,
-        ))
     emit(
         callback,
         ProgressEvent(
             "index",
             ("CDX response remains unverified; checkpoint retained" if isinstance(exc, MalformedCDXResponse)
              else "Wayback request remains unavailable; checkpoint retained")
-            + f". Retrying in {wait_seconds:.1f}s (attempt {current.failures + 1}).",
+            + f". {summarize_cdx_error(exc)}. Retrying in {wait_seconds:.1f}s (attempt {current.failures + 1}).",
             completed_windows,
             total_windows,
+            {"retain_notice": True, "failures": current.failures},
         ),
     )
     stop_event.wait(wait_seconds)
@@ -817,7 +822,7 @@ def _client_for_config(
         else:
             message = f"CDX request failed ({reason}). Retrying attempt {attempt}/{total} in {wait_seconds:.1f}s…"
             stage = "index"
-        emit(callback, ProgressEvent(stage, message))
+        emit(callback, ProgressEvent(stage, message, detail={"retain_notice": True}))
 
     def on_network(message: str) -> None:
         emit(callback, ProgressEvent("network", message))
@@ -1619,9 +1624,12 @@ def index_archive(
                         callback,
                         ProgressEvent(
                             "index",
-                            f"{target} {label}: received {received:,}, stored {changed:,}, seen {seen:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                            f"{target} {label}: received {received:,}, stored {changed:,}, seen {seen:,}; network/parse/scope {request_seconds:.1f}s, database {write_seconds:.2f}s",
                             completed_windows,
                             total_windows,
+                            {"retain_notice": True, "received": received, "stored": changed,
+                             "seen": seen, "request_parse_scope_seconds": request_seconds,
+                             "database_seconds": write_seconds},
                         ),
                     )
                     # Do not retain the previous 50k-row page while the next
@@ -1706,7 +1714,8 @@ def index_archive(
                         4 if exc.timed_out else 6,
                     )
                     if transient_failure_streak >= no_progress_limit:
-                        current.failures += 1
+                        # _defer_transient_window counts this failed turn once.
+                        # The threshold notice must not escalate its cooldown.
                         with database:
                             error_id = record_error(database, "index", "transient_index_delay",
                                 f"{target} {label}: {transient_failure_streak} temporary failures: {exc}", retryable=True)
@@ -1738,7 +1747,9 @@ def index_archive(
                             total_windows += added
                             with database:
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split {target} {label} into {len(parts)} smaller windows (unfinished ranges retained).", completed_windows, total_windows))
+                            reason = ("; last-resort restart after repeated failures at the saved cursor"
+                                      if current.resume_key else "")
+                            emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split {target} {label} into {len(parts)} smaller windows (unfinished ranges retained{reason}).", completed_windows, total_windows, {"retain_notice": True}))
                             continue
                         if not target_config.cdx_collapses and _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
                             current.strategy = "paged"

@@ -106,6 +106,7 @@ class AcquisitionDiagnostics:
         self.samples = set()
         self.phase_saved_base = 0
         self.batch_saved = 0
+        self.batch_metrics = None
         self.last_summary = time.monotonic()
         self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
 
@@ -116,6 +117,7 @@ class AcquisitionDiagnostics:
         self.phase_saved_base += self.batch_saved
         self.batch_saved = 0
         self.callback = callback
+        self.batch_metrics = None
 
     def _emit(self, event):
         if self.callback:
@@ -221,6 +223,11 @@ class AcquisitionDiagnostics:
             return
         self.last_summary = time.monotonic()
         detail = self.snapshot()
+        if self.batch_metrics is not None:
+            try:
+                detail['acquisition'] = self.batch_metrics()
+            except Exception:
+                pass  # Diagnostics must not affect saved evidence or retries.
         detail['new_saves'] = total_saved
         detail['batch_new_saves'] = saved
         try:
@@ -232,9 +239,16 @@ class AcquisitionDiagnostics:
         except OSError:
             pass
         if self.callback:
+            metrics = detail.get('acquisition', {})
+            stages = (f"workers {metrics['configured_workers']}; "
+                f"running {metrics['running_tasks']}; completed awaiting owner {metrics['completed_waiting_owner']}; "
+                f"mean owner commit/write wait {self._timing(metrics['avg_owner_commit_seconds'])}; "
+                f"mean payload publication {self._timing(metrics['avg_payload_publication_seconds'])}; "
+                f"queue preparation {metrics['queue_preparation_seconds']:.3f}s. "
+                if metrics else '')
             self._emit(ProgressEvent('acquisition_health',
                 f"{self.kind.title()} acquisition health: build {self.build}; new saves {total_saved:,}; "
                 f"failures {dict(self.failures)}; responses {detail['response_counts']}; "
                 f"mean gate wait {self._timing(detail['avg_gate_wait_seconds'])}; "
                 f"mean backend transfer/write time {self._timing(detail['avg_backend_elapsed_seconds'])}. "
-                'Unfinished captures remain checkpointed.', detail=detail))
+                + stages + 'Unfinished captures remain checkpointed.', detail=detail))

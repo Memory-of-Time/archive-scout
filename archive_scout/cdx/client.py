@@ -33,6 +33,7 @@ from ..network.transports import (
     is_transport_connection_failure,
     is_transport_read_timeout,
     is_transport_timeout,
+    exception_chain,
 )
 from ..runtime import ensure_frozen_bundle_available, frozen_bundle_error_from_exception, is_missing_frozen_bundle_error
 from ..utils import clean_space
@@ -61,6 +62,14 @@ class TransientRequestError(RuntimeError):
 
 class MalformedCDXResponse(TransientRequestError):
     """A successful CDX response whose body cannot be parsed safely."""
+
+
+def summarize_cdx_error(error: BaseException, limit: int = 260) -> str:
+    """Keep a bounded underlying reason visible without logging query URLs."""
+    chain = list(exception_chain(error))
+    leaf = chain[-1] if chain else error
+    message = re.sub(r'https?://[^\s<>"\']+', '[URL]', str(leaf))
+    return (type(leaf).__name__ + ': ' + clean_space(message))[:limit]
 
 
 class PermanentRequestError(RuntimeError):
@@ -639,10 +648,10 @@ class HttpClient:
             return
         status = getattr(failure, "status", None)
         reason = f"HTTP {status}" if status else type(failure).__name__
-        detail = str(failure).replace("\n", " ")[:130]
+        detail = summarize_cdx_error(failure)
         next_step = f"trying {next_endpoint}" if next_endpoint else "all configured services exhausted"
         self.retry_callback(1, 1, (
-            f"Endpoint unavailable: {endpoint}; {reason}: {detail}; "
+            f"CDX endpoint attempt failed: {endpoint}; {reason}: {detail}; "
             f"elapsed {elapsed:.1f}s; {next_step} (indexing checkpoint retained)"
         ), 0.0)
 

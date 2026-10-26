@@ -745,6 +745,7 @@ def download_archive(
                    "file_fsync_publish_seconds": 0.0,
                    "database_commit_seconds": 0.0,
                    "samples": 0}
+    stage_samples = {"network_and_pacing_seconds": 0, "file_fsync_publish_seconds": 0}
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     last_completion = time.monotonic()
@@ -753,6 +754,29 @@ def download_archive(
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-scout") as pool:
             futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
+
+            def batch_metrics() -> dict:
+                # Called only at the existing 30-second health interval and
+                # final summary. No new per-capture I/O, queue or sampling task.
+                samples = stage_stats['samples']
+                return {
+                    'configured_workers': config.workers,
+                    'download_delay_seconds': config.download_delay,
+                    'queued_running_tasks': len(futures),
+                    'running_tasks': sum(f.running() for f in futures),
+                    'completed_waiting_owner': sum(f.done() for f in futures),
+                    'scanner_active': scanner_thread is not None and scanner_thread.is_alive(),
+                    'queue_preparation_seconds': queue_preparation_seconds,
+                    'initial_queue_size': initial_queue_size,
+                    'committed_samples': samples,
+                    'avg_owner_commit_seconds': stage_stats['database_commit_seconds']/samples if samples else None,
+                    'avg_payload_publication_seconds': (stage_stats['file_fsync_publish_seconds']
+                        / stage_samples['file_fsync_publish_seconds'] if stage_samples['file_fsync_publish_seconds'] else None),
+                    'avg_acquisition_seconds': (stage_stats['network_and_pacing_seconds']
+                        / stage_samples['network_and_pacing_seconds'] if stage_samples['network_and_pacing_seconds'] else None),
+                }
+
+            diagnostics.batch_metrics = batch_metrics
     
             fresh_admitted = 0
 
@@ -849,7 +873,9 @@ def download_archive(
                             stage_stats["samples"] += 1
                             stage_stats["database_commit_seconds"] += time.monotonic()-commit_started
                             for stage in ("network_and_pacing_seconds", "file_fsync_publish_seconds"):
-                                stage_stats[stage] += float(result.get(stage, 0.0))
+                                if stage in result:
+                                    stage_stats[stage] += float(result[stage])
+                                    stage_samples[stage] += 1
                         except Exception:
                             # Publish rescue state and its scan error together
                             # in the outer handler. A scanner must not race a
@@ -1081,7 +1107,10 @@ def download_archive(
             client.close()
         if scanner_thread is not None and reconciliation_finished:
             mark_reconciled(database, config)
-        diagnostics.summary(saved_this_pass, force=True)
+        try:
+            diagnostics.summary(saved_this_pass, force=True)
+        finally:
+            diagnostics.batch_metrics = None  # do not retain this batch's owners
     if scanner_failures:
         raise RuntimeError("background scanner failed; retained bodies remain recoverable") from scanner_failures[0]
     # Final safeguard catches a small race between the last network commit and

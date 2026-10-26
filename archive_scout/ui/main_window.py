@@ -2008,7 +2008,9 @@ class ArchiveScoutApp(tk.Tk):
     def on_engine_event(self, event: ProgressEvent) -> None:
         # Routine download counters are presentation-only, coalesced in one slot.
         # Engine callbacks, local scanning, and CLI output are unchanged.
-        if event.stage == "download" and event.detail and "attempt_outcomes" in event.detail:
+        if event.detail and event.detail.get("retain_notice"):
+            self.events.put_notice(event)
+        elif event.stage == "download" and event.detail and "attempt_outcomes" in event.detail:
             self.events.put_acquisition(event)
         elif event.stage in {"site_issue", "acquisition_stall", "storage_full", "redirect_skipped", "acquisition_health"}:
             self.events.put_notice(event)
