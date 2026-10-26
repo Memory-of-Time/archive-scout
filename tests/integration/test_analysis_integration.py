@@ -14,6 +14,24 @@ from archive_scout.utils import hash_text, normalize_search
 
 
 class AnalysisIntegrationTests(unittest.TestCase):
+    def test_analysis_source_requires_exact_bytes_for_lf_and_crlf(self):
+        from archive_scout.analysis.workflow import _read_source
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "source.html"
+            for newline in ("\n", "\r\n"):
+                with self.subTest(newline=repr(newline)):
+                    raw = f"<html>café{newline}second line</html>"
+                    path.write_bytes(raw.encode("utf-8"))
+                    self.assertEqual(
+                        _read_source(str(path), "text/html; charset=utf-8", hash_text(raw)),
+                        raw,
+                    )
+                    changed = raw.replace(newline, "\r\n" if newline == "\n" else "\n")
+                    path.write_bytes(changed.encode("utf-8"))
+                    with self.assertRaisesRegex(RuntimeError, "differs from recorded raw evidence"):
+                        _read_source(str(path), "text/html; charset=utf-8", hash_text(raw))
+
     def test_analysis_workflow_builds_all_core_outputs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -36,7 +54,8 @@ class AnalysisIntegrationTests(unittest.TestCase):
             upsert_captures(database, [row], target_id, "sig")
             capture_id = database.execute("SELECT id FROM captures").fetchone()[0]
             path = root / "thread.html"
-            path.write_text(raw, encoding="utf-8")
+            # Persist exactly the UTF-8 bytes recorded by hash_text on every OS.
+            path.write_bytes(raw.encode("utf-8"))
             upsert_document(
                 database,
                 capture_id,
@@ -89,7 +108,7 @@ class AnalysisIntegrationTests(unittest.TestCase):
             upsert_captures(database, [row], target_id, "sig")
             capture_id = database.execute("SELECT id FROM captures").fetchone()[0]
             path = root / "external.html"
-            path.write_text(raw, encoding="utf-8")
+            path.write_bytes(raw.encode("utf-8"))
             upsert_document(
                 database, capture_id, path, "External", "External player",
                 ["http://cdn.example.net/player.swf"], hash_text(raw),
