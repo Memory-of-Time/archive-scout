@@ -24,6 +24,7 @@ from ..cdx.indexer import (
     encode_plan,
     index_windows,
     validate_cdx_scope,
+    record_recovery_event,
     uncovered_index_ranges,
     _reconcile_paged_completion,
     _query_is_oversized,
@@ -871,12 +872,19 @@ def index_direct_media(
                         nonlocal received, accepted_count, changed, write_seconds, seen
                         if result.resume_key is not None:
                             raise TransientRequestError("numbered media page advertised unresolved continuation", splittable=False)
-                        validate_cdx_scope(result.rows,target,current.start,current.end,target_config.cdx_filters,target_config.cdx_match_type)
                         page_received = len(result.rows)
+                        excluded_hosts = validate_cdx_scope(
+                            result.rows,target,current.start,current.end,
+                            target_config.cdx_filters,target_config.cdx_match_type,
+                            discard_adjacent_surt_hosts=True)
                         accepted = _accept_media_rows(result.rows, media)
                         write_started = time.monotonic()
                         with database:
                             changed += upsert_media_captures(database, accepted, target_id, signature)
+                            if excluded_hosts:
+                                record_recovery_event(database, "media_index", "cdx_adjacent_host_excluded",
+                                    f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from media page {result.page}",
+                                    details={"excluded":excluded_hosts,"page":result.page,"raw_rows":page_received})
                             # No page is accepted without its durable ledger.
                             database.execute("""INSERT OR REPLACE INTO media_index_pages
                                 (target_id,year,state_signature,window_start,window_end,layout_signature,page,row_count,updated_at)
@@ -994,11 +1002,15 @@ def index_direct_media(
                 rows, finished, next_cursor = _request_media_resume(
                     target_config, client, target, current, extensions
                 )
-                validate_cdx_scope(rows,target,current.start,current.end,target_config.cdx_filters,target_config.cdx_match_type)
+                raw_received = len(rows)
+                excluded_hosts = validate_cdx_scope(
+                    rows,target,current.start,current.end,
+                    target_config.cdx_filters,target_config.cdx_match_type,
+                    discard_adjacent_surt_hosts=True)
                 connection_failure_streak = 0
                 transient_failure_streak = 0
                 request_seconds = time.monotonic() - request_started
-                received = len(rows)
+                received = raw_received
                 accepted = _accept_media_rows(rows, media)
                 accepted_count = len(accepted)
                 write_started = time.monotonic()
@@ -1008,6 +1020,10 @@ def index_direct_media(
                 try:
                     with database:
                         changed = upsert_media_captures(database, accepted, target_id, signature)
+                        if excluded_hosts:
+                            record_recovery_event(database, "media_index", "cdx_adjacent_host_excluded",
+                                f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from media continuation",
+                                details={"excluded":excluded_hosts,"raw_rows":received})
                         seen += received
                         current.failures = 0
                         if next_cursor is not None:
@@ -1033,7 +1049,8 @@ def index_direct_media(
                     callback(
                         ProgressEvent(
                             "media_index",
-                            f"{target} {label}: received {received:,}, accepted {accepted_count:,}, stored {changed:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                            f"{target} {label}: received {received:,}, accepted {accepted_count:,}, stored {changed:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s"
+                            + (f"; excluded {excluded_hosts:,} adjacent out-of-scope host rows" if excluded_hosts else ""),
                             completed,
                             total,
                         )
