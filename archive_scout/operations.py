@@ -396,7 +396,7 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
 
 
 def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000,
-                           include_exhausted_pending: bool = False, respect_selection: bool = False):
+                           include_exhausted_pending: bool = False, respect_selection: bool = False, automatic: bool = False):
     """Yield each eligible capture at most once per pass, without an ID-sized list."""
     # Reuse a bounded, disk-backed scope table so target-specific CDX overrides
     # are not silently filtered out by the global signature on retry.
@@ -409,9 +409,11 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         ((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
          for target in config.targets for scoped in [config.for_target(target)]),
     )
-    from .downloads.schedule import retry_selection, explicit_error_predicate
+    from .downloads.schedule import retry_selection, explicit_error_predicate, automatic_retry_allowed, explicit_recheck_requested, selected_retry_allowed
     selection, selected_params = retry_selection(database, config) if respect_selection else ("", [])
-    error_predicate = explicit_error_predicate(config) if respect_selection else 'e.retryable=1'
+    manual = not automatic and respect_selection and explicit_recheck_requested(config)
+    error_predicate = explicit_error_predicate(config) if manual else 'e.retryable=1'
+    latest_decision = ' AND '+(selected_retry_allowed() if manual else automatic_retry_allowed())
     last_id = 0
     while True:
         # Explicit retry includes pending captures which a lifetime attempt
@@ -431,7 +433,7 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
                    AND (NOT EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id)
                         OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
                                    AND sched.next_eligible_at<=?)))"""
-            + exhausted + ")" + selection + " ORDER BY c.id LIMIT ?",
+            + exhausted + ")" + latest_decision + selection + " ORDER BY c.id LIMIT ?",
             (last_id, time.time(), *([config.max_attempts] if include_exhausted_pending else []),
              *selected_params, batch_size),
         ).fetchall()
@@ -481,7 +483,7 @@ def recover_transient_text_errors(
     while True:
         attempted = 0
         made_progress = False
-        for ids in _retryable_text_batches(config, database, respect_selection=respect_selection):
+        for ids in _retryable_text_batches(config, database, respect_selection=respect_selection, automatic=True):
             if stop_event.is_set():
                 raise Stopped
             attempted += len(ids)
@@ -499,7 +501,7 @@ def recover_transient_text_errors(
         elif attempted:
             budget.attempted()
         remaining = next(_retryable_text_batches(config, database, batch_size=1,
-                                                respect_selection=respect_selection), [])
+                                                respect_selection=respect_selection, automatic=True), [])
         from .downloads.schedule import next_due
         earliest = next_due(database, config, respect_selection=respect_selection)
         if not remaining and earliest is None:

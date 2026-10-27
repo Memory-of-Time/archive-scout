@@ -10,7 +10,7 @@ from ..events import ProgressEvent
 from ..scanning.jobs import ScanJob
 from ..scanning.rescanner import rescan_documents, rescan_keyword_sets
 from .downloader import download_archive, _populate_download_scopes
-from .schedule import explicit_error_predicate
+from .schedule import explicit_error_predicate, automatic_retry_allowed, explicit_recheck_requested, selected_retry_allowed
 
 
 def retry_error_urls(
@@ -28,6 +28,8 @@ def retry_error_urls(
             ON s.pattern=t.pattern AND s.signature=c.query_signature
             WHERE t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
                 WHERE m.capture_id=c.id AND m.target_id=t.id)))"""]
+    clauses.append(selected_retry_allowed('e.capture_id') if explicit_recheck_requested(config)
+                   else automatic_retry_allowed('e.capture_id'))
     params: list[object] = []
     if config.retry_error_categories:
         clauses.append("e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")")

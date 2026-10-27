@@ -643,11 +643,16 @@ def retry_media_errors(
         selection_sql = " AND EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=mc.id)"
     last_id = 0
     active_signature = media_query_signature(config)
-    error_predicate = ("(e.retryable=1 OR e.category='missing_capture')"
-                       if selected or 'missing_capture' in config.retry_error_categories else "e.retryable=1")
+    error_predicate = ("(e.retryable=1 OR e.category IN ('missing_capture','oversized_response'))"
+                       if selected or {'missing_capture','oversized_response'} & set(config.retry_error_categories)
+                       else "e.retryable=1")
     category_sql = ""
     if config.retry_error_categories:
         category_sql = " AND e.category IN (" + ",".join("?" for _ in config.retry_error_categories) + ")"
+    deliberate = bool(selected or {'missing_capture','oversized_response'} & set(config.retry_error_categories))
+    latest_decision = (" AND NOT EXISTS(SELECT 1 FROM media_retry_decisions latest WHERE latest.media_capture_id=mc.id "
+                       "AND latest.retryable=0" +
+                       (" AND latest.category NOT IN ('missing_capture','oversized_response')" if deliberate else '') + ")")
     pending_clause = (" OR (mc.state='pending' AND mc.download_attempts>=?)"
                       if not config.retry_error_categories else "")
     while True:
@@ -659,7 +664,7 @@ def retry_media_errors(
                     SELECT 1 FROM errors e WHERE e.media_capture_id=mc.id
                     AND e.resolved=0 AND e.ignored=0 AND """ + error_predicate + category_sql + "))"
             + pending_clause + ")"
-            + selection_sql + " ORDER BY mc.id LIMIT 1000",
+            + latest_decision + selection_sql + " ORDER BY mc.id LIMIT 1000",
             (active_signature, last_id, *config.retry_error_categories,
              *([config.max_attempts] if pending_clause else [])),
         ).fetchall()

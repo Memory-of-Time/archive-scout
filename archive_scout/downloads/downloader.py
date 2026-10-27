@@ -30,7 +30,7 @@ from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
-from .schedule import record_failure, clear_retry, prepare_retry_queue, select_due_retry
+from .schedule import record_failure, clear_retry, prepare_retry_queue, select_due_retry, automatic_retry_allowed, restore_increased_size_limit
 from .checkpoint import write_receipt, discard_receipt, sync_directory
 from .diagnostics import AcquisitionDiagnostics
 from .redirects import make_replay_redirect_validator
@@ -182,6 +182,7 @@ def prepare_download_rows(
     _populate_download_scopes(database, config)
     if not capture_ids:
         _restore_changed_url_filter_skips(database, config)
+        restore_increased_size_limit(database, config)
     if not capture_ids:
         # Earlier releases stored redirect-policy refusals as nonretryable errors.
         # Recheck only exclusions whose meaning changed under the current policy;
@@ -243,6 +244,7 @@ def prepare_download_rows(
                      OR EXISTS(SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=c.id
                                 AND s.next_eligible_at<=?))))""")
             params.append(time.time())
+            clauses.append("(c.state!='error' OR " + automatic_retry_allowed() + ")")
 
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     cursor = database.execute(
@@ -742,6 +744,7 @@ def download_archive(
         scanner_thread.start()
         scanner_wakeup.set()
     completed = matched = failures = saved_this_pass = 0
+    held_failures = oversized_failures = 0
     recent_commits: deque[float] = deque()
     stage_stats = {"network_and_pacing_seconds": 0.0,
                    "file_fsync_publish_seconds": 0.0,
@@ -961,8 +964,10 @@ def download_archive(
                                              capture_id=int(row["id"]), retryable=False)
                                 database.execute("UPDATE capture_routing SET routing='failed_redirect_policy',updated_at=? WHERE capture_id=?",
                                                  (utc_now(), row["id"]))
-                                clear_retry(database, int(row["id"]))
+                                record_failure(database,int(row['id']),exc.category,None,False,
+                                    config.network.retry_base_seconds,config.network.retry_max_seconds)
                             failures += 1
+                            held_failures += 1
                             diagnostics.failure(row, exc.category, exc)
                         else:
                             outcome_state = 'skipped'
@@ -989,6 +994,9 @@ def download_archive(
                             category, status, retryable = classify_exception(exc)
                         if retained_after_failure is not None:
                             category, status, retryable = 'scan_commit_failure', retained_after_failure['http_status'], True
+                        if not retryable:
+                            held_failures += 1
+                            oversized_failures += int(category=='oversized_response')
                         issue_message = site_issue_message(
                             category, str(row["original_url"]), "text download", status
                         )
@@ -1023,7 +1031,7 @@ def download_archive(
                             else:
                                 record_failure(database, int(row["id"]), category, status, retryable,
                                                config.network.retry_base_seconds,
-                                               config.network.retry_max_seconds)
+                                               config.network.retry_max_seconds, max_bytes=config.max_file_bytes)
                             if should_surface_site_issue(category):
                                 record_site_issue(
                                     database,
@@ -1113,6 +1121,14 @@ def download_archive(
             diagnostics.summary(saved_this_pass, force=True)
         finally:
             diagnostics.batch_metrics = None  # do not retain this batch's owners
+    if callback and held_failures:
+        size_detail = (f" {oversized_failures:,} exceeded the configured text size limit "
+                       f"({config.max_file_mb:g} MiB); increasing that limit makes them eligible again."
+                       if oversized_failures else '')
+        callback(ProgressEvent('download_incomplete',
+            f"{held_failures:,} capture(s) remain unfinished with automatic replay retries held for their latest outcome."
+            + size_detail + " Review Errors for the current reason; size-limit and missing-capture outcomes support an explicit selected-error recheck.",
+            detail={'held_failures':held_failures,'oversized_failures':oversized_failures,'retain_notice':True}))
     if scanner_failures:
         raise RuntimeError("background scanner failed; retained bodies remain recoverable") from scanner_failures[0]
     # Final safeguard catches a small race between the last network commit and
