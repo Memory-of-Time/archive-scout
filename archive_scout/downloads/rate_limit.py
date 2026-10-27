@@ -139,13 +139,18 @@ class SharedHostGate:
                     "remaining_pause": max(0.0, self.blocked_until-time.monotonic()),
                     "reason": self.reason}
 
-    def acquire_request(self, stop_event: threading.Event) -> HostPermit:
+    def acquire_request(self, stop_event: threading.Event, *, deadline: float | None = None) -> HostPermit:
         while True:
             with self.condition:
                 if stop_event.is_set():
                     raise Stopped
                 now = time.monotonic()
                 remaining = self.blocked_until - now
+                if deadline is not None and ((remaining > 0 and self.blocked_until >= deadline)
+                        or (now >= deadline and self.probe_inflight)):
+                    from ..cdx.client import RateLimitDeferred
+                    raise RateLimitDeferred('Shared Wayback cooldown exceeds this request turn; checkpoint retained',
+                                            status=429, waited=0)
                 if remaining > 0:
                     self.waiting_workers += 1
                     try:

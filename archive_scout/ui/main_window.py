@@ -54,7 +54,7 @@ from ..runtime import FrozenBundleError, bundled_resource, ensure_frozen_bundle_
 from ..scanning.full_text import search_documents
 from ..utils import normalize_cdx_date, normalize_target
 from ..projects.backups import list_project_backups, restore_project_backup
-from .dashboard import read_dashboard_counts, format_media_policy_summary
+from .dashboard import format_capture_accounting, read_dashboard_counts, format_media_policy_summary
 from .dashboard_refresh import DashboardRefreshController
 from .eta import OperationEtaTracker
 from .event_queue import CoalescingEventQueue
@@ -477,7 +477,7 @@ class ArchiveScoutApp(tk.Tk):
             ttk.Label(card, textvariable=variable, style="CardValue.TLabel").pack(anchor="w", pady=(5, 0))
         status = ttk.Frame(tab, padding=(4, 10, 4, 0))
         status.grid(row=3, column=0, columnspan=4, sticky="ew")
-        ttk.Label(status, text="Pending text:").pack(side="left")
+        ttk.Label(status, text="Pending captures:").pack(side="left")
         ttk.Label(status, textvariable=self.dashboard_pending_var).pack(side="left", padx=(4, 16))
         ttk.Label(status, text="Saved unscanned:").pack(side="left")
         ttk.Label(status, textvariable=self.dashboard_waiting_scan_var).pack(side="left", padx=(4, 16))
@@ -509,10 +509,10 @@ class ArchiveScoutApp(tk.Tk):
             justify="left", wraplength=1100,
         ).pack(fill="x", anchor="w", pady=(8, 0))
 
-        outcomes = ttk.LabelFrame(tab, text="Other outcomes", padding=10)
+        outcomes = ttk.LabelFrame(tab, text="Indexed capture accounting (entire project)", padding=10)
         outcomes.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Label(outcomes, textvariable=self.dashboard_failure_summary_var, justify="left", wraplength=1080).pack(fill="x")
-        ttk.Label(outcomes, text="Skips and deferred media are intentional outcomes; open error records can include several records for one failed capture.", style="Muted.TLabel", wraplength=1080).pack(fill="x", pady=(4,0))
+        ttk.Label(outcomes, text="Counts are snapshot records across the entire project, not unique URLs or just the current selection. Pending includes records awaiting classification. Saved unscanned is part of Saved documents. Media has its own inventory; open errors are incidents, not additional captures.", style="Muted.TLabel", wraplength=1080).pack(fill="x", pady=(4,0))
 
         actions = ttk.LabelFrame(tab, text="Project maintenance", padding=12)
         actions.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(14, 0), padx=(0, 6))
@@ -1233,7 +1233,7 @@ class ArchiveScoutApp(tk.Tk):
             ttk.Entry(recovery, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
         ttk.Checkbutton(recovery, text="Experimental: coordinate recovery after confirmed host connection failures", variable=self.network_connection_gate_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 2))
-        ttk.Label(recovery, text="Persistent recovery retains failures for later attempts. The experimental connection gate above is optional. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(recovery, text="Recovery retries automatically within a bounded no-progress budget. If no progress is possible, reports are saved with an incomplete result; Resume retries retained work. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         redirects = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
         redirects.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)
@@ -3384,15 +3384,7 @@ class ArchiveScoutApp(tk.Tk):
         self.dashboard_media_excluded_var.set(display_count("media_excluded"))
         self.dashboard_media_errors_var.set(display_count("media_errors"))
         self.dashboard_media_deferred_var.set(display_count("media_deferred_from_text"))
-        self.dashboard_failure_summary_var.set(
-            "Other outcomes — "
-            f"non-text/media excluded {display_count('skipped_non_text')} • "
-            f"URL-filter skips {display_count('skipped_url_filter')} • "
-            f"media handoffs {display_count('deferred_to_media')} • "
-            f"other skips {display_count('skipped_other')} • "
-            f"failed captures {display_count('failed_captures')} • "
-            f"recovered incidents {display_count('recovery_events')}"
-        )
+        self.dashboard_failure_summary_var.set(format_capture_accounting(counts))
         if counts.get("_exact", True):
             label = "Exact counts refreshed "
         else:

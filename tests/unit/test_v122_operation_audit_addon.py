@@ -169,9 +169,9 @@ class OperationAuditRegressions(unittest.TestCase):
                 tid=get_or_create_target(db,cfg.targets[0]);
                 add_capture(db,tid,cdx_query_signature(cfg),'http://example.org/missing',state='downloaded_unscanned');db.commit()
             finally: db.close()
-            with self.assertRaises(IncompleteCoverage) as observed:
-                run_project(cfg,'rescan')
-            self.assertTrue(observed.exception.paths['summary'].is_file())
+            result=run_project(cfg,'rescan')
+            self.assertEqual(result.status,'incomplete')
+            self.assertTrue(result['summary'].is_file())
             db=open_database(cfg.output_dir)
             try:
                 self.assertEqual(db.execute('SELECT status FROM operation_runs ORDER BY id DESC LIMIT 1').fetchone()[0],'incomplete')

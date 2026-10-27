@@ -72,7 +72,7 @@ class BackpressureTests(unittest.TestCase):
         self.assertEqual(transport.calls, 2)
         self.assertEqual(len(gate.pauses), 1)
 
-    def test_unlimited_default_waits_through_repeated_429s(self) -> None:
+    def test_default_budget_recovers_after_three_429s(self) -> None:
         gate = FakeGate()
         client, transport = self.make_client(
             [response(429), response(429), response(429), response(200, b"ok")],
@@ -84,6 +84,14 @@ class BackpressureTests(unittest.TestCase):
         self.assertEqual(result["data"], b"ok")
         self.assertEqual(transport.calls, 4)
         self.assertEqual(len(gate.pauses), 3)
+
+    def test_zero_setting_no_longer_means_an_infinite_http_turn(self):
+        gate = FakeGate()
+        client, transport = self.make_client([response(429)]*4,gate,rate_limit_attempts=0)
+        with self.assertRaises(RateLimitDeferred):
+            client.get("https://web.archive.org/test",100)
+        self.assertEqual(transport.calls,4)
+        self.assertEqual(len(gate.pauses),4)
 
     def test_persistent_429_can_use_optional_deferral_budget(self) -> None:
         gate = FakeGate()

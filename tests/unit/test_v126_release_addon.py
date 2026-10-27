@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import tempfile
 import threading
 import unittest
@@ -84,21 +85,21 @@ class RecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             cfg=config(Path(temp)); db=open_database(cfg.output_dir); stop=VirtualWait(); events=[]
             with patch.object(HttpClient,'get_cdx_any',return_value=CDXRows(rows(host='unrelated.invalid'))) as request:
-                with self.assertRaises(Stopped):index_archive(cfg,db,stop,events.append)
-            self.assertEqual(request.call_count,8)
-            self.assertEqual(stop.waits,[5,10,20,40,80,160,300,300])
+                self.assertTrue(index_archive(cfg,db,stop,events.append))
+            self.assertEqual(request.call_count,4)
+            self.assertEqual(stop.waits,[5,10,20])
             state=db.execute('SELECT plan_json,complete FROM index_coverage').fetchone()
-            self.assertEqual(decode_plan(state['plan_json'],[]).pending[0].failures,8)
+            self.assertEqual(decode_plan(state['plan_json'],[]).pending[0].failures,4)
             self.assertEqual(state['complete'],0)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM captures').fetchone()[0],0)
             notices=[e for e in events if 'remains unverified' in e.message]
-            self.assertEqual(len(notices),8)
+            self.assertEqual(len(notices),3)
             self.assertTrue(all(e.detail['retain_notice'] and 'unrelated host' in e.message for e in notices))
             db.close()
 
     def test_repeated_cursor_timeouts_retain_last_resort_recovery(self):
         with tempfile.TemporaryDirectory() as temp:
-            cfg=config(Path(temp));db=open_database(cfg.output_dir);calls=[];events=[]
+            cfg=replace(config(Path(temp)),max_attempts=8);db=open_database(cfg.output_dir);calls=[];events=[]
             def respond(_client,endpoints,params,**kwargs):
                 calls.append(dict(params))
                 if len(calls)==1:return CDXRows(rows(),'SAVED')

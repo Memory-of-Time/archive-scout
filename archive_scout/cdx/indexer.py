@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..retry_budget import NoProgressBudget, CursorHistory, incomplete_retry_message
+
 import calendar
 import re
 import fnmatch
@@ -16,7 +18,7 @@ from typing import Callable
 from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_site_issue, upsert_captures
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
-from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
+from ..events import ProgressEvent, Stopped
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
 from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload, summarize_cdx_error
@@ -752,13 +754,6 @@ def _defer_transient_window(
             plan.pending.append(plan.pending.pop(0))
         persist_task_state(encode_plan(plan), False, seen, error_id)
 
-    if not network.persistent_retries and current.failures >= max(3, config.retries):
-        raise TransientRequestError(
-            f"transient retry limit reached for {window_label(current.start, current.end)}: {exc}",
-            timed_out=is_timeout_error(exc),
-            splittable=False,
-        ) from exc
-
     threshold = network.failure_pause_threshold
     # Transient outages are not a terminal operation state. Every window remains
     # in the checkpoint and will be revisited automatically until stopped.
@@ -1237,6 +1232,9 @@ def index_archive(
     task_queue = deque(tasks)
     due: dict[tuple[str, str, int | None, str, str], float] = {}
     spent: dict[str, float] = {}
+    retry_budgets = {}
+    cursor_histories = {}
+    retry_deferred = set()
     budget_deferred: set[str] = set()
     accounted: dict[tuple, tuple[int, int]] = {}
     try:
@@ -1246,7 +1244,7 @@ def index_archive(
             task = task_queue.popleft()
             target, target_config, target_id, state_kind, year, task_start, task_end, default_windows, signature = task
             task_key = (target, state_kind, year, task_start, task_end)
-            if target in budget_deferred:
+            if target in budget_deferred or task_key in retry_deferred:
                 continue
             ready = due.get(task_key, 0.0)
             now = time.monotonic()
@@ -1342,7 +1340,15 @@ def index_archive(
             total_windows += extra - counted_extra
             accounted[task_key] = (plan.completed, extra)
 
+            retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
             while plan.pending:
+                if retry_budget.exhausted:
+                    with database:
+                        persist_task_state(encode_plan(plan), False, seen, error_id)
+                    retry_deferred.add(task_key)
+                    emit(callback, ProgressEvent("index_deferred", incomplete_retry_message(target),
+                         completed_windows, total_windows, {"retain_notice": True}))
+                    break
                 active = spent.get(target, 0.0) + (time.monotonic() - turn_started)
                 if budget_limit is not None and active >= budget_limit:
                     with database:
@@ -1404,6 +1410,7 @@ def index_archive(
                     },
                 ))
                 request_started = time.monotonic()
+                retry_budget.attempted()
                 try:
                     if current.strategy == "paged":
                         received = 0
@@ -1456,6 +1463,7 @@ def index_archive(
                                     (signature, target_id, current.start, current.end, int(result.page), page_received,
                                      cdx_layout_signature(target_config, current.start, current.end, 'paged', current.page_blocks), utc_now()),
                                 )
+                            retry_budget.progress()
                             completed_pages.add(int(result.page))
                             write_seconds += time.monotonic() - write_started
                             received += page_received
@@ -1503,6 +1511,7 @@ def index_archive(
                                 if not _reconcile_paged_completion(current, completed_pages):
                                     batch.finished = False
                                 else:
+                                    retry_budget.progress()
                                     plan.pending.pop(0)
                                     plan.completed += 1
                                     completed_windows += 1
@@ -1582,11 +1591,10 @@ def index_archive(
                                     details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                                 )
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            raise IndexResponsePaused(
-                                f"{len(current.retry_pages)} Timemap page(s) remained unavailable after "
-                                f"{highest_page_failures} attempts. Successful pages were preserved and only the exact "
-                                "failed page queue was saved for Resume."
-                            ) from failure_exc
+                            retry_deferred.add(task_key)
+                            emit(callback, ProgressEvent('index_deferred', incomplete_retry_message(target),
+                                 completed_windows,total_windows,{'retain_notice':True}))
+                            break
                         with database:
                             record_recovery_event(
                                 database, "index", "transient_page_retry",
@@ -1617,7 +1625,7 @@ def index_archive(
                         error_id = _defer_transient_window(
                             target_config, database, plan, current, persist_task_state, seen, error_id,
                             failure_exc, callback, completed_windows, total_windows, stop_event,
-                            yield_to_other_tasks=bool(task_queue),
+                            yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                         )
                         if task_queue:
                             due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1627,6 +1635,9 @@ def index_archive(
                         continue
 
                     rows, finished, next_cursor = _request_resume(client, target_config, target, current)
+                    history_key = (task_key,current.start,current.end)
+                    history = cursor_histories.setdefault(history_key, CursorHistory())
+                    history.check(next_cursor)
                     raw_received = len(rows)
                     excluded_hosts = validate_cdx_scope(
                         rows, target, current.start, current.end,
@@ -1683,6 +1694,10 @@ def index_archive(
                         if finished and (not plan.pending or plan.pending[0] is not current):
                             plan.pending.insert(0, current)
                         raise
+                    history.committed(next_cursor)
+                    if finished:
+                        cursor_histories.pop(history_key, None)
+                    retry_budget.progress()
                     write_seconds = time.monotonic() - write_started
                     emit(
                         callback,
@@ -1714,7 +1729,7 @@ def index_archive(
                     error_id = _defer_transient_window(
                         target_config, database, plan, current, persist_task_state, seen, error_id,
                         exc, callback, completed_windows, total_windows, stop_event,
-                        yield_to_other_tasks=bool(task_queue),
+                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                     )
                     if task_queue:
                         due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1763,7 +1778,7 @@ def index_archive(
                             task_queue.append(task)
                             yielded = True
                             break
-                        stop_event.wait(wait_seconds)
+                        stop_event.wait(retry_budget.wait_seconds(wait_seconds) if not retry_budget.exhausted else 0)
                         if stop_event.is_set():
                             raise Stopped
                         current.next_eligible_at = 0.0
@@ -1799,7 +1814,7 @@ def index_archive(
                         error_id = _defer_transient_window(
                             target_config, database, plan, current, persist_task_state,
                             seen, error_id, exc, callback, completed_windows,
-                            total_windows, stop_event, yield_to_other_tasks=bool(task_queue),
+                            total_windows, stop_event, yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                         )
                         if task_queue:
                             due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1834,7 +1849,7 @@ def index_archive(
                     error_id = _defer_transient_window(
                         target_config, database, plan, current, persist_task_state, seen, error_id,
                         exc, callback, completed_windows, total_windows, stop_event,
-                        yield_to_other_tasks=bool(task_queue),
+                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                     )
                     if task_queue:
                         due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1896,7 +1911,7 @@ def index_archive(
                 emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} • {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))
     finally:
         client.close()
-    return bool(budget_deferred)
+    return bool(budget_deferred or retry_deferred)
 
 def _request_paged_count(
     client: HttpClient,

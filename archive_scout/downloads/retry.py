@@ -101,8 +101,8 @@ def retry_error_urls(
             else:
                 if len(jobs) == 1:
                     download_archive(config, database, scan_run_id, stop_event, callback,
-                        states=("error", "pending", "downloaded"), capture_ids=ids)
+                        states=("error", "pending", "downloaded"), capture_ids=ids, allow_partial_inventory=True)
                 else:
                     download_archive(config, database, scan_run_id, stop_event, callback,
                         states=("error", "pending", "downloaded"), capture_ids=ids,
-                        scan_jobs=jobs)
+                        scan_jobs=jobs, allow_partial_inventory=True)

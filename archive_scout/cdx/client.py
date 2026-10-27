@@ -206,7 +206,7 @@ class HttpClient:
         self.coordinated_connection_recovery = bool(coordinated_connection_recovery)
         self.connection_failure_threshold = max(2, int(connection_failure_threshold))
         self.connection_retry_seconds = max(1.0, float(connection_retry_seconds))
-        self.rate_limit_attempts = max(0, int(rate_limit_attempts))
+        self.rate_limit_attempts = max(1, int(rate_limit_attempts or 4))
         self.rate_limit_max_wait = max(0.0, float(rate_limit_max_wait))
         self.endpoint_lock = threading.Lock()
         self.endpoint_last_success: str | None = None
@@ -281,11 +281,14 @@ class HttpClient:
         generic_attempt = 0
         rate_attempt = 0
         total_rate_wait = 0.0
+        gate_deadline = time.monotonic() + (self.rate_limit_max_wait or 300.0)
 
         while True:
             ensure_frozen_bundle_available()
             gate_started = time.monotonic()
-            permit = self.host_gate.acquire_request(self.stop_event)
+            permit = (self.host_gate.acquire_request(self.stop_event, deadline=gate_deadline)
+                      if isinstance(self.host_gate, SharedHostGate)
+                      else self.host_gate.acquire_request(self.stop_event))
             turn_started = time.monotonic()
             try:
                 with (nullcontext() if isinstance(self.transport, ResilientTransport)
@@ -472,6 +475,7 @@ class HttpClient:
         generic_attempt = 0
         rate_attempt = 0
         total_rate_wait = 0.0
+        gate_deadline = time.monotonic() + (self.rate_limit_max_wait or 300.0)
         destination = Path(destination)
 
         while True:
@@ -480,7 +484,9 @@ class HttpClient:
             if destination.exists() and not _partial_metadata_path(destination).is_file():
                 destination.unlink(missing_ok=True)
             gate_started = time.monotonic()
-            permit = self.host_gate.acquire_request(self.stop_event)
+            permit = (self.host_gate.acquire_request(self.stop_event, deadline=gate_deadline)
+                      if isinstance(self.host_gate, SharedHostGate)
+                      else self.host_gate.acquire_request(self.stop_event))
             turn_started = time.monotonic()
             try:
                 with (nullcontext() if isinstance(self.transport, ResilientTransport)

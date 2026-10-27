@@ -151,8 +151,7 @@ class FastIndexingTests(unittest.TestCase):
                 return []
 
             with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", new=fake_get):
-                with self.assertRaises(IndexResponsePaused):
-                    index_archive(config, database, threading.Event())
+                self.assertTrue(index_archive(config, database, threading.Event()))
 
             self.assertEqual(page_calls.get(1), 5)
             self.assertEqual(resume_calls, 0)

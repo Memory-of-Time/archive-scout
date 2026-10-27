@@ -331,40 +331,47 @@ def download_media(
     states: tuple[str, ...] = ("pending",),
     media_capture_ids: list[int] | None = None,
     media_signature: str | None = None,
+    allow_partial_inventory: bool = False,
 ) -> None:
-    # Direct and retry paths need the same positive index proof as orchestration.
-    # Embedded discovery carries its own distinct scope/admission from the
-    # preceding scan/discovery phase rather than a direct-media checkpoint.
-    from ..coverage import IndexCoveragePending, require_media_coverage, require_embedded_coverage
+    from ..coverage import IndexCoveragePending, require_media_coverage, require_embedded_coverage, media_coverage_gaps
     direct_signature = media_query_signature(config)
-    if media_signature is None or media_signature == direct_signature:
-        require_media_coverage(database, config)
-        require_embedded_coverage(database, config, direct_signature)
+    active_signature = media_signature or direct_signature
+    is_direct = active_signature == direct_signature
+    if is_direct:
+        scope_config = config
     else:
-        # Supplying an arbitrary signature must not act as an admission bypass.
-        # The only supported separate scope is externally embedded discovery
-        # resolved by the preceding text scan/index phase.
         from dataclasses import replace
-        from .indexer import media_query_signature as signature_of
-        external_config = config.normalized()
-        external_config.media = replace(external_config.media.normalized(),
-                                        enabled=True, discover_embedded=True,
-                                        allow_external_embeds=True)
-        if media_signature != signature_of(external_config):
+        scope_config = config.normalized()
+        scope_config.media = replace(scope_config.media.normalized(), enabled=True,
+                                    discover_embedded=True, allow_external_embeds=True)
+        if active_signature != media_query_signature(scope_config):
             raise IndexCoveragePending("Unrecognized media inventory identity; acquisition is not admitted")
-        require_embedded_coverage(database, external_config, media_signature)
-        if database.execute(
-            "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
-            "AND state IN ('pending','error','resolving') LIMIT 1",
-            (media_signature,),
-        ).fetchone():
-            raise IndexCoveragePending("Embedded media lookup inventory is unfinished")
-    # Reapply the policy at admission too: explicit retry IDs must not revive
-    # a later duplicate that an older run left in an error/pending state.
+    inventory_complete = False
+    try:
+        if is_direct:
+            require_media_coverage(database, config)
+        require_embedded_coverage(database, scope_config, active_signature)
+        inventory_complete = True
+    except IndexCoveragePending:
+        if not allow_partial_inventory:
+            raise
     from .indexer import _apply_snapshot_strategy
-    _apply_snapshot_strategy(database, media_signature or direct_signature, config.media.snapshot_strategy)
+    if inventory_complete:
+        _apply_snapshot_strategy(database, active_signature, config.media.snapshot_strategy)
     clauses: list[str] = []
     params: list[object] = []
+    if not inventory_complete and config.media.snapshot_strategy != 'all':
+        direct_complete = is_direct and not media_coverage_gaps(database, config)
+        if not direct_complete:
+            clauses.append("""(media_captures.source_type IN ('embedded','external_embedded') OR EXISTS (SELECT 1 FROM media_discovery_queue q
+                WHERE q.query_signature=media_captures.query_signature
+                  AND q.original_url=media_captures.original_url AND q.state='indexed'))""")
+        comparison = '<' if config.media.snapshot_strategy == 'earliest' else '>'
+        clauses.append(f"""NOT EXISTS (SELECT 1 FROM media_captures chosen
+            WHERE chosen.original_url=media_captures.original_url
+              AND chosen.query_signature=media_captures.query_signature
+              AND (chosen.timestamp {comparison} media_captures.timestamp
+                   OR (chosen.timestamp=media_captures.timestamp AND chosen.id {comparison} media_captures.id)))""")
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_selection")
     if media_capture_ids:
         database.execute(
@@ -615,6 +622,7 @@ def retry_media_errors(
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None = None,
     media_capture_ids: list[int] | None = None,
+    allow_partial_inventory: bool = False,
 ) -> None:
     """Explicit bounded retry of recorded errors AND over-attempt pending work.
 
@@ -662,4 +670,4 @@ def retry_media_errors(
         if callback:
             callback(ProgressEvent("media_retry", f"Retrying {len(ids):,} errored or attempt-exhausted media captures"))
         download_media(config, database, stop_event, callback,
-                       states=("error", "pending"), media_capture_ids=ids)
+                       states=("error", "pending"), media_capture_ids=ids, allow_partial_inventory=allow_partial_inventory)

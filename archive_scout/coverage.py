@@ -13,7 +13,7 @@ from .config import ProjectConfig
 
 
 class IndexCoveragePending(RuntimeError):
-    """Unfinished inventory must not permit any new replay requests."""
+    """Full inventory coverage remains unresolved; completion is not certified."""
 
 
 def text_coverage_gaps(database: sqlite3.Connection, config: ProjectConfig) -> list[str]:
@@ -81,7 +81,7 @@ def require_media_coverage(database: sqlite3.Connection, config: ProjectConfig) 
 
 def require_embedded_coverage(database: sqlite3.Connection, config: ProjectConfig,
                               signature: str) -> None:
-    """Every saved document and lookup must be accounted for before media I/O."""
+    """Require full saved-document and lookup coverage for global admission/completion."""
     if not config.media.discover_embedded:
         return
     from .database.scope import prepare_saved_scope, saved_scope_predicate, discovery_scope_config

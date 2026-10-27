@@ -57,7 +57,8 @@ class RetryTests(unittest.TestCase):
             def fake_rescan(database, scan_run_id, keywords, stop_event, callback, document_ids, workers=None):
                 captured["documents"].extend(document_ids)
 
-            def fake_download(config, database, scan_run_id, stop_event, callback, states, capture_ids):
+            def fake_download(config, database, scan_run_id, stop_event, callback, states, capture_ids, allow_partial_inventory=False):
+                self.assertTrue(allow_partial_inventory)
                 captured["captures"].extend(capture_ids)
 
             with patch("archive_scout.downloads.retry.rescan_documents", fake_rescan), patch(

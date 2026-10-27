@@ -149,7 +149,7 @@ class IndexRestorationTests(unittest.TestCase):
     def test_six_isolated_page_timeouts_recover_without_manual_resume_or_repeating_good_pages(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
-            config=ProjectConfig(root,['example.org/*'],[],from_date='20010101',to_date='20010101',cdx_delay=0,
+            config=ProjectConfig(root,['example.org/*'],[],max_attempts=8,from_date='20010101',to_date='20010101',cdx_delay=0,
                                  network=NetworkConfig(index_strategy='paged',page_blocks=2,cdx_workers=3)).normalized()
             database=open_database(root)
             calls={}

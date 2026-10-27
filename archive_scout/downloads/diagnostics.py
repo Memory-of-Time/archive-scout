@@ -28,7 +28,7 @@ def build_fingerprint():
     found = False
     for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
                  'downloads/validation.py', 'network/transports.py', 'cdx/client.py',
-                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'domains.py', 'scanning/scoring.py', 'operations.py'):
+                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
         path = root / name
         if path.is_file():
             try:

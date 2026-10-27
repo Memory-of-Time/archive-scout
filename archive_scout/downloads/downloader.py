@@ -587,16 +587,18 @@ def download_archive(
     capture_ids: list[int] | None = None,
     scan_jobs: list[ScanJob] | None = None,
     acquire_only: bool = False,
+    allow_partial_inventory: bool = False,
 ) -> None:
     operation_started = time.monotonic()
     if config.download_scope == "index_only":
         if callback:
             callback(ProgressEvent("download", "Index-only mode selected; downloads skipped."))
         return
-    # Defense in depth: direct callers and manual retries cannot bypass a
-    # missing/unfinished inventory. One proof per batch, never per capture.
+    # Direct callers retain strict admission. Operations can acquire already
+    # committed scoped rows while retaining unfinished index checkpoints.
     from ..coverage import require_text_coverage
-    require_text_coverage(database, config)
+    if not allow_partial_inventory:
+        require_text_coverage(database, config)
     jobs = [] if acquire_only else (scan_jobs or [ScanJob.create(scan_run_id, config.keyword_set_name, config.keywords)])
     if not acquire_only and (not jobs or any(not job.patterns for job in jobs)):
         raise ValueError("at least one keyword rule is required")

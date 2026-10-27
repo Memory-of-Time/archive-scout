@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Callable
 
+from ..retry_budget import NoProgressBudget, incomplete_retry_message
 from ..config import ProjectConfig
 from ..events import ProgressEvent, Stopped
 from ..utils import utc_now
@@ -56,7 +57,8 @@ def clear_media_retry(db: sqlite3.Connection, capture_id: int) -> None:
 
 def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: threading.Event,
                          callback: Callable[[ProgressEvent], None] | None = None,
-                         additional_signature: str | None = None) -> None:
+                         additional_signature: str | None = None,
+                         allow_partial_inventory: bool = False) -> None:
     """Only run for a currently indexed and admitted media scope.
 
     A single bounded ID batch is passed to the existing downloader. The DB owns
@@ -64,7 +66,7 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
     """
     from .downloader import download_media
     from ..coverage import require_media_coverage
-    if additional_signature is None:
+    if additional_signature is None and not allow_partial_inventory:
         require_media_coverage(db, config)
     if not config.network.persistent_retries:
         return  # A one-pass operation still reports remaining work incomplete.
@@ -86,24 +88,36 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
                     record_media_failure(db, int(cid), str(category), status, True, config)
         return bool(outstanding)
 
+    budget = NoProgressBudget(config)
+    sweep_cursor = (-1.0, 0)
+    sweep_started = time.time()
+    sweep_progress = False
     while not stop.is_set():
+        if budget.exhausted:
+            if callback:
+                callback(ProgressEvent('media_incomplete', incomplete_retry_message('Media recovery'),
+                                       detail={'retain_notice': True}))
+            return
         # Bounded adoption is repeated; a large legacy error history must not
         # leave everything beyond the first selected page undiscoverable.
         adopted = adopt_legacy_batch()
-        now = time.time()
         args = tuple(signatures)
         due = db.execute(
-            "SELECT s.media_capture_id FROM media_retry_schedule s JOIN media_captures mc ON mc.id=s.media_capture_id "
-            "WHERE mc.query_signature IN (" + placeholders + ") AND mc.state='error' AND s.next_eligible_at<=? "
+            "SELECT s.media_capture_id,s.next_eligible_at FROM media_retry_schedule s JOIN media_captures mc ON mc.id=s.media_capture_id "
+            "WHERE mc.query_signature IN (" + placeholders + ") AND mc.state='error' AND s.next_eligible_at<=? AND (s.next_eligible_at,s.media_capture_id)>(?,?) "
             "AND EXISTS(SELECT 1 FROM errors e WHERE e.media_capture_id=mc.id "
             "AND e.retryable=1 AND e.resolved=0 AND e.ignored=0) "
-            "ORDER BY s.next_eligible_at,s.media_capture_id LIMIT 128", (*args, now)).fetchall()
+            "ORDER BY s.next_eligible_at,s.media_capture_id LIMIT 128", (*args, sweep_started, *sweep_cursor)).fetchall()
         if due:
             ids = [int(row[0]) for row in due]
+            sweep_cursor = (float(due[-1][1]), ids[-1])
             if callback:
                 callback(ProgressEvent('media_retry', f'Automatically recovering {len(ids):,} due media capture(s)'))
             download_media(config, db, stop, callback, states=('error',), media_capture_ids=ids,
-                           media_signature=additional_signature)
+                           media_signature=additional_signature, allow_partial_inventory=allow_partial_inventory)
+            if db.execute("SELECT 1 FROM media_captures WHERE id IN (" + ','.join('?' for _ in ids) +
+                          ") AND state NOT IN ('pending','error','downloading') LIMIT 1", ids).fetchone():
+                sweep_progress = True
             continue
         earliest = db.execute(
             "SELECT MIN(s.next_eligible_at) FROM media_retry_schedule s JOIN media_captures mc ON mc.id=s.media_capture_id "
@@ -114,7 +128,23 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
             return
         if adopted:
             continue
-        wait = min(10.0, max(0.05, float(earliest[0]) - time.time()))
+        if sweep_cursor != (-1.0, 0):
+            if sweep_progress:
+                budget.progress()
+            else:
+                budget.attempted()
+            sweep_cursor = (-1.0, 0)
+            sweep_started = time.time()
+            sweep_progress = False
+            continue
+        budget.waiting()
+        requested = max(0.05, float(earliest[0]) - time.time())
+        if requested > budget.wait_seconds(requested):
+            if callback:
+                callback(ProgressEvent('media_incomplete', incomplete_retry_message('Media cooldown'),
+                                       detail={'retain_notice':True}))
+            return
+        wait = budget.wait_seconds(min(10.0, requested))
         if callback:
             callback(ProgressEvent('media_retry', f'Media temporarily unavailable; retry eligible in {wait:.1f}s'))
         stop.wait(wait)

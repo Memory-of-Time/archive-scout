@@ -11,8 +11,9 @@ from contextlib import nullcontext
 import json
 import threading
 
+from ..retry_budget import CursorHistory
 from ..cdx.client import HttpClient, RateLimitDeferred
-from ..cdx.indexer import PendingWindow, cdx_response_budget, validate_cdx_scope
+from ..cdx.indexer import PendingWindow, cdx_response_budget, validate_cdx_scope, _query_is_oversized
 from ..cdx.parallel import memory_limited_page_workers
 from ..database.repositories import (iter_media_discovery_rows, upsert_media_captures,
     mark_media_discovery_lookup, record_error, resolve_errors, blocked_site_hosts,
@@ -70,9 +71,9 @@ def index_all_embedded_pages(config, database, client, stop_event, callback, sig
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='archive-embedded-page') as pool:
         pending = {}
 
-        def submit(row):
+        def submit(row, history=None):
             window = window_for(row)
-            pending[pool.submit(fetch, row, window)] = (row, window)
+            pending[pool.submit(fetch, row, window)] = (row, window, history or CursorHistory())
 
         def fill():
             while len(pending) < workers and not pool_cancel.is_set():
@@ -95,9 +96,10 @@ def index_all_embedded_pages(config, database, client, stop_event, callback, sig
                     raise Stopped
                 done, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
                 for future in done:
-                    row, window = pending.pop(future)
+                    row, window, history = pending.pop(future)
                     try:
                         rows, finished, cursor = future.result()
+                        history.check(cursor)
                     except RateLimitDeferred:
                         raise
                     except Stopped:
@@ -106,9 +108,16 @@ def index_all_embedded_pages(config, database, client, stop_event, callback, sig
                         raise
                     except Exception as exc:
                         category, status, retryable = classify_exception(exc)
+                        smaller_page = _query_is_oversized(exc) and (window.page_size or config.page_size)>100
+                        if smaller_page:
+                            retryable = True
+                            window.page_size = max(100,(window.page_size or config.page_size)//2)
                         host = host_from_url(row['original_url'])
                         message = site_issue_message(category, row['original_url'], 'embedded-media indexing', status)
                         with database:
+                            if smaller_page:
+                                database.execute('INSERT OR REPLACE INTO project_meta(key,value) VALUES(?,?)',
+                                    (checkpoint_key(row),json.dumps({'resume_key':window.resume_key,'page_size':window.page_size})))
                             mark_media_discovery_lookup(database, row['id'],
                                 'error' if retryable else 'unavailable',
                                 error=str(exc), result_count=int(row['result_count'] or 0))
@@ -157,13 +166,14 @@ def index_all_embedded_pages(config, database, client, stop_event, callback, sig
                         else:
                             database.execute('INSERT OR REPLACE INTO project_meta(key,value) VALUES(?,?)',
                                 (checkpoint_key(row), json.dumps({'resume_key':cursor,'page_size':window.page_size})))
+                    history.committed(cursor)
                     rows.clear()
                     if callback:
                         callback(ProgressEvent('media_embed',
                             f'Embedded media page committed: {count:,} captures; URL complete={finished}; {row["original_url"]}'))
                     if not finished:
                         continued = dict(row); continued['result_count'] = count
-                        submit(continued)
+                        submit(continued, history)
                     fill()
         finally:
             pool_cancel.set()

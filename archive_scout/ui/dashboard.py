@@ -12,6 +12,10 @@ EMPTY_DASHBOARD = {
     "errors": 0,
     "text": 0,"image":0,"video":0,"audio":0,"media_descriptor":0,
     "other_binary":0,"unknown":0,"deferred":0,"skipped":0,"failed":0,
+    "pending":0,"downloading":0,"downloaded_unscanned":0,"saved_scanned":0,
+    "failed_captures":0,"deferred_to_media":0,"skipped_non_text":0,
+    "skipped_url_filter":0,"unsupported_non_text":0,"skipped_other":0,
+    "other_states":0,"accounted_captures":0,"recovery_events":0,
 }
 
 
@@ -30,6 +34,7 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
         database.set_progress_handler(lambda: int(time.monotonic() >= deadline),1000)
         database.execute("PRAGMA query_only=ON")
         database.execute("PRAGMA busy_timeout=250")
+        database.execute("BEGIN")
         row = database.execute(
             """
             SELECT
@@ -50,27 +55,32 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
         }
         if not include_classification:
             return result
-        counts = {}
-        try:
-            from ..database.classification import classification_counts
-            counts=classification_counts(database)
-            for kind in ("text","image","video","audio","media_descriptor","other_binary","unknown"):
-                result[kind]=counts.get(kind,0)
-            result["deferred"]=counts.get("route_deferred_to_media",0)
-            result["skipped"]=counts.get("route_skipped_non_text",0)+counts.get("route_skipped_url_filter",0)
-            result["failed"]=counts.get("route_failed",0)
-        except sqlite3.OperationalError:
-            pass
-        result.update({
-            "pending": database.execute("SELECT COUNT(*) FROM captures WHERE state='pending'").fetchone()[0],
-            "downloaded_unscanned": database.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0],
-            "failed_captures": database.execute("SELECT COUNT(*) FROM captures WHERE state='error'").fetchone()[0],
-            "deferred_to_media": result.get("deferred",0),
-            "skipped_non_text": counts.get("route_skipped_non_text",0),
-            "skipped_url_filter": counts.get("route_skipped_url_filter",0),
-            "skipped_other": 0,
-            "recovery_events": database.execute("SELECT COUNT(*) FROM network_events WHERE stage LIKE '%recovery%'").fetchone()[0],
-        })
+        groups = database.execute("""SELECT c.state,COALESCE(r.routing,''),
+            COALESCE(r.resource_class,'unknown'),COUNT(*) FROM captures c
+            LEFT JOIN capture_routing r ON r.capture_id=c.id GROUP BY 1,2,3""").fetchall()
+        for key in EMPTY_DASHBOARD:
+            result.setdefault(key, 0)
+        skip_routes = {'skipped_non_text':'skipped_non_text',
+                       'skipped_url_filter':'skipped_url_filter',
+                       'deferred_to_media':'deferred_to_media',
+                       'unsupported_non_text':'unsupported_non_text'}
+        states = {'pending':'pending','downloading':'downloading',
+                  'downloaded':'saved_scanned','downloaded_unscanned':'downloaded_unscanned',
+                  'error':'failed_captures'}
+        for state, routing, kind, count in groups:
+            if kind in ('text','image','video','audio','media_descriptor','other_binary','unknown'):
+                result[kind] += int(count)
+            else:
+                result['unknown'] += int(count)
+            bucket = skip_routes.get(routing, 'skipped_other') if state=='skipped' else states.get(state, 'other_states')
+            result[bucket] += int(count)
+        result['deferred'] = result['deferred_to_media']
+        result['failed'] = result['failed_captures']
+        result['skipped'] = sum(result[key] for key in (*skip_routes.values(), 'skipped_other'))
+        result['accounted_captures'] = sum(result[key] for key in
+            ('pending','downloading','saved_scanned','downloaded_unscanned','failed_captures','skipped','other_states'))
+        result['recovery_events'] = database.execute(
+            "SELECT COUNT(*) FROM network_events WHERE stage LIKE '%recovery%'").fetchone()[0]
         media={str(row[0]):int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM media_captures GROUP BY state")}
         result.update({"media_candidates":sum(media.values()),"media_selected":sum(value for state,value in media.items() if state not in ('excluded','skipped_strategy','skipped')),"media_pending":media.get("pending",0),"media_downloading":media.get("downloading",0),"media_downloaded":media.get("downloaded",0),"media_excluded":sum(media.get(state,0) for state in ("excluded","skipped_strategy","skipped")),"media_errors":media.get("error",0),"media_deferred_from_text":result.get("deferred",0)})
         for kind in ("image","video"):
@@ -82,6 +92,20 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
         return {**{key:None for key in EMPTY_DASHBOARD},"_exact":False}
     finally:
         database.close()
+
+def format_capture_accounting(counts):
+    def number(key):
+        value = counts.get(key)
+        return '…' if value is None else f'{int(value):,}'
+    return (
+        f"Indexed {number('captures')} = pending {number('pending')} + in flight {number('downloading')} "
+        f"+ saved {number('documents')} (includes {number('downloaded_unscanned')} awaiting scan) "
+        f"+ failed {number('failed_captures')} + non-text skips {number('skipped_non_text')} "
+        f"+ URL-filter skips {number('skipped_url_filter')} + media handoffs {number('deferred_to_media')} "
+        f"+ unsupported media {number('unsupported_non_text')} + other skips {number('skipped_other')} "
+        f"+ other states {number('other_states')}. Accounted for: {number('accounted_captures')}."
+    )
+
 
 def format_media_policy_summary(media) -> str:
     """Compact human-readable summary of the Media-tab policy for Dashboard."""
