@@ -6,7 +6,7 @@ import calendar
 import re
 import fnmatch
 from urllib.parse import urlsplit
-from collections import deque
+from collections import Counter, deque
 import json
 import sqlite3
 import threading
@@ -730,6 +730,7 @@ def _defer_transient_window(
             "index",
             "invalid_index_response" if isinstance(exc, MalformedCDXResponse) else "transient_index_delay",
             f"{window_label(current.start, current.end)}: {message}",
+            http_status=getattr(exc, 'status', None),
             retryable=True,
         )
         _record_network_event(
@@ -1237,6 +1238,28 @@ def index_archive(
     retry_deferred = set()
     budget_deferred: set[str] = set()
     accounted: dict[tuple, tuple[int, int]] = {}
+    remaining_tasks = Counter(task[0] for task in tasks)
+
+    def queue_status():
+        deferred_targets = budget_deferred | {key[0] for key in retry_deferred}
+        cooling_targets = {key[0] for key, ready_at in due.items()
+                           if ready_at > time.monotonic() and key[0] in remaining_tasks}
+        retrying_targets = {key[0] for key, budget in retry_budgets.items()
+                            if budget.attempts and key[0] in remaining_tasks} - deferred_targets
+        emit(callback, ProgressEvent('index_status',
+            f"Indexing queue: {len(remaining_tasks):,} target(s) remain for completion checks; "
+            f"{len(retrying_targets):,} retrying, {len(cooling_targets):,} cooling, "
+            f"{len(deferred_targets):,} deferred with checkpoints retained. "
+            "Capture downloads are a separate phase.",
+            detail={'unfinished_targets': len(remaining_tasks), 'retrying_targets': len(retrying_targets),
+                    'cooling_targets': len(cooling_targets), 'deferred_targets': len(deferred_targets)}))
+
+    def task_complete(target):
+        remaining_tasks[target] -= 1
+        if remaining_tasks[target] <= 0:
+            del remaining_tasks[target]
+
+    queue_status()
     try:
         while task_queue:
             if stop_event.is_set():
@@ -1259,6 +1282,7 @@ def index_archive(
                     # immediate user Stop and prompt recovery at eligibility.
                     stop_event.wait(min(5.0, max(0.05, min(future_times) - now)))
                 continue
+            due.pop(task_key, None)
             turn_started = time.monotonic()
             requests_this_turn = 0
             yielded = False
@@ -1298,6 +1322,7 @@ def index_archive(
                 ).fetchone()
                 state_plan = state["plan_json"] if state else None
             if state and state["complete"]:
+                task_complete(target)
                 completed_windows += len(default_windows)
                 emit(callback, ProgressEvent("index", f"Already indexed {target} for {scope_label}", completed_windows, total_windows))
                 continue
@@ -1341,13 +1366,23 @@ def index_archive(
             accounted[task_key] = (plan.completed, extra)
 
             retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
+            retry_budget.resume()
             while plan.pending:
                 if retry_budget.exhausted:
                     with database:
+                        previous_error = database.execute('SELECT http_status,message FROM errors WHERE id=?',
+                                                          (error_id,)).fetchone() if error_id else None
+                        detail = retry_budget.details()
+                        error_id = record_error(database, 'index', 'retry_budget_exhausted',
+                            f"{target}: {detail['attempts_without_progress']}/{detail['attempt_limit']} attempts "
+                            f"without progress; {detail['active_no_progress_seconds']:.1f}s active recovery time "
+                            "(time queued behind other targets excluded). Last failure: "
+                            + (str(previous_error[1])[:1200] if previous_error else 'no verified response'),
+                            http_status=previous_error[0] if previous_error else None, retryable=True)
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     retry_deferred.add(task_key)
                     emit(callback, ProgressEvent("index_deferred", incomplete_retry_message(target),
-                         completed_windows, total_windows, {"retain_notice": True}))
+                         completed_windows, total_windows, {**detail, "retain_notice": True}))
                     break
                 active = spent.get(target, 0.0) + (time.monotonic() - turn_started)
                 if budget_limit is not None and active >= budget_limit:
@@ -1906,12 +1941,21 @@ def index_archive(
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     raise
             accounted[task_key] = (plan.completed, plan.planned - len(default_windows))
+            retry_budget.pause()
             spent[target] = spent.get(target, 0.0) + (time.monotonic() - turn_started)
             if not plan.pending:
+                task_complete(target)
+                retry_budgets.pop(task_key, None)
                 emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} • {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))
+            queue_status()
     finally:
         client.close()
-    return bool(budget_deferred or retry_deferred)
+    from .status import text_index_status, format_index_status
+    status = text_index_status(database, config)
+    emit(callback, ProgressEvent('index_status', format_index_status(status),
+         status['complete_targets'], status['selected_targets'],
+         {**{key: value for key, value in status.items() if key != 'targets'}, 'retain_notice': True}))
+    return bool(status['unfinished_targets'] or budget_deferred or retry_deferred)
 
 def _request_paged_count(
     client: HttpClient,

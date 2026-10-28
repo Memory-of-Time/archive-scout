@@ -14,6 +14,7 @@ from .retry_budget import NoProgressBudget, incomplete_retry_message
 from .cdx.client import RateLimitDeferred
 from .cdx.indexer import index_archive
 from .cdx.parameters import cdx_query_signature
+from .cdx.status import text_index_status, format_index_status
 from .database.classification import classify_indexed_captures
 from .analysis.workflow import run_analysis
 from .config import KeywordSetConfig, MediaConfig, ProjectConfig, save_project_config, project_config_from_payload
@@ -22,6 +23,7 @@ from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
 from .downloads.downloader import download_archive
 from .downloads.retry import retry_error_urls
+from .downloads.outcomes import text_outcome_counts, media_unavailable, media_unavailable_count
 from .events import ConnectivityPaused, ProgressEvent, Stopped
 from .media.downloader import download_media, retry_media_errors
 from .media.recovery import recover_active_media
@@ -62,8 +64,8 @@ def _media_unfinished(database: sqlite3.Connection, config: ProjectConfig,
     except IndexCoveragePending:
         return True
     return bool((not extra_signature and media_coverage_gaps(database, config)) or database.execute(
-        "SELECT 1 FROM media_captures WHERE state IN ('pending','error','downloading') "
-        "AND query_signature IN (" + ",".join("?" for _ in signatures) + ") LIMIT 1",
+        "SELECT 1 FROM media_captures mc WHERE mc.state IN ('pending','error','downloading') "
+        "AND NOT " + media_unavailable() + " AND mc.query_signature IN (" + ",".join("?" for _ in signatures) + ") LIMIT 1",
         signatures,
     ).fetchone() or (extra_signature and database.execute(
         "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
@@ -450,16 +452,7 @@ def remaining_acquisition_gaps(config: ProjectConfig, database: sqlite3.Connecti
     Reports may still be generated, but a successful export must not turn
     unresolved downloads into a falsely complete operation status.
     """
-    from .downloads.downloader import _populate_download_scopes
-    _populate_download_scopes(database, config)
-    return int(database.execute(
-        """SELECT COUNT(*) FROM captures c
-           WHERE EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-                ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-                WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-                     WHERE m.capture_id=c.id AND m.target_id=t.id))
-             AND c.state IN ('error','pending','downloading')""",
-    ).fetchone()[0])
+    return text_outcome_counts(database, config)['unfinished']
 
 
 def recover_transient_text_errors(
@@ -479,7 +472,9 @@ def recover_transient_text_errors(
     Retry eligibility and all evidence remain durable after the limit. A long
     productive run resets the budget; an unresponsive tail yields to reports.
     """
-    budget = NoProgressBudget(config)
+    # Every selected failure receives a complete fair sweep. Project size and
+    # saved eligibility delays must not exhaust a URL's attempts before it runs.
+    budget = NoProgressBudget(config, count_only=True)
     while True:
         attempted = 0
         made_progress = False
@@ -669,6 +664,15 @@ def run_project(
                 finish_operation_run(database,operation_run_id,'incomplete',f'Domain extraction has {domain_gaps:,} unresolved saved inputs')
                 database.commit()
         row = database.execute("SELECT status,message FROM operation_runs WHERE id=?", (operation_run_id,)).fetchone()
+        media_requested = mode in {'media_all', 'media_download', 'media_retry', 'external_media_after_scan'} or (
+            config.media.enabled and mode in {'all', 'resume', 'download_only', 'retry_errors'})
+        if row and media_requested:
+            unavailable = media_unavailable_count(database, config)
+            if unavailable:
+                finish_operation_run(database, operation_run_id, row[0],
+                    str(row[1] or '') + f' {unavailable:,} unavailable media capture(s) retained in Errors.')
+                database.commit()
+                row = database.execute("SELECT status,message FROM operation_runs WHERE id=?", (operation_run_id,)).fetchone()
         if row and row[0] == "complete" and mode in RESUMABLE_MODES:
             _complete_resume_request(database, operation_run_id)
             database.commit()
@@ -758,7 +762,7 @@ def run_project(
             paths["project"] = config.output_dir / "project.json"
             finish_operation_run(database, operation_run_id,
                 "incomplete" if index_deferred else "complete",
-                "Indexing incomplete; unfinished checkpoints retained for Resume" if index_deferred else "Index complete")
+                format_index_status(text_index_status(database, config)) if index_deferred else 'Index complete')
             database.commit()
             return result_paths(paths)
         if mode == "report":
@@ -841,7 +845,8 @@ def run_project(
             if text_coverage_gaps(database, config):
                 index_deferred = True
                 emit(callback, ProgressEvent('index_incomplete',
-                    'Index checkpoints remain incomplete; acquiring only committed captures. Full coverage remains unresolved.'))
+                    format_index_status(text_index_status(database, config)),
+                    detail={'retain_notice': True}))
             record_admission(database, operation_run_id, "text_ready" if index_deferred else "text", config)
 
         # Acquisition-only runs never create scan jobs, even without a keyword set.
@@ -879,11 +884,14 @@ def run_project(
             paths["project"] = config.output_dir / "project.json"
             if config.media.enabled and mode == "download_only":
                 paths.update(generate_media_reports(config, database))
-            gaps = remaining_acquisition_gaps(config, database)
+            outcomes = text_outcome_counts(database, config)
+            gaps = outcomes['unfinished']
             media_gaps = mode == "download_only" and config.media.enabled and _media_unfinished(database, config)
             finish_operation_run(database, operation_run_id, "incomplete" if (gaps or index_deferred or media_gaps) else "complete",
-                                 f"Acquisition-only: {gaps:,} unresolved capture(s); indexing deferred={index_deferred}; media gaps={media_gaps}" if (gaps or index_deferred or media_gaps)
-                                 else "Acquisition-only operation complete")
+                                 f"Acquisition-only: {gaps:,} unfinished capture(s); {outcomes['unavailable']:,} unavailable (recorded in Errors); "
+                                 + format_index_status(text_index_status(database, config)) + f"; media gaps={media_gaps}"
+                                 if (gaps or index_deferred or media_gaps) else
+                                 f"Download pass complete; {outcomes['unavailable']:,} unavailable capture(s) recorded in Errors; no automatic text retries remain.")
             database.commit()
             return result_paths(paths)
 
@@ -1009,15 +1017,18 @@ def run_project(
             research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
             paths["research_index"] = research_report
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-        unresolved = remaining_acquisition_gaps(config, database) if mode != "rescan" else 0
+        outcomes = text_outcome_counts(database, config) if mode != 'rescan' else {'unfinished': 0, 'unavailable': 0}
+        unresolved = outcomes['unfinished']
         media_requested = (mode == "external_media_after_scan" or external_media_signature is not None
             or (mode == "all" and config.media.enabled) or bool(pending_media_phase)
             or (mode == "retry_errors" and bool(media_error_count)))
         media_gaps = bool(media_requested and _media_unfinished(database, config, external_media_signature))
         finish_operation_run(database, operation_run_id,
                              "incomplete" if (unresolved or index_deferred or media_gaps or incomplete_runs) else "complete",
-                             f"{unresolved:,} unresolved capture(s); indexing deferred={index_deferred}; media gaps={media_gaps}; incomplete scans={len(incomplete_runs)}" if (unresolved or index_deferred or media_gaps or incomplete_runs)
-                             else "Operation complete")
+                             f"{unresolved:,} unfinished capture(s); {outcomes['unavailable']:,} unavailable (recorded in Errors); "
+                             + format_index_status(text_index_status(database, config)) + f"; media gaps={media_gaps}; incomplete scans={len(incomplete_runs)}"
+                             if (unresolved or index_deferred or media_gaps or incomplete_runs) else
+                             f"Operation complete; {outcomes['unavailable']:,} unavailable text capture(s) recorded in Errors.")
         if mode in {"all", "external_media_after_scan", "resume"} and not (unresolved or index_deferred or media_gaps or incomplete_runs):
             database.execute("DELETE FROM project_meta WHERE key IN ('pending_media_phase','pending_media_settings')")
         database.commit()

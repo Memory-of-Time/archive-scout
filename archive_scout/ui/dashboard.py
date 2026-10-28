@@ -16,6 +16,7 @@ EMPTY_DASHBOARD = {
     "failed_captures":0,"deferred_to_media":0,"skipped_non_text":0,
     "skipped_url_filter":0,"unsupported_non_text":0,"skipped_other":0,
     "other_states":0,"accounted_captures":0,"recovery_events":0,
+    "unavailable_captures":0,
 }
 
 
@@ -76,6 +77,9 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
             result[bucket] += int(count)
         result['deferred'] = result['deferred_to_media']
         result['failed'] = result['failed_captures']
+        from ..downloads.outcomes import text_unavailable
+        result['unavailable_captures'] = int(database.execute(
+            "SELECT COUNT(*) FROM captures c WHERE c.state='error' AND " + text_unavailable()).fetchone()[0])
         result['skipped'] = sum(result[key] for key in (*skip_routes.values(), 'skipped_other'))
         result['accounted_captures'] = sum(result[key] for key in
             ('pending','downloading','saved_scanned','downloaded_unscanned','failed_captures','skipped','other_states'))
@@ -100,7 +104,8 @@ def format_capture_accounting(counts):
     return (
         f"Indexed {number('captures')} = pending {number('pending')} + in flight {number('downloading')} "
         f"+ saved {number('documents')} (includes {number('downloaded_unscanned')} awaiting scan) "
-        f"+ failed {number('failed_captures')} + non-text skips {number('skipped_non_text')} "
+        f"+ failed {number('failed_captures')} (includes {number('unavailable_captures')} confirmed unavailable) "
+        f"+ non-text skips {number('skipped_non_text')} "
         f"+ URL-filter skips {number('skipped_url_filter')} + media handoffs {number('deferred_to_media')} "
         f"+ unsupported media {number('unsupported_non_text')} + other skips {number('skipped_other')} "
         f"+ other states {number('other_states')}. Accounted for: {number('accounted_captures')}."

@@ -81,6 +81,30 @@ class PermanentRequestError(RuntimeError):
         self.category = category
 
 
+def _permanent_http_rejection(status, url, headers, preview=b""):
+    """Keep streamed and in-memory HTTP outcomes identical and evidence based."""
+    runtime_error = str(headers.get('x-archive-wayback-runtime-error')
+                        or headers.get('X-Archive-Wayback-Runtime-Error') or '')
+    try:
+        body_preview = bytes(preview[:4096]).decode('utf-8', 'ignore')
+    except Exception:
+        body_preview = ''
+    combined = (runtime_error + ' ' + body_preview).casefold()
+    if status == 403 and 'robots.txt' in combined:
+        category = 'robots_blocked'
+    elif status == 403 and ('blocked site error' in combined or 'excluded from the wayback machine' in combined):
+        category = 'wayback_excluded'
+    elif status == 403:
+        category = 'wayback_forbidden'
+    elif status == 404:
+        category = 'missing_capture'
+    else:
+        category = 'http_client_error'
+    detail = clean_space(runtime_error)[:300]
+    suffix = f" — {detail}" if detail else ''
+    return PermanentRequestError(f"HTTP {status}: {url}{suffix}", status=status, category=category)
+
+
 class RateLimitDeferred(TransientRequestError):
     """Raised only after an optional server-directed wait budget is exhausted."""
 
@@ -331,34 +355,7 @@ class HttpClient:
 
                 if status >= 400:
                     if status not in RETRYABLE_STATUS:
-                        runtime_error = str(
-                            response.headers.get("x-archive-wayback-runtime-error")
-                            or response.headers.get("X-Archive-Wayback-Runtime-Error")
-                            or ""
-                        )
-                        try:
-                            body_preview = bytes(response.data[:4096]).decode("utf-8", "ignore")
-                        except Exception:
-                            body_preview = ""
-                        combined = (runtime_error + " " + body_preview).casefold()
-                        if status == 403 and "robots.txt" in combined:
-                            category = "robots_blocked"
-                        elif status == 403 and (
-                            "blocked site error" in combined
-                            or "excluded from the wayback machine" in combined
-                        ):
-                            category = "wayback_excluded"
-                        elif status == 403:
-                            category = "wayback_forbidden"
-                        elif status == 404:
-                            category = "missing_capture"
-                        else:
-                            category = "http_client_error"
-                        detail = clean_space(runtime_error)[:300]
-                        suffix = f" — {detail}" if detail else ""
-                        raise PermanentRequestError(
-                            f"HTTP {status}: {url}{suffix}", status=status, category=category
-                        )
+                        raise _permanent_http_rejection(status, url, response.headers, response.data)
                     generic_attempt += 1
                     if generic_attempt >= self.retries:
                         raise TransientRequestError(
@@ -540,7 +537,7 @@ class HttpClient:
                 if status >= 400:
                     self._discard_untracked_partial(destination)
                     if status not in RETRYABLE_STATUS:
-                        raise RuntimeError(f"HTTP {status}: {url}")
+                        raise _permanent_http_rejection(status, url, response.headers, response.preview)
                     generic_attempt += 1
                     if generic_attempt >= self.retries:
                         raise TransientRequestError(

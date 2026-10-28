@@ -38,6 +38,8 @@ Legacy `scout` and `scout-gui` console entry points remain available. Internally
 - **Write report now** in Reports: background, read-only committed-state snapshots even during an active operation, including media-only projects, saved in `reports/manual/`. A separate report export does not interrupt downloads or scans.
 - Resume preserves the selected direct/external media phase. GUI and CLI explicitly distinguish `incomplete` operations from a successful report export.
 
+A normal download pass can finish with confirmed missing or archive-blocked captures recorded in Errors. These unavailable captures do not require **Resume incomplete**; they are still failures, never saved bodies. Transient failures recover automatically in fair, bounded sweeps. Unverified indexing, remaining retryable captures, size-limit refusals, and local failures still leave the operation incomplete. With Summary enabled, `reports/indexing_status.tsv` lists the selected targets, unfinished scopes, and last recorded reasons. Target retry time excludes turns spent waiting behind other targets.
+
 An eight-requests-per-second admission target is **not** a guarantee of eight saved captures per second on the live Internet Archive. Checkpoint safety and correct coverage take priority over throughput.
 
 ## Projects and compatibility

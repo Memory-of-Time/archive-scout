@@ -62,6 +62,10 @@ Historical scan regeneration uses the same worker with an explicitly selected sc
 
 `archive-scout run project.json --mode <mode> --format json` returns `status: complete` or `status: incomplete` (with an incomplete exit code) based on the actual operation row, not just whether a report file was written. JSONL similarly distinguishes an `incomplete` final result. Existing Python callers receive a dictionary-compatible mapping of paths with `.status` and `.message` properties; no stored schema migration is required.
 
+A finished download pass may include confirmed missing captures, explicit Wayback exclusions, or robots-blocked captures. They retain their capture/error evidence and are named as **unavailable**, without requiring Resume. Unknown failures, plain HTTP 403, size-limit refusals, local errors, incomplete payloads and unproven indexing remain unfinished. GUI dialogs and CLI JSON/JSONL include the operation's explanation. The report snapshot's stricter `complete` flag still stays false when unavailable failures lack acquired/scanned evidence; its counts separately identify unavailable text/media captures.
+
+With the Summary report and its index-coverage field enabled, `reports/indexing_status.tsv` lists every selected text target, its unfinished scopes, and last recorded reasons. The live indexing queue also shows remaining, retrying, cooling and deferred target counts. Retry time excludes turns behind other targets. Text/media payload recovery allows complete fair sweeps up to the configured no-progress attempt allowance; saved cooldowns do not expire that allowance before an attempt. Persistent 429/503 gate rules and explicit request pacing still apply.
+
 Resumability preserves saved scan results including zero-hit documents, downloaded bytes, CDX cursors and unfinished media state. v1.2.6 uses **schema 11** and backs up supported schema-10 projects before adding independent domain coverage, current retry decisions and derivation revisions. The previous data remains in place; nevertheless make an independent project backup before upgrading and do not open the upgraded project in v1.2.5.
 
 ## Domains and corrected scan recipes

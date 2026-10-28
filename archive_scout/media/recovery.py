@@ -88,7 +88,9 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
                     record_media_failure(db, int(cid), str(category), status, True, config)
         return bool(outstanding)
 
-    budget = NoProgressBudget(config)
+    # Bound failed sweeps, rather than elapsed time across unrelated captures
+    # or a persisted cooldown that has not allowed this run a request yet.
+    budget = NoProgressBudget(config, count_only=True)
     sweep_cursor = (-1.0, 0)
     sweep_started = time.time()
     sweep_progress = False
@@ -101,6 +103,11 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
         # Bounded adoption is repeated; a large legacy error history must not
         # leave everything beyond the first selected page undiscoverable.
         adopted = adopt_legacy_batch()
+        if sweep_cursor == (-1.0, 0):
+            # Freeze eligibility only during an admitted sweep. An idle sweep
+            # must advance after its wait, or future-due captures can never
+            # enter it even when their persisted cooldown has expired.
+            sweep_started = time.time()
         args = tuple(signatures)
         due = db.execute(
             "SELECT s.media_capture_id,s.next_eligible_at FROM media_retry_schedule s JOIN media_captures mc ON mc.id=s.media_capture_id "

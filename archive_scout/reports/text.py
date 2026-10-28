@@ -171,6 +171,22 @@ def _index_coverage_status(database: sqlite3.Connection) -> str:
             f"checkpoint windows complete; {incomplete:,} incomplete")
 
 
+def _write_indexing_status(config, database, root, stop_event=None):
+    from ..cdx.status import text_index_status
+    status = text_index_status(database, config)
+    def lines():
+        yield 'target\tstatus\tunfinished_scopes\treason\tlast_error'
+        for row in status['targets']:
+            if stop_event is not None and stop_event.is_set():
+                from ..events import Stopped
+                raise Stopped
+            yield '\t'.join(str(row[key]).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+                            for key in ('target', 'status', 'unfinished_scopes', 'reason', 'last_error'))
+    path = root / 'indexing_status.tsv'
+    atomic_write_lines(path, lines())
+    return path
+
+
 def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
                            *, operation: str = "index",
                            progress: Callable[[str, int, bool], None] | None = None,
@@ -188,6 +204,11 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
         _write_selected(root,None,"all_indexed_urls",
                         _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths,progress,stop_event)
     if opts.output_enabled("summary"):
+        from ..cdx.status import text_index_status, format_index_status
+        from ..downloads.outcomes import text_outcome_counts
+        if 'index_coverage' in opts.summary_fields:
+            paths['indexing_status'] = _write_indexing_status(config, database, root, stop_event)
+        outcomes = text_outcome_counts(database, config) if 'states' in opts.summary_fields else {'unfinished': 0, 'unavailable': 0}
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         values = {
             "heading": "Archive Scout",
@@ -197,10 +218,11 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
-            "index_coverage": _index_coverage_status(database),
+            "index_coverage": _index_coverage_status(database) + '\n' + format_index_status(text_index_status(database, config)),
             "unresolved_errors": f"Unresolved errors: {int(database.execute('SELECT COUNT(*) FROM errors WHERE resolved=0').fetchone()[0]):,}",
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
-            "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
+            "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items()))
+                + f"\nSelected text download outcomes: {outcomes['unfinished']:,} unfinished; {outcomes['unavailable']:,} confirmed unavailable (retained in Errors; no automatic retry needed).",
         }
         _write_selected(root, None, "summary", (values[field] for field in opts.summary_fields if field in values), paths, progress, stop_event)
     if opts.output_enabled("errors"):
@@ -384,6 +406,11 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
     if opts.output_enabled("site_issues"):
         _write_selected(root, run_dir, "site_issues", _site_issue_rows(database, opts.fields_for("site_issues")), paths, progress, stop_event)
     if opts.output_enabled("summary"):
+        from ..cdx.status import text_index_status, format_index_status
+        from ..downloads.outcomes import text_outcome_counts
+        if 'index_coverage' in opts.summary_fields:
+            paths['indexing_status'] = _write_indexing_status(config, database, root, stop_event)
+        outcomes = text_outcome_counts(database, config) if 'states' in opts.summary_fields else {'unfinished': 0, 'unavailable': 0}
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         keywords = json.loads(run["keywords_json"])
         values = {
@@ -397,7 +424,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             "targets": f"Targets: {', '.join(config.targets) or '(project database only)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
-            "index_coverage": _index_coverage_status(database),
+            "index_coverage": _index_coverage_status(database) + '\n' + format_index_status(text_index_status(database, config)),
             "ranked_matches": f"Ranked matches at score >= {config.minimum_score}: {int(database.execute('SELECT COUNT(*) FROM document_matches WHERE scan_run_id=? AND score>=? AND excluded=0 AND required_missing=0', (scan_run_id, config.minimum_score)).fetchone()[0]):,}",
             "scan_diagnostic": (
                 "Scan status: " +
@@ -410,7 +437,8 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             ),
             "unresolved_errors": f"Unresolved errors: {int(database.execute('SELECT COUNT(*) FROM errors WHERE resolved=0').fetchone()[0]):,}",
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
-            "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
+            "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items()))
+                + f"\nSelected text download outcomes: {outcomes['unfinished']:,} unfinished; {outcomes['unavailable']:,} confirmed unavailable (retained in Errors; no automatic retry needed).",
         }
         _write_selected(root, run_dir, "summary", (values[name] for name in opts.summary_fields if name in values), paths, progress, stop_event)
     atomic_write_text(root / "latest_scan_run.txt", f"{scan_run_id}\n{run_dir}\n")

@@ -154,6 +154,11 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
                 "SELECT COUNT(*) FROM index_state WHERE complete=0").fetchone()[0])
             incomplete_media = int(db.execute("SELECT COUNT(*) FROM media_index_state WHERE complete=0").fetchone()[0])
             media_pending = int(db.execute("SELECT COUNT(*) FROM media_captures WHERE state IN ('pending','error','downloading')").fetchone()[0])
+            from ..downloads.outcomes import text_unavailable, media_unavailable
+            unavailable_text = int(db.execute("SELECT COUNT(*) FROM captures c WHERE c.state='error' AND "
+                                              + text_unavailable()).fetchone()[0])
+            unavailable_media = int(db.execute("SELECT COUNT(*) FROM media_captures mc WHERE mc.state='error' AND "
+                                               + media_unavailable()).fetchone()[0])
             request = db.execute("SELECT value FROM project_meta WHERE key='resume_request'").fetchone()
             backlog = db.execute("SELECT value FROM project_meta WHERE key='resume_backlog'").fetchone()
             unfinished_requests = int(request is not None) + (len(json.loads(backlog[0])) if backlog else 0)
@@ -178,6 +183,8 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
                 "counts": {"indexed_captures": captures, "media_captures": media,
                            "saved_documents": documents, "unfinished_text_captures": pending,
                            "unfinished_media_captures": media_pending,
+                           "unavailable_text_captures": unavailable_text,
+                           "unavailable_media_captures": unavailable_media,
                            "index_checkpoints": index_checkpoints,
                            "incomplete_index_checkpoints": incomplete_index,
                            "incomplete_media_checkpoints": incomplete_media,
@@ -189,7 +196,9 @@ def _export_project_snapshot_locked(config: ProjectConfig, *, scan_run_id: int |
                                  not (pending or media_pending or incomplete_index or incomplete_media
                                       or unfinished_requests or embedded_pending)),
                 "files": sorted(str(value.relative_to(staging)) for value in paths.values() if value.is_file()),
-                "note": "A successful report export does not establish inventory, acquisition, or scan completeness."
+                "note": "A successful report export does not establish inventory, acquisition, or scan completeness. "
+                        "A finished download pass can include confirmed unavailable captures kept in Errors; "
+                        "unavailable capture failures still keep this stricter completeness flag false."
             }
             if not paths:
                 manifest["note"] += " No report outputs are enabled."

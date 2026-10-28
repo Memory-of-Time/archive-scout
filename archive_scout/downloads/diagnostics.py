@@ -27,7 +27,8 @@ def build_fingerprint():
     digest = hashlib.sha256()
     found = False
     for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
-                 'downloads/validation.py', 'network/transports.py', 'cdx/client.py',
+                 'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'cdx/client.py',
+                 'cdx/indexer.py', 'cdx/status.py',
                  'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
         path = root / name
         if path.is_file():

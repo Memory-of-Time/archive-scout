@@ -265,13 +265,15 @@ def _run_command(args: argparse.Namespace) -> int:
         outcome = getattr(paths, "status", "complete")
         result = {"status": outcome, "mode": args.mode,
                   "paths": {key: str(value) for key, value in paths.items()}}
-        if outcome != "complete":
+        if getattr(paths, 'message', '') or outcome != "complete":
             result["message"] = getattr(paths, "message", "Unfinished work retained")
         if args.format == "jsonl":
             _print_json({"type": outcome, "data": result})
         elif args.format == "json":
             _print_json(result)
         else:
+            if result.get('message'):
+                print(result['message'])
             for name, path in paths.items():
                 print(f"{name}: {path}")
         return EXIT_INCOMPLETE if outcome == "incomplete" else EXIT_OK

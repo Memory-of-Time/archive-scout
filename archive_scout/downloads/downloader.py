@@ -745,6 +745,7 @@ def download_archive(
         scanner_wakeup.set()
     completed = matched = failures = saved_this_pass = 0
     held_failures = oversized_failures = 0
+    unavailable_failures = 0
     recent_commits: deque[float] = deque()
     stage_stats = {"network_and_pacing_seconds": 0.0,
                    "file_fsync_publish_seconds": 0.0,
@@ -997,6 +998,8 @@ def download_archive(
                         if not retryable:
                             held_failures += 1
                             oversized_failures += int(category=='oversized_response')
+                            from .outcomes import UNAVAILABLE_CATEGORIES
+                            unavailable_failures += int(category in UNAVAILABLE_CATEGORIES)
                         issue_message = site_issue_message(
                             category, str(row["original_url"]), "text download", status
                         )
@@ -1075,6 +1078,7 @@ def download_archive(
                                 f"retained {retained:,}; excluded/routed {excluded:,}; "
                                 f"attempt outcomes {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
                                 f"matches committed asynchronously; errors {failures:,}; recent successful saves {rate:.1f}/s (30s); "
+                                f"unavailable outcomes {unavailable_failures:,}; "
                                 f"acquisition average {invocation_rate:.1f}/s; "
                                 f"batch average including preparation {saved_this_pass/max(.001,now-operation_started):.1f}/s",
                                 cumulative_completed,
@@ -1092,6 +1096,7 @@ def download_archive(
                                     "capture_total": cumulative_total,
                                     "attempt_outcomes": completed,
                                     "attempt_errors": failures,
+                                    "unavailable_outcomes": unavailable_failures,
                                     "initial_queue_size": initial_queue_size,
                                     "admitted_attempts": total,
                                     "queue_preparation_seconds": queue_preparation_seconds,
@@ -1125,10 +1130,12 @@ def download_archive(
         size_detail = (f" {oversized_failures:,} exceeded the configured text size limit "
                        f"({config.max_file_mb:g} MiB); increasing that limit makes them eligible again."
                        if oversized_failures else '')
-        callback(ProgressEvent('download_incomplete',
-            f"{held_failures:,} capture(s) remain unfinished with automatic replay retries held for their latest outcome."
+        callback(ProgressEvent('download_incomplete' if held_failures > unavailable_failures else 'download_summary',
+            f"{unavailable_failures:,} capture(s) confirmed unavailable; recorded in Errors without requiring Resume. "
+            f"{held_failures-unavailable_failures:,} other held failure(s) remain unfinished."
             + size_detail + " Review Errors for the current reason; size-limit and missing-capture outcomes support an explicit selected-error recheck.",
-            detail={'held_failures':held_failures,'oversized_failures':oversized_failures,'retain_notice':True}))
+            detail={'held_failures':held_failures,'unavailable_failures':unavailable_failures,
+                    'oversized_failures':oversized_failures,'retain_notice':True}))
     if scanner_failures:
         raise RuntimeError("background scanner failed; retained bodies remain recoverable") from scanner_failures[0]
     # Final safeguard catches a small race between the last network commit and

@@ -475,6 +475,7 @@ def _defer_media_window(
             "media_index",
             "transient_media_index_delay",
             f"{target} {label}: {type(exc).__name__}: {exc}",
+            http_status=getattr(exc, 'status', None),
             retryable=True,
         )
         if len(plan.pending) > 1:
@@ -829,14 +830,24 @@ def index_direct_media(
         total += extra - previous_extra
 
         retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
+        retry_budget.resume()
         while plan.pending:
             if retry_budget.exhausted:
                 with database:
+                    previous_error = database.execute('SELECT http_status,message FROM errors WHERE id=?',
+                                                      (error_id,)).fetchone() if error_id else None
+                    detail = retry_budget.details()
+                    error_id = record_error(database, 'media_index', 'retry_budget_exhausted',
+                        f"{target}: {detail['attempts_without_progress']}/{detail['attempt_limit']} attempts "
+                        f"without progress; {detail['active_no_progress_seconds']:.1f}s active recovery time "
+                        "(time queued behind other targets excluded). Last failure: "
+                        + (str(previous_error[1])[:1200] if previous_error else 'no verified response'),
+                        http_status=previous_error[0] if previous_error else None, retryable=True)
                     _save_media_state(database,target_id,year,state_signature,encode_plan(plan),False,seen,error_id)
                 retry_deferred.add(task_key)
                 if callback:
                     callback(ProgressEvent("media_index_incomplete", incomplete_retry_message(target),
-                             completed, total, {"retain_notice": True}))
+                             completed, total, {**detail, "retain_notice": True}))
                 break
             active = spent.get(target,0.0) + time.monotonic() - turn_started
             if budget_limit is not None and active >= budget_limit:
@@ -1187,6 +1198,7 @@ def index_direct_media(
                     _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
                 raise
         accounted[task_key] = (plan.completed,max(0,plan.planned-len(default_windows)))
+        retry_budget.pause()
         spent[target] = spent.get(target,0.0) + time.monotonic()-turn_started
     return bool(budget_deferred or retry_deferred)
 

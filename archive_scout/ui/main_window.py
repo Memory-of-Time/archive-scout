@@ -2055,12 +2055,13 @@ class ArchiveScoutApp(tk.Tk):
                     self.progress.configure(mode="determinate")
                     self.progress_var.set(100)
                     self.status_var.set("Complete")
-                    self.log("Complete. Reports are ready.")
+                    outcome_message = getattr(payload, 'message', '') or 'The run is complete.'
+                    self.log(outcome_message + " Reports are ready.")
                     self.finish_run()
                     self.refresh_history()
                     self.refresh_results()
                     self.refresh_errors()
-                    messagebox.showinfo(APP_NAME, "The run is complete.")
+                    messagebox.showinfo(APP_NAME, outcome_message)
                 elif kind == "incomplete_result":
                     self.last_paths = payload["paths"]
                     self.progress.stop()
@@ -2069,7 +2070,7 @@ class ArchiveScoutApp(tk.Tk):
                     self.finish_run()
                     self.refresh_history()
                     self.refresh_errors()
-                    messagebox.showwarning(APP_NAME, "Reports were written, but unfinished work remains. Resume to continue.")
+                    messagebox.showwarning(APP_NAME, payload['message'] + "\n\nReports were written; unfinished checkpoints are retained.")
                 elif kind == "manual_report_done":
                     self.write_report_now_button.configure(state="normal")
                     self.report_worker_thread = None

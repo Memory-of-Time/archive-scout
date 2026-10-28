@@ -8,7 +8,7 @@ from collections import deque
 from ..events import ProgressEvent
 
 
-_TELEMETRY = {"network", "retry", "download_retry", "site_issue", "warning", "log"}
+_TELEMETRY = {"network", "retry", "download_retry", "site_issue", "warning", "log", "index_status", "download_summary"}
 _WAITING = {"network_waiting", "rate_limit_waiting", "rate_limit", "network_pause"}
 
 
