@@ -178,8 +178,7 @@ class MediaAuditV124(unittest.TestCase):
                 def blocked(*args,**kwargs):
                     raise PermanentRequestError('403',status=403,category='wayback_forbidden')
                 with patch.object(HttpClient,'get_cdx_any',blocked):
-                    with self.assertRaises(PermanentRequestError):
-                        index_media(cfg,db,threading.Event())
+                    index_media(cfg,db,threading.Event())
                 state=db.execute('SELECT complete,resume_key FROM media_index_state').fetchone()
                 self.assertEqual(state['complete'],0)
                 self.assertIsNotNone(state['resume_key'])

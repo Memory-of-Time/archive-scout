@@ -132,8 +132,7 @@ class CoverageIntegrityTests(unittest.TestCase):
             cfg=self.config(Path(tmp)); db=open_database(cfg.output_dir)
             with patch("archive_scout.cdx.client.HttpClient.get_cdx_any",side_effect=PermanentRequestError(
                 "HTTP 403", status=403, category="wayback_forbidden")):
-                with self.assertRaises(PermanentRequestError):
-                    index_archive(cfg,db,threading.Event())
+                self.assertTrue(index_archive(cfg,db,threading.Event()))
             state=db.execute("SELECT complete FROM index_coverage").fetchone()
             self.assertIsNotNone(state)
             self.assertEqual(int(state[0]),0)

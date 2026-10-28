@@ -756,6 +756,7 @@ def index_direct_media(
     retry_budgets = {}
     cursor_histories = {}
     retry_deferred = set()
+    blocked_tasks = set()
     budget_deferred: set[str] = set()
     while task_queue:
         if stop_event.is_set():
@@ -765,7 +766,7 @@ def index_direct_media(
         if target in budget_deferred:
             continue
         task_key = (target,year)
-        if task_key in retry_deferred:
+        if task_key in retry_deferred or task_key in blocked_tasks:
             continue
         now = time.monotonic()
         if due.get(task_key,0) > now:
@@ -1153,7 +1154,7 @@ def index_direct_media(
                     task_queue.append(task)
                     break
             except RuntimeError as exc:
-                if isinstance(exc, PermanentRequestError) and exc.category in {"wayback_excluded", "wayback_forbidden"}:
+                if isinstance(exc, PermanentRequestError) and exc.status == 403:
                     category = exc.category
                     message = site_issue_message(category, target, "media CDX indexing", exc.status)
                     # Forbidden/excluded responses are coverage blockers, not
@@ -1169,9 +1170,12 @@ def index_direct_media(
                             target=target, http_status=exc.status,
                         )
                         _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
+                    blocked_tasks.add(task_key)
                     if callback:
-                        callback(ProgressEvent("site_issue", message + "; media inventory incomplete", completed, total))
-                    raise
+                        callback(ProgressEvent("site_issue", message +
+                            "; this scope remains unfinished; continuing other media indexing scopes.",
+                            completed, total, {"target": target, "http_status": exc.status, "retain_notice": True}))
+                    break
                 if current.strategy == "paged" and _pagination_unavailable(exc):
                     current.pagination_supported = False
                     current.strategy = "resume"
@@ -1200,7 +1204,7 @@ def index_direct_media(
         accounted[task_key] = (plan.completed,max(0,plan.planned-len(default_windows)))
         retry_budget.pause()
         spent[target] = spent.get(target,0.0) + time.monotonic()-turn_started
-    return bool(budget_deferred or retry_deferred)
+    return bool(budget_deferred or retry_deferred or blocked_tasks)
 
 
 def _discover_document_media(

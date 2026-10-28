@@ -28,10 +28,12 @@ PERMANENT_SITE_ISSUES = {
 
 def host_from_url(url: str) -> str:
     try:
-        parsed = urllib.parse.urlsplit(str(url or ""))
+        value = str(url or "").strip()
+        parsed = urllib.parse.urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
+        host = (parsed.hostname or "unknown").casefold().removeprefix("*.")
     except (TypeError, ValueError, UnicodeError):
         return "unknown"
-    return (parsed.hostname or "unknown").casefold()
+    return host if host != "*" else "unknown"
 
 
 def site_issue_message(category: str, url: str, stage: str, status: int | None = None) -> str:
@@ -39,11 +41,11 @@ def site_issue_message(category: str, url: str, stage: str, status: int | None =
     host = host_from_url(url)
     status_text = f" (HTTP {int(status)})" if status else ""
     if category == "wayback_excluded":
-        detail = "The Internet Archive reports that this material is excluded from Wayback access."
+        detail = "The Internet Archive reports an exclusion for this request."
     elif category == "robots_blocked":
-        detail = "Wayback is refusing this replay because of a robots.txt restriction recorded for the site."
+        detail = "Wayback reports a robots.txt restriction for this request."
     elif category == "wayback_forbidden":
-        detail = "Wayback rejected this index request. Some broad CDX queries require different access or a narrower target."
+        detail = "Wayback refused this request. The response alone does not establish whether the restriction is query-specific, site-specific, or broader."
     elif category == "missing_capture":
         detail = "The requested capture is not available from Wayback."
     elif category == "origin_unavailable":

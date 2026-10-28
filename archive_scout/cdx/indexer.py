@@ -1236,12 +1236,13 @@ def index_archive(
     retry_budgets = {}
     cursor_histories = {}
     retry_deferred = set()
+    blocked_tasks = set()
     budget_deferred: set[str] = set()
     accounted: dict[tuple, tuple[int, int]] = {}
     remaining_tasks = Counter(task[0] for task in tasks)
 
     def queue_status():
-        deferred_targets = budget_deferred | {key[0] for key in retry_deferred}
+        deferred_targets = budget_deferred | {key[0] for key in retry_deferred | blocked_tasks}
         cooling_targets = {key[0] for key, ready_at in due.items()
                            if ready_at > time.monotonic() and key[0] in remaining_tasks}
         retrying_targets = {key[0] for key, budget in retry_budgets.items()
@@ -1267,7 +1268,7 @@ def index_archive(
             task = task_queue.popleft()
             target, target_config, target_id, state_kind, year, task_start, task_end, default_windows, signature = task
             task_key = (target, state_kind, year, task_start, task_end)
-            if target in budget_deferred or task_key in retry_deferred:
+            if target in budget_deferred or task_key in retry_deferred or task_key in blocked_tasks:
                 continue
             ready = due.get(task_key, 0.0)
             now = time.monotonic()
@@ -1892,7 +1893,7 @@ def index_archive(
                         yielded = True
                         break
                 except RuntimeError as exc:
-                    if isinstance(exc, PermanentRequestError) and exc.category in {"wayback_excluded", "wayback_forbidden"}:
+                    if isinstance(exc, PermanentRequestError) and exc.status == 403:
                         category = exc.category
                         message = site_issue_message(category, target, "CDX indexing", exc.status)
                         # A 403 is not evidence that every capture was indexed.
@@ -1906,9 +1907,12 @@ def index_archive(
                             record_site_issue(database, host_from_url(target), "cdx_index",
                                               category, message, target=target, http_status=exc.status)
                             persist_task_state(encode_plan(plan), False, seen, error_id)
-                        emit(callback, ProgressEvent("site_issue", message + "; indexing remains incomplete.",
-                                                     completed_windows, total_windows))
-                        raise
+                        blocked_tasks.add(task_key)
+                        emit(callback, ProgressEvent("site_issue", message +
+                            "; this scope remains unfinished; continuing other indexing scopes.",
+                            completed_windows, total_windows,
+                            {"target": target, "http_status": exc.status, "retain_notice": True}))
+                        break
                     if current.strategy == "paged" and _is_pagination_unavailable(exc):
                         current.pagination_supported = False
                         current.strategy = "resume"
@@ -1955,7 +1959,7 @@ def index_archive(
     emit(callback, ProgressEvent('index_status', format_index_status(status),
          status['complete_targets'], status['selected_targets'],
          {**{key: value for key, value in status.items() if key != 'targets'}, 'retain_notice': True}))
-    return bool(status['unfinished_targets'] or budget_deferred or retry_deferred)
+    return bool(status['unfinished_targets'] or budget_deferred or retry_deferred or blocked_tasks)
 
 def _request_paged_count(
     client: HttpClient,

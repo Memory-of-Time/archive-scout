@@ -1034,11 +1034,12 @@ def queue_media_discovery_candidates(
 
 
 def blocked_site_reasons(database: sqlite3.Connection) -> dict[str, str]:
-    """Return hosts currently known to be unavailable due to archive policy."""
+    """Return replay-policy blocks; an index query refusal cannot block every replay."""
     result: dict[str, str] = {}
     for row in database.execute(
         """SELECT host,category FROM site_issues
            WHERE resolved=0 AND category IN ('wayback_excluded','robots_blocked')
+             AND stage NOT IN ('cdx_index','media_cdx_index')
            ORDER BY CASE category WHEN 'wayback_excluded' THEN 0 ELSE 1 END,last_seen DESC"""
     ):
         host = str(row[0] or '').strip().casefold()
