@@ -120,7 +120,7 @@ def _extra_collapse_affects_extreme(config: ProjectConfig) -> bool:
 
 def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int | None = None) -> str:
     if revision is None:
-        revision = 5 if _extra_collapse_affects_extreme(config) else 4
+        revision = 6
     payload = {"media_query_signature": media_query_signature(config, page_size), "index_revision": int(revision)}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -131,7 +131,7 @@ def media_signature_candidates(config: ProjectConfig) -> tuple[tuple[str, str], 
     for size in [config.page_size, 5000, 25000, 1000, 10000, 50000, 100000, 150000]:
         for discovery_version in (2, 1):
             media_signature = media_query_signature(config, size, discovery_version=discovery_version)
-            for revision in (5, 4, 3, 2):
+            for revision in (6, 5, 4, 3, 2):
                 raw = json.dumps({'media_query_signature': media_signature, 'index_revision': revision},
                                  sort_keys=True, separators=(',', ':'))
                 item = (media_signature, hashlib.sha256(raw.encode()).hexdigest()[:20])
@@ -153,6 +153,21 @@ def extension_filter_regex(extensions: list[str]) -> str:
     # image.jpg&ref=thumb without a question mark. Accept those separators too.
     return rf"(?i).*(?:\.|%2e)(?:{escaped})(?:$|[?&#;].*)"
 
+
+
+def media_discovery_filter(extensions: list[str], media) -> str:
+    encoded = []
+    for extension in sorted(set(extensions)):
+        value = extension.casefold().lstrip(".")
+        encoded.append("".join(f"(?:{re.escape(char)}|%{ord(char):02x})" for char in value))
+    suffix = r"(?:\.|%2e)(?:" + "|".join(encoded) + r")(?:$|[?&#;\s]|%[0-9a-f]{2})"
+    alternatives = [suffix]
+    if media.include_images:
+        alternatives.append(r"\simage/[^\s]+\s")
+    if media.include_videos:
+        alternatives.extend([r"\svideo/[^\s]+\s",
+            r"\sapplication/(?:x-shockwave-flash|futuresplash|vnd\.rn-realmedia|x-mplayer2)(?:;[^\s]*)?\s"])
+    return (r"(?i).*(?:" + "|".join(alternatives) + r").*").replace("(?:", "(")
 
 def build_media_params(
     config: ProjectConfig,
@@ -182,10 +197,13 @@ def build_media_params(
     if config.media.normalized().snapshot_strategy == "all":
         params.extend(("collapse", value) for value in config.cdx_collapses)
     if not exact and extensions:
-        # One regex filter covers every selected extension. Archive Scout never
-        # performs an extension-by-extension CDX index.
-        params.append(("filter", "original:" + extension_filter_regex(extensions)))
+        # Use one full-record superset filter, then enforce the local policy.
+        params.append(("filter", media_discovery_filter(extensions, config.media)))
     extras = parse_cdx_parameter_lines(config.cdx_extra_params)
+    managed = {"page", "pagesize", "shownumpages", "showpagedindex", "offset"}
+    for key, _ in extras:
+        if key.casefold() in managed:
+            raise ValueError(f"{key} is controlled by media indexing and cannot be added as an advanced parameter")
     if config.media.normalized().snapshot_strategy != 'all':
         extras = [(key, value) for key, value in extras if key != 'collapse']
     params.extend(extras)
@@ -323,22 +341,9 @@ def _adopt_compatible_media_state(
         ).fetchone()
         if not state:
             continue
-        # Revision 4 closes two old false-completion paths: terminal pages
-        # with a lost cursor, and earliest/latest reused from a collapsed text
-        # index. Keep all capture rows/files; only uncertain coverage is redone.
-        # Valid unfinished cursors remain restartable. Small proven terminal
-        # inventories and revision-4 evidence remain directly reusable.
-        candidate_sizes = [identity_config.page_size, 5000, 25000, 1000,
-                           10000, 50000, 100000, 150000]
-        page_size = next((size for size in candidate_sizes
-                         if media_query_signature(identity_config, size) == candidate_signature),
-                        identity_config.page_size)
-        proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': 5 if _extra_collapse_affects_extreme(config) else 4},
-                           sort_keys=True, separators=(',', ':'))
-        old_revision = candidate_state != hashlib.sha256(proof.encode()).hexdigest()[:20]
-        if state['complete'] and old_revision and (
-                int(state['seen'] or 0) >= min(100, page_size) or
-                (config.media.snapshot_strategy in {'earliest', 'latest'} and (config.cdx_collapses or _extra_collapse_affects_extreme(config)))):
+        current_proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': 6},
+                                   sort_keys=True, separators=(',', ':'))
+        if candidate_state != hashlib.sha256(current_proof.encode()).hexdigest()[:20]:
             continue
         if candidate_signature != signature:
             database.execute(
@@ -374,65 +379,8 @@ def _reuse_completed_main_index(
     media_signature: str,
     state_signature: str,
 ) -> tuple[bool, int, int]:
-    """Populate media rows from a completed normal index without another CDX pass."""
-    if config.media.snapshot_strategy in {"earliest", "latest"} and (
-            config.cdx_collapses or any(k == 'collapse' for k, _ in parse_cdx_parameter_lines(config.cdx_extra_params))):
-        # A digest/urlkey representative is not proof of either timestamp
-        # extreme. Only the uncollapsed timestamp inventory is sufficient.
-        return False, 0, 0
-    target_row = database.execute("SELECT id FROM targets WHERE pattern=?", (target,)).fetchone()
-    if not target_row:
-        return False, 0, 0
-    normal_target_id = int(target_row["id"])
-    start, end = ((config.from_date, config.to_date) if year == 0 else
-                  cdx_year_window(config, year) or (f"{year:04d}0101000000", f"{year:04d}1231235959"))
-    reusable_signature = None
-    for candidate in cdx_query_signatures(config):
-        row = database.execute(
-            "SELECT complete FROM index_state WHERE target_id=? AND year=? AND query_signature=?",
-            (normal_target_id, year, candidate),
-        ).fetchone()
-        if (((year == 0 or config.text_collapse_scope == 'range')
-             and not uncovered_index_ranges(database, normal_target_id, candidate, start, end))
-                or (year != 0 and row and row["complete"])):
-            reusable_signature = candidate
-            break
-    if reusable_signature is None:
-        return False, 0, 0
-
-    media = config.media.normalized()
-    seen = 0
-    changed = 0
-    cursor = database.execute(
-        "SELECT original_url,timestamp,mimetype,statuscode,digest,length FROM captures "
-        "WHERE (target_id=? OR EXISTS (SELECT 1 FROM capture_target_membership m "
-        "WHERE m.capture_id=captures.id AND m.target_id=?)) "
-        "AND query_signature=? AND timestamp BETWEEN ? AND ? ORDER BY id",
-        (normal_target_id, normal_target_id, reusable_signature, start, end),
-    )
-    while True:
-        batch = cursor.fetchmany(10000)
-        if not batch:
-            break
-        accepted: list[tuple[CDXRow, str, str]] = []
-        seen += len(batch)
-        for item in batch:
-            row: CDXRow = (
-                str(item["timestamp"]),
-                str(item["original_url"]),
-                str(item["mimetype"] or ""),
-                str(item["statuscode"] or ""),
-                str(item["digest"] or ""),
-                str(item["length"] or 0),
-            )
-            allowed, kind, extension = allowed_media_url(row[1], media, row[2])
-            if allowed and kind:
-                accepted.append((row, kind, extension))
-        changed += upsert_media_captures(
-            database, accepted, media_target_id, media_signature, source_type="main_index"
-        )
-    _save_media_state(database, media_target_id, year, state_signature, None, True, seen, None)
-    return True, seen, changed
+    """Text checkpoints cannot prove the expanded standalone media query."""
+    return False, 0, 0
 
 
 def _wait_seconds(config: ProjectConfig, failures: int) -> float:
@@ -542,6 +490,10 @@ def _request_media_paged_batch(
             max_bytes=1024 * 1024,
             prefer_text=False,
         )
+        if isinstance(payload, bool) or (isinstance(payload, list) and payload and isinstance(payload[0], list)
+                and {"timestamp", "original", "urlkey"}.intersection(str(value) for value in payload[0])):
+            from ..cdx.client import MalformedCDXResponse
+            raise MalformedCDXResponse("Media page-count request returned capture rows or invalid metadata; no page layout verified", splittable=False)
         current.page_count = parse_num_pages(payload)
         current.page_layout = layout
         current.page = min(current.page, current.page_count)
@@ -606,6 +558,7 @@ def _request_media_resume(
     *, exact: bool = False,
 ) -> tuple[list[CDXRow], bool, str | None]:
     # Cursor advancement must be atomic with inserted media inventory rows.
+    current.verify_paged_next = False
     page_size = current.page_size or config.page_size
     result = request_cdx_rows(
         client,
@@ -622,13 +575,14 @@ def _request_media_resume(
         ),
         max_bytes=cdx_response_budget(page_size),
         prefer_text=True,
+        verify_terminal=True,
     )
     rows, next_resume = result.rows, result.resume_key
     if next_resume:
         if next_resume == current.resume_key:
             raise TransientRequestError("CDX returned the same media resume key twice", splittable=True)
         return rows, False, next_resume
-    if len(rows) >= page_size and isinstance(client, HttpClient):
+    if len(rows) >= page_size and not result.terminal_verified and isinstance(client, HttpClient):
         confirmation = request_cdx_rows(
             client, cdx_endpoints(config),
             build_media_params(config, target, current.start, current.end, current.resume_key,
@@ -640,6 +594,9 @@ def _request_media_resume(
             from ..cdx.client import MalformedCDXResponse
             raise MalformedCDXResponse(
                 "Full-sized media CDX page has unconfirmed terminal membership", splittable=False)
+    if result.needs_paged_check and current.page_count < 0:
+        current.verify_paged_next = True
+        return rows, False, None
     return rows, True, None
 
 
@@ -825,6 +782,11 @@ def index_direct_media(
         seen = int(state["seen"] or 0) if state else 0
         error_id = int(state["error_id"]) if state and state["error_id"] else None
         plan = decode_plan(state["resume_key"] if state else None, default_windows)
+        if task_key not in accounted:
+            for window in plan.pending:
+                if window.merged_verified and not window.pagination_supported:
+                    window.pagination_supported = True
+                    window.strategy = "paged"
         previous_complete, previous_extra = accounted.get(task_key,(0,0))
         completed += plan.completed - previous_complete
         extra = max(0, plan.planned - len(default_windows))
@@ -833,6 +795,18 @@ def index_direct_media(
         retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
         retry_budget.resume()
         while plan.pending:
+            blocked_window = plan.pending[0]
+            if blocked_window.merged_verified and not blocked_window.pagination_supported:
+                with database:
+                    error_id = record_error(database, "media_index", "coverage_verification_unavailable",
+                        f"{target}: merged media rows retained, but numbered verification is unavailable; coverage remains incomplete",
+                        retryable=True)
+                    _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
+                blocked_tasks.add(task_key)
+                if callback:
+                    callback(ProgressEvent("media_index_incomplete", f"{target}: numbered verification is unavailable; discovered media and unfinished coverage retained.",
+                        completed, total, {"retain_notice": True}))
+                break
             if retry_budget.exhausted:
                 with database:
                     previous_error = database.execute('SELECT http_status,message FROM errors WHERE id=?',
@@ -958,9 +932,16 @@ def index_direct_media(
                             transient_failure_streak = 0
                         if batch.finished and _reconcile_paged_completion(current, completed_pages):
                             retry_budget.progress()
-                            plan.pending.pop(0)
-                            plan.completed += 1
-                            completed += 1
+                            if current.merged_verified:
+                                plan.pending.pop(0)
+                                plan.completed += 1
+                                completed += 1
+                            else:
+                                current.strategy = "resume"
+                                current.resume_key = None
+                                current.failures = 0
+                                if callback:
+                                    callback(ProgressEvent("media_index", f"{target} {label}: numbered media pages are durable; reconciling the merged CDX index before declaring full coverage."))
                         complete = not plan.pending
                         _save_media_state(
                             database,
@@ -1052,6 +1033,7 @@ def index_direct_media(
                 accepted_count = len(accepted)
                 write_started = time.monotonic()
                 old_seen, old_cursor = seen, current.resume_key
+                old_strategy, old_merged = current.strategy, current.merged_verified
                 old_failures, old_completed = current.failures, plan.completed
                 old_completed_windows, old_error_id = completed, error_id
                 try:
@@ -1062,6 +1044,10 @@ def index_direct_media(
                                 f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from media continuation",
                                 details={"excluded":excluded_hosts,"raw_rows":received})
                         seen += received
+                        if current.verify_paged_next:
+                            current.strategy = "paged"
+                            current.merged_verified = True
+                            current.resume_key = None
                         current.failures = 0
                         if next_cursor is not None:
                             current.resume_key = next_cursor
@@ -1076,6 +1062,8 @@ def index_direct_media(
                             error_id = None
                 except BaseException:
                     seen, current.resume_key = old_seen, old_cursor
+                    current.strategy, current.merged_verified = old_strategy, old_merged
+                    current.verify_paged_next = False
                     current.failures, plan.completed = old_failures, old_completed
                     completed, error_id = old_completed_windows, old_error_id
                     if finished and (not plan.pending or plan.pending[0] is not current):

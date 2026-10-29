@@ -104,6 +104,8 @@ class FastIndexingTests(unittest.TestCase):
                 values = dict(params)
                 if values.get("showNumPages") == "true":
                     return 4
+                if "page" not in values:
+                    return []
                 page = int(values["page"])
                 page_calls[page] = page_calls.get(page, 0) + 1
                 if page == 1 and page_calls[page] == 1:
@@ -232,7 +234,7 @@ class FastIndexingTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, 1)
         client.close()
 
-    def test_media_reuses_completed_main_index_without_network(self):
+    def test_media_verifies_its_own_query_despite_completed_main_index(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             config = ProjectConfig(text_collapse_scope="year", 
@@ -262,16 +264,17 @@ class FastIndexingTests(unittest.TestCase):
                 {"timestamp": "20010101000001", "original": "http://example.com/a.html", "mimetype": "text/html", "statuscode": "200", "digest": "B", "length": "10"},
             ]
             upsert_captures(database, rows, target_id, signature)
-            database.execute(
-                "INSERT INTO index_state(target_id,year,query_signature,resume_key,complete,seen,error_id,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (target_id, 2001, signature, None, 1, 2, None, utc_now()),
-            )
+            from archive_scout.cdx.indexer import save_state
+            save_state(database, target_id, 2001, signature, None, True, 2, None)
             database.commit()
-            with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", side_effect=AssertionError("network should not run")):
+            def media_response(_client, _urls, params, **kwargs):
+                if dict(params).get('showNumPages') == 'true': return 1
+                return [HEADER, ["20010101000000", "http://example.com/a.jpg", "image/jpeg", "200", "A", "10"]]
+            with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", new=media_response):
                 index_media(config, database, threading.Event())
             row = database.execute("SELECT original_url,source_type FROM media_captures").fetchone()
             self.assertEqual(row["original_url"], "http://example.com/a.jpg")
-            self.assertEqual(row["source_type"], "main_index")
+            self.assertEqual(row["source_type"], "cdx")
             database.close()
 
     def test_earlier_defaults_migrate_to_fast_safe_defaults(self):

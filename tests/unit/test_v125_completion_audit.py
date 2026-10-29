@@ -140,14 +140,14 @@ class MediaInventory(unittest.TestCase):
         self.assertEqual(result,(False,0,0))
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM media_index_state').fetchone()[0],0)
 
-    def test_proven_uncollapsed_range_is_reused_without_network(self):
+    def test_uncollapsed_text_range_does_not_certify_standalone_media(self):
         sig=cdx_query_signature(self.cfg)
         with self.db:
             upsert_captures(self.db,rows(3),self.target,sig)
             save_coverage_state(self.db,self.target,sig,self.cfg.from_date,self.cfg.to_date,None,True,3,None)
         reused,seen,_=_reuse_completed_main_index(self.cfg,self.db,'example.org/*',self.media_target,0,self.sig,self.state_sig)
-        self.assertTrue(reused);self.assertEqual(seen,3)
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM media_captures').fetchone()[0],3)
+        self.assertFalse(reused);self.assertEqual(seen,0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM media_captures').fetchone()[0],0)
 
     def test_missing_page_ledger_is_requeued_instead_of_looping_empty_batches(self):
         cfg=replace(self.cfg,network=replace(self.cfg.network,index_strategy='paged'))
@@ -164,12 +164,13 @@ class MediaInventory(unittest.TestCase):
             item=PageFetchResult(page=0,rows=rows(1),elapsed=0.01)
             consume(item);window.retry_pages=[]
             return PagedBatch([item],[0],True)
-        with patch('archive_scout.media.indexer._request_media_paged_batch',side_effect=batch):
+        with patch('archive_scout.media.indexer._request_media_paged_batch',side_effect=batch), \
+             patch('archive_scout.media.indexer._request_media_resume',return_value=([],True,None)):
             index_direct_media(cfg,self.db,Mock(),threading.Event(),None,sig,state_sig)
         self.assertEqual(len(calls),2)
         self.assertEqual(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?',(state_sig,)).fetchone()[0],1)
 
-    def test_revision_upgrade_preserves_pending_cursor_and_downloaded_files(self):
+    def test_changed_media_filter_keeps_old_cursor_as_evidence_and_saved_files(self):
         old=media_index_state_signature(self.cfg,revision=3)
         cursor=encode_plan(IndexPlan([PendingWindow(self.cfg.from_date,self.cfg.to_date,resume_key='NEXT')],0,1))
         with self.db:
@@ -178,7 +179,8 @@ class MediaInventory(unittest.TestCase):
             self.db.execute("UPDATE media_captures SET state='downloaded',path='keep.jpg'")
             _adopt_compatible_media_state(self.db,self.media_target,0,self.cfg,self.sig,self.state_sig)
         state=self.db.execute('SELECT resume_key,complete FROM media_index_state WHERE query_signature=?',(self.state_sig,)).fetchone()
-        self.assertEqual(tuple(state),(cursor,0))
+        self.assertIsNone(state)
+        self.assertEqual(self.db.execute('SELECT resume_key FROM media_index_state WHERE query_signature=?',(old,)).fetchone()[0],cursor)
         self.assertEqual(tuple(self.db.execute('SELECT state,path FROM media_captures').fetchone()),('downloaded','keep.jpg'))
 
     def test_uncertain_old_full_terminal_page_requires_reverification(self):
@@ -192,12 +194,13 @@ class MediaInventory(unittest.TestCase):
             self.assertIsNone(self.db.execute('SELECT 1 FROM media_index_state WHERE query_signature=?',(current,)).fetchone())
             self.assertIsNotNone(self.db.execute('SELECT 1 FROM media_index_state WHERE query_signature=?',(old,)).fetchone())
 
-    def test_safe_small_old_terminal_inventory_is_adopted(self):
+    def test_even_small_old_extension_filter_inventory_requires_new_discovery(self):
         old=media_index_state_signature(self.cfg,revision=3)
         with self.db:
             _save_media_state(self.db,self.media_target,2008,old,None,True,3,None)
             _adopt_compatible_media_state(self.db,self.media_target,2008,self.cfg,self.sig,self.state_sig)
-        self.assertEqual(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?',(self.state_sig,)).fetchone()[0],1)
+        self.assertIsNone(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?',(self.state_sig,)).fetchone())
+        self.assertEqual(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?',(old,)).fetchone()[0],1)
 
     def test_queue_has_stable_size_order_and_no_repeated_history_scan(self):
         items=[(tuple([*row[:5],str(length)]),'image','.jpg') for row,length in zip(rows(5),[0,7,2,7,-1])]

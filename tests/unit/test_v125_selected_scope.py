@@ -109,7 +109,7 @@ class SelectedScopeTests(unittest.TestCase):
         with self.assertRaises(IndexCoveragePending):
             require_embedded_coverage(self.db, self.cfg, sig)
 
-    def test_legacy_discovery_proof_is_not_reused_but_direct_index_is(self):
+    def test_legacy_discovery_and_old_direct_filter_proofs_require_reindex(self):
         self.seed()
         tid = get_or_create_media_target(self.db, 'example.org/*')
         old_sig = media_query_signature(self.cfg, discovery_version=1)
@@ -118,7 +118,8 @@ class SelectedScopeTests(unittest.TestCase):
         self.db.execute("INSERT INTO media_discovery_documents(query_signature,document_id,content_hash,scanned_at) SELECT ?,id,content_hash,'now' FROM documents", (old_sig,))
         sig = media_query_signature(self.cfg)
         _adopt_compatible_media_state(self.db, tid, 2008, self.cfg, sig, media_index_state_signature(self.cfg))
-        self.assertEqual(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?', (media_index_state_signature(self.cfg),)).fetchone()[0], 1)
+        self.assertIsNone(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?', (media_index_state_signature(self.cfg),)).fetchone())
+        self.assertEqual(self.db.execute('SELECT complete FROM media_index_state WHERE query_signature=?', (old_state,)).fetchone()[0], 1)
         with self.assertRaises(IndexCoveragePending):
             require_embedded_coverage(self.db, self.cfg, sig)
 

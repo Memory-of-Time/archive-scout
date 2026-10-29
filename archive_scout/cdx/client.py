@@ -122,6 +122,8 @@ class CDXRows:
 
     rows: list[CDXRow]
     resume_key: str | None = None
+    terminal_verified: bool = False
+    needs_paged_check: bool = False
 
 
 def is_timeout_error(exc: BaseException) -> bool:
@@ -816,6 +818,7 @@ class HttpClient:
         max_bytes: int = 64 * 1024 * 1024,
         *,
         prefer_text: bool = True,
+        verify_terminal: bool = False,
     ) -> CDXRows:
         """Fetch CDX rows without constructing a second list of per-row dicts.
 
@@ -861,6 +864,29 @@ class HttpClient:
                         )
                     else:
                         result = parse_cdx_rows_payload(parse_json_response(response["data"], endpoint))
+                    wants_resume = any(key == "showResumeKey" and value == "true" for key, value in params)
+                    numbered = any(key in {"page", "showNumPages"} for key, _ in params)
+                    if verify_terminal and wants_resume and not numbered and not result.resume_key:
+                        confirm_params = list(params)
+                        limit = int(dict(params).get("limit", "0"))
+                        if limit > 0 and len(result.rows) >= limit:
+                            confirm_params = [(key, str(limit + 1) if key == "limit" else value) for key, value in params]
+                        confirmation = self.get_cdx_json_rows_any((endpoint,), confirm_params, max_bytes=max_bytes)
+                        if not confirmation.resume_key and limit > 0 and len(confirmation.rows) >= max(limit + 1, len(result.rows) + 1):
+                            raise MalformedCDXResponse("CDX terminal confirmation filled its enlarged limit without a cursor", splittable=False)
+                        if confirmation.resume_key == dict(params).get("resumeKey") and confirmation.resume_key:
+                            raise MalformedCDXResponse("CDX terminal confirmation repeated its input cursor", splittable=False)
+                        if confirmation.rows[:len(result.rows)] != result.rows:
+                            raise MalformedCDXResponse("CDX terminal confirmation disagrees with received membership", splittable=False)
+                        if len(confirmation.rows) > len(result.rows) and self.retry_callback:
+                            self.retry_callback(1, 1, "CDX terminal verification recovered omitted rows", 0.0)
+                        result = confirmation
+                        result.terminal_verified = not bool(result.resume_key)
+                        values = dict(params)
+                        mode = values.get("matchType", "")
+                        target = values.get("url", "")
+                        broad = mode in {"prefix", "host", "domain"} or (not mode and "*" in target)
+                        result.needs_paged_check = result.terminal_verified and broad
                     self._remember_endpoint_success(endpoint)
                     return result
                 except MemoryError as exc:
@@ -1061,6 +1087,7 @@ def request_cdx_rows(
     max_bytes: int = 64 * 1024 * 1024,
     *,
     prefer_text: bool = True,
+    verify_terminal: bool = False,
 ) -> CDXRows:
     """Use the compact row API while retaining compatibility with clients.
 
@@ -1071,9 +1098,10 @@ def request_cdx_rows(
     """
     compact_getter = getattr(client, "get_cdx_rows_any", None)
     if callable(compact_getter):
-        return compact_getter(
-            urls, params, max_bytes=max_bytes, prefer_text=prefer_text
-        )
+        options = {"max_bytes": max_bytes, "prefer_text": prefer_text}
+        if verify_terminal and isinstance(client, HttpClient):
+            options["verify_terminal"] = True
+        return compact_getter(urls, params, **options)
     legacy_getter = getattr(client, "get_cdx_any")
     payload = legacy_getter(
         urls, params, max_bytes=max_bytes, prefer_text=prefer_text

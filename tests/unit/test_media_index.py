@@ -86,12 +86,11 @@ class MediaIndexTests(unittest.TestCase):
                 index_media(config, database, threading.Event())
             self.assertEqual(mocked.call_count, 1)
             params = mocked.call_args.args[1]
-            original_filters = [value for key, value in params if key == "filter" and value.startswith("original:")]
-            self.assertEqual(len(original_filters), 1)
-            for extension in ("jpg", "png", "mp4", "wmv"):
-                self.assertIn(extension, original_filters[0])
-            self.assertNotIn("~original:", original_filters[0])
-            self.assertIn("[?&#;]", original_filters[0])
+            from archive_scout.media.indexer import media_discovery_filter
+            expected = media_discovery_filter(['.jpg', '.png', '.mp4', '.wmv'], config.media)
+            self.assertIn(('filter', expected), params)
+            self.assertNotIn('original:', expected)
+            self.assertIn('image/', expected)
             self.assertEqual(dict(params)["url"], "example.com/")
             state = database.execute("SELECT extension,complete FROM media_index_state").fetchone()
             self.assertEqual(state["extension"], "__all__")

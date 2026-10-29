@@ -66,6 +66,8 @@ class PendingWindow:
     retry_pages: list[int] = field(default_factory=list)
     page_failures: dict[int, int] = field(default_factory=dict)
     gateway_504_failures: int = 0
+    merged_verified: bool = False
+    verify_paged_next: bool = False
 
 
 @dataclass(slots=True)
@@ -151,6 +153,7 @@ def encode_plan(plan: IndexPlan) -> str | None:
         "gateway_splits_without_response": int(plan.gateway_splits_without_response),
         "pending": [
             {
+                "merged_verified": bool(item.merged_verified),
                 "start": item.start,
                 "end": item.end,
                 "resume_key": item.resume_key,
@@ -201,6 +204,7 @@ def decode_plan(value: str | None, default_windows: list[tuple[str, str]]) -> In
                         PendingWindow(
                             start=start,
                             end=end,
+                            merged_verified=bool(raw.get("merged_verified", False)),
                             resume_key=str(resume) if resume else None,
                             failures=max(0, int(raw.get("failures", 0))),
                             gateway_504_failures=max(0, int(raw.get("gateway_504_failures", 0))),
