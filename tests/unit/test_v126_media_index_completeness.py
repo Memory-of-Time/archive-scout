@@ -266,7 +266,7 @@ class MissingMediaMembership(unittest.TestCase):
                 with self.assertRaisesRegex(MalformedCDXResponse, 'no page layout verified'):
                     _request_media_paged_batch(cfg, c, cfg.targets[0], current, ['.jpg'], threading.Event())
                 self.assertEqual(current.page_count, -1)
-                self.assertEqual(c.get_cdx_any.call_count, 1)
+                self.assertEqual(c.get_cdx_any.call_count, 2)
 
     def test_empty_numbered_media_pages_do_not_hide_later_matches(self):
         transport = Transport([b'', json_body([]), b'3', json_body([]), json_body([]), json_body([row('http://example.org/last-page.jpg')])])

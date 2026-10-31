@@ -58,6 +58,16 @@ def generate_media_reports(config: ProjectConfig, database: sqlite3.Connection,
               FROM errors e JOIN media_captures mc ON mc.id=e.media_capture_id
               WHERE e.resolved=0 AND e.ignored=0 ORDER BY e.last_seen,e.id""")
     ))
+    if opts.output_enabled('media_errors'):
+        from .indexer import media_query_signature
+        from .selection import selection_proof_prefix
+        selection_signature = selection_proof_prefix(media_query_signature(config)) + 'work'
+        path = reports / 'media_selection_unfinished.tsv'
+        atomic_write_lines(path, (
+            f"{row['original_url']}\t{row['state']}\t{row['lookup_attempts']}\t{row['last_error'] or ''}"
+            for row in database.execute("SELECT original_url,state,lookup_attempts,last_error FROM media_discovery_queue WHERE query_signature=? AND state IN ('pending','error') ORDER BY id", (selection_signature,))
+        ))
+        paths['media_selection_unfinished'] = path
 
     counts = {str(row[0]): int(row[1]) for row in database.execute(
         "SELECT state,COUNT(*) FROM media_captures GROUP BY state"

@@ -68,6 +68,7 @@ class PendingWindow:
     gateway_504_failures: int = 0
     merged_verified: bool = False
     verify_paged_next: bool = False
+    page_endpoint: str = ""
 
 
 @dataclass(slots=True)
@@ -165,6 +166,7 @@ def encode_plan(plan: IndexPlan) -> str | None:
                 "page_count": int(item.page_count),
                 "page_blocks": int(item.page_blocks),
                 "page_layout": item.page_layout,
+                "page_endpoint": item.page_endpoint,
                 "next_eligible_at": float(item.next_eligible_at),
                 "pagination_supported": bool(item.pagination_supported),
                 "retry_pages": sorted({int(page) for page in item.retry_pages if int(page) >= 0}),
@@ -214,6 +216,7 @@ def decode_plan(value: str | None, default_windows: list[tuple[str, str]]) -> In
                             page_count=int(raw.get("page_count", -1)),
                             page_blocks=max(0, int(raw.get("page_blocks", 0))),
                             page_layout=str(raw.get("page_layout") or ""),
+                            page_endpoint=str(raw.get("page_endpoint") or ""),
                             next_eligible_at=max(0.0,float(raw.get("next_eligible_at") or 0.0)),
                             pagination_supported=bool(raw.get("pagination_supported", True)),
                             retry_pages=retry_pages,
