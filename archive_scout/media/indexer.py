@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
-from ..cdx.client import CDXRow, HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, request_cdx_rows, request_cdx_json_payload, summarize_cdx_error
+from ..cdx.client import CDXRow, HttpClient, PermanentRequestError, RateLimitDeferred, TransientRequestError, request_cdx_rows, request_cdx_json_rows, _uses_builtin_cdx_getter
 from ..cdx.indexer import (
     PendingWindow,
     PagedBatch,
@@ -69,7 +69,6 @@ from .discovery import discover_media, hosts_related, safe_document_text, target
 from .extensions import allowed_media_url, selected_extensions
 
 ALL_EXTENSIONS_STATE = "__all__"
-MEDIA_INDEX_REVISION = 7
 
 
 def media_query_signature(config: ProjectConfig, page_size: int | None = None, *, discovery_version: int = 2) -> str:
@@ -121,7 +120,7 @@ def _extra_collapse_affects_extreme(config: ProjectConfig) -> bool:
 
 def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int | None = None) -> str:
     if revision is None:
-        revision = MEDIA_INDEX_REVISION
+        revision = 8
     payload = {"media_query_signature": media_query_signature(config, page_size), "index_revision": int(revision)}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -132,7 +131,7 @@ def media_signature_candidates(config: ProjectConfig) -> tuple[tuple[str, str], 
     for size in [config.page_size, 5000, 25000, 1000, 10000, 50000, 100000, 150000]:
         for discovery_version in (2, 1):
             media_signature = media_query_signature(config, size, discovery_version=discovery_version)
-            for revision in (MEDIA_INDEX_REVISION, 6, 5, 4, 3, 2):
+            for revision in (8, 7, 6, 5, 4, 3, 2):
                 raw = json.dumps({'media_query_signature': media_signature, 'index_revision': revision},
                                  sort_keys=True, separators=(',', ':'))
                 item = (media_signature, hashlib.sha256(raw.encode()).hexdigest()[:20])
@@ -182,16 +181,7 @@ def build_media_params(
     # representative. Keep the full timestamp universe until local selection.
     if config.media.normalized().snapshot_strategy == "all":
         params.extend(("collapse", value) for value in config.cdx_collapses)
-    # Wayback rejects the previous fieldless full-record media expression as
-    # an invalid field spec. Separate original/mimetype filters would be AND,
-    # but local media policy needs suffix OR MIME. Enumerate this CDX scope
-    # without an automatic media predicate and apply _accept_media_rows locally.
-    # Retain the extensions argument for all existing query-builder callers.
     extras = parse_cdx_parameter_lines(config.cdx_extra_params)
-    managed = {"page", "pagesize", "shownumpages", "showpagedindex", "offset"}
-    for key, _ in extras:
-        if key.casefold() in managed:
-            raise ValueError(f"{key} is controlled by media indexing and cannot be added as an advanced parameter")
     if config.media.normalized().snapshot_strategy != 'all':
         extras = [(key, value) for key, value in extras if key != 'collapse']
     params.extend(extras)
@@ -329,11 +319,9 @@ def _adopt_compatible_media_state(
         ).fetchone()
         if not state:
             continue
-        # A changed remote predicate changes the cursor universe. Only adopt
-        # checkpoints from this revision; retain older states and saved bodies.
-        current_proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': MEDIA_INDEX_REVISION},
-                                   sort_keys=True, separators=(',', ':'))
-        if candidate_state != hashlib.sha256(current_proof.encode()).hexdigest()[:20]:
+        proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': 8},
+                           sort_keys=True, separators=(',', ':'))
+        if candidate_state != hashlib.sha256(proof.encode()).hexdigest()[:20]:
             continue
         if candidate_signature != signature:
             database.execute(
@@ -369,7 +357,7 @@ def _reuse_completed_main_index(
     media_signature: str,
     state_signature: str,
 ) -> tuple[bool, int, int]:
-    """Text checkpoints cannot prove the expanded standalone media query."""
+    """A text-only inventory cannot certify standalone media membership."""
     return False, 0, 0
 
 
@@ -429,7 +417,7 @@ def _defer_media_window(
     if yield_to_other_tasks:
         return error_id
     if callback:
-        callback(ProgressEvent("media_index", f"Media CDX request failed: {summarize_cdx_error(exc)}. Retrying the saved request in {wait:.1f}s.", completed, total))
+        callback(ProgressEvent("media_index", f"Wayback is temporarily unavailable. Media indexing remains active and retries in {wait:.1f}s.", completed, total))
     stop_event.wait(wait)
     if stop_event.is_set():
         raise Stopped
@@ -454,33 +442,6 @@ def _resolve_media_strategy(current: PendingWindow, config: ProjectConfig, targe
         current.page_blocks = network.page_blocks
 
 
-class MediaPaginationUnavailable(MalformedCDXResponse):
-    pass
-
-
-def _media_page_layout(config, current):
-    layout = cdx_layout_signature(config, current.start, current.end, "paged", current.page_blocks)
-    if current.page_endpoint:
-        layout += ":" + hashlib.sha256(current.page_endpoint.encode()).hexdigest()[:12]
-    return layout
-
-
-def _media_page_count(client, endpoints, params):
-    try:
-        payload = request_cdx_json_payload(client, endpoints, params, max_bytes=1024 * 1024)
-    except PermanentRequestError as exc:
-        if exc.status in {400, 404, 405}:
-            raise MediaPaginationUnavailable(f"Media page-count helper rejected the request (HTTP {exc.status})", splittable=False) from exc
-        raise
-    if isinstance(payload, bool) or (isinstance(payload, list) and payload and isinstance(payload[0], list)
-            and {"timestamp", "original", "urlkey"}.intersection(str(value) for value in payload[0])):
-        raise MediaPaginationUnavailable("Media page-count request returned capture rows or invalid metadata; no page layout verified", splittable=False)
-    try:
-        return parse_num_pages(payload)
-    except RuntimeError as exc:
-        raise MediaPaginationUnavailable("Media page-count metadata is unsupported: " + str(exc)[:300], splittable=False) from exc
-
-
 def _request_media_paged_batch(
     config: ProjectConfig,
     client: HttpClient,
@@ -493,38 +454,21 @@ def _request_media_paged_batch(
     deadline: float | None = None,
 ) -> PagedBatch:
     endpoints = cdx_paged_endpoints(config)
-    from ..constants import CDX_URL
-    allowed_endpoints = set(endpoints) | ({CDX_URL} if config.network.endpoint_mode == "auto" else set())
-    if current.page_endpoint:
-        if current.page_endpoint not in allowed_endpoints:
-            raise MediaPaginationUnavailable("Saved media page endpoint differs from the configured endpoint scope", splittable=False)
-        endpoints = (current.page_endpoint,)
     network = config.network.normalized()
-    layout = _media_page_layout(config, current)
+    layout = cdx_layout_signature(config, current.start, current.end, "paged", current.page_blocks)
     if current.page_count >= 0 and current.page_layout != layout:
         current.page_count = -1
         current.page = 0
         current.retry_pages.clear()
         current.page_failures.clear()
     if current.page_count < 0:
-        params = build_media_num_pages_params(config, target, current.start, current.end, extensions, current.page_blocks)
-        try:
-            page_count = _media_page_count(client, endpoints, params)
-        except (MediaPaginationUnavailable, PermanentRequestError) as exc:
-            if isinstance(exc, PermanentRequestError) and exc.status != 400:
-                raise
-            if current.page_endpoint or config.network.endpoint_mode != "auto" or CDX_URL in endpoints:
-                raise
-            page_count = _media_page_count(client, (CDX_URL,), params)
-            current.page_endpoint = CDX_URL
-            current.page = 0
-            current.retry_pages.clear()
-            current.page_failures.clear()
-            if completed_pages is not None:
-                completed_pages.clear()
-            endpoints = (CDX_URL,)
-            layout = _media_page_layout(config, current)
-        current.page_count = page_count
+        payload = client.get_cdx_any(
+            endpoints,
+            build_media_num_pages_params(config, target, current.start, current.end, extensions, current.page_blocks),
+            max_bytes=1024 * 1024,
+            prefer_text=False,
+        )
+        current.page_count = parse_num_pages(payload)
         current.page_layout = layout
         current.page = min(current.page, current.page_count)
         current.retry_pages = [page for page in current.retry_pages if page < current.page_count]
@@ -588,7 +532,6 @@ def _request_media_resume(
     *, exact: bool = False,
 ) -> tuple[list[CDXRow], bool, str | None]:
     # Cursor advancement must be atomic with inserted media inventory rows.
-    current.verify_paged_next = False
     page_size = current.page_size or config.page_size
     result = request_cdx_rows(
         client,
@@ -605,28 +548,41 @@ def _request_media_resume(
         ),
         max_bytes=cdx_response_budget(page_size),
         prefer_text=True,
-        verify_terminal=True,
     )
     rows, next_resume = result.rows, result.resume_key
     if next_resume:
         if next_resume == current.resume_key:
             raise TransientRequestError("CDX returned the same media resume key twice", splittable=True)
         return rows, False, next_resume
-    if len(rows) >= page_size and not result.terminal_verified and isinstance(client, HttpClient):
-        confirmation = request_cdx_rows(
-            client, cdx_endpoints(config),
-            build_media_params(config, target, current.start, current.end, current.resume_key,
-                               page_size=page_size + 1, extensions=extensions, exact=exact),
-            max_bytes=cdx_response_budget(page_size + 1), prefer_text=False)
-        if confirmation.resume_key and confirmation.resume_key != current.resume_key:
+    if len(rows) >= page_size or (isinstance(client, HttpClient) and hasattr(client, 'transport') and _uses_builtin_cdx_getter(client)):
+        params = build_media_params(config, target, current.start, current.end, current.resume_key,
+                                    page_size=page_size + 1, extensions=extensions, exact=exact)
+        confirmation = (request_cdx_json_rows(client, cdx_endpoints(config), params,
+                                             max_bytes=cdx_response_budget(page_size + 1))
+                        if hasattr(client, 'transport') else
+                        request_cdx_rows(client, cdx_endpoints(config), params,
+                                         max_bytes=cdx_response_budget(page_size + 1), prefer_text=False))
+        from ..cdx.client import MalformedCDXResponse
+        if confirmation.rows[:len(rows)] != rows:
+            raise MalformedCDXResponse("Media terminal response disagrees with native JSON; cursor retained", splittable=False)
+        if confirmation.resume_key:
+            if confirmation.resume_key == current.resume_key:
+                raise MalformedCDXResponse("Media terminal response repeats its input cursor", splittable=False)
             return confirmation.rows, False, confirmation.resume_key
-        if confirmation.resume_key or confirmation.rows != rows:
-            from ..cdx.client import MalformedCDXResponse
-            raise MalformedCDXResponse(
-                "Full-sized media CDX page has unconfirmed terminal membership", splittable=False)
-    if result.needs_paged_check and current.page_count < 0:
-        current.verify_paged_next = True
-        return rows, False, None
+        if len(confirmation.rows) >= page_size and page_size > 1:
+            smaller = max(1, page_size // 2)
+            probe = request_cdx_json_rows(client, cdx_endpoints(config),
+                build_media_params(config, target, current.start, current.end, current.resume_key,
+                                   page_size=smaller, extensions=extensions, exact=exact),
+                max_bytes=cdx_response_budget(smaller))
+            if (probe.resume_key and probe.resume_key != current.resume_key
+                    and probe.rows == confirmation.rows[:len(probe.rows)]):
+                current.page_size = smaller
+                return probe.rows, False, probe.resume_key
+            raise MalformedCDXResponse("Full tokenless media response has no verifiable continuation; cursor retained", splittable=False)
+        if len(confirmation.rows) > page_size:
+            raise MalformedCDXResponse("Media terminal confirmation exceeded its limit without continuation", splittable=False)
+        rows = confirmation.rows
     return rows, True, None
 
 
@@ -638,7 +594,7 @@ def _media_failure_error(failures: list[PageFetchResult]) -> BaseException:
 
 def _pagination_unavailable(exc: BaseException) -> bool:
     message = str(exc)
-    return isinstance(exc, MediaPaginationUnavailable) or (isinstance(exc, RuntimeError) and ("HTTP 400" in message or "page-count" in message))
+    return isinstance(exc, RuntimeError) and ("HTTP 400" in message or "page-count" in message)
 
 
 def _permanent_media_page_error(exc: BaseException) -> bool:
@@ -812,11 +768,6 @@ def index_direct_media(
         seen = int(state["seen"] or 0) if state else 0
         error_id = int(state["error_id"]) if state and state["error_id"] else None
         plan = decode_plan(state["resume_key"] if state else None, default_windows)
-        if task_key not in accounted:
-            for window in plan.pending:
-                if window.merged_verified and not window.pagination_supported:
-                    window.pagination_supported = True
-                    window.strategy = "paged"
         previous_complete, previous_extra = accounted.get(task_key,(0,0))
         completed += plan.completed - previous_complete
         extra = max(0, plan.planned - len(default_windows))
@@ -825,18 +776,6 @@ def index_direct_media(
         retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
         retry_budget.resume()
         while plan.pending:
-            blocked_window = plan.pending[0]
-            if blocked_window.merged_verified and not blocked_window.pagination_supported:
-                with database:
-                    error_id = record_error(database, "media_index", "coverage_verification_unavailable",
-                        f"{target}: merged media rows retained, but numbered verification is unavailable; coverage remains incomplete",
-                        retryable=True)
-                    _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
-                blocked_tasks.add(task_key)
-                if callback:
-                    callback(ProgressEvent("media_index_incomplete", f"{target}: numbered verification is unavailable; discovered media and unfinished coverage retained.",
-                        completed, total, {"retain_notice": True}))
-                break
             if retry_budget.exhausted:
                 with database:
                     previous_error = database.execute('SELECT http_status,message FROM errors WHERE id=?',
@@ -926,7 +865,7 @@ def index_direct_media(
                                 (target_id,year,state_signature,window_start,window_end,layout_signature,page,row_count,updated_at)
                                 VALUES(?,?,?,?,?,?,?,?,?)""",
                                 (target_id,year,state_signature,current.start,current.end,
-                                 _media_page_layout(target_config, current),
+                                 cdx_layout_signature(target_config,current.start,current.end,"paged",current.page_blocks),
                                  int(result.page),page_received,utc_now()))
                             seen += page_received
                             _save_media_state(database,target_id,year,state_signature,
@@ -945,7 +884,7 @@ def index_direct_media(
                            AND state_signature=? AND window_start=? AND window_end=?
                            AND layout_signature=?""",
                         (target_id,year,state_signature,current.start,current.end,
-                         _media_page_layout(target_config, current)))}
+                         cdx_layout_signature(target_config,current.start,current.end,"paged",current.page_blocks)))}
                     batch = _request_media_paged_batch(
                         target_config, client, target, current, extensions, stop_event,
                         store_completed_media_page, completed_pages,
@@ -962,16 +901,9 @@ def index_direct_media(
                             transient_failure_streak = 0
                         if batch.finished and _reconcile_paged_completion(current, completed_pages):
                             retry_budget.progress()
-                            if current.merged_verified:
-                                plan.pending.pop(0)
-                                plan.completed += 1
-                                completed += 1
-                            else:
-                                current.strategy = "resume"
-                                current.resume_key = None
-                                current.failures = 0
-                                if callback:
-                                    callback(ProgressEvent("media_index", f"{target} {label}: numbered media pages are durable; reconciling the merged CDX index before declaring full coverage."))
+                            plan.pending.pop(0)
+                            plan.completed += 1
+                            completed += 1
                         complete = not plan.pending
                         _save_media_state(
                             database,
@@ -1063,7 +995,6 @@ def index_direct_media(
                 accepted_count = len(accepted)
                 write_started = time.monotonic()
                 old_seen, old_cursor = seen, current.resume_key
-                old_strategy, old_merged = current.strategy, current.merged_verified
                 old_failures, old_completed = current.failures, plan.completed
                 old_completed_windows, old_error_id = completed, error_id
                 try:
@@ -1074,10 +1005,6 @@ def index_direct_media(
                                 f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from media continuation",
                                 details={"excluded":excluded_hosts,"raw_rows":received})
                         seen += received
-                        if current.verify_paged_next:
-                            current.strategy = "paged"
-                            current.merged_verified = True
-                            current.resume_key = None
                         current.failures = 0
                         if next_cursor is not None:
                             current.resume_key = next_cursor
@@ -1092,8 +1019,6 @@ def index_direct_media(
                             error_id = None
                 except BaseException:
                     seen, current.resume_key = old_seen, old_cursor
-                    current.strategy, current.merged_verified = old_strategy, old_merged
-                    current.verify_paged_next = False
                     current.failures, plan.completed = old_failures, old_completed
                     completed, error_id = old_completed_windows, old_error_id
                     if finished and (not plan.pending or plan.pending[0] is not current):
@@ -1121,18 +1046,6 @@ def index_direct_media(
                     _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
                 raise
             except (RateLimitDeferred, TransientRequestError) as exc:
-                if current.strategy == "paged" and _pagination_unavailable(exc):
-                    current.pagination_supported = False
-                    current.strategy = "resume"
-                    with database:
-                        error_id = record_error(database, "media_index", "coverage_verification_unavailable",
-                            f"{target} {label}: {summarize_cdx_error(exc)}; inventory retained", retryable=True)
-                        _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
-                    if callback:
-                        callback(ProgressEvent("media_index_incomplete",
-                            f"{target}: numbered verification unavailable: {summarize_cdx_error(exc)}; discovered media retained.",
-                            completed, total, {"retain_notice": True}))
-                    continue
                 if isinstance(exc, TransientRequestError) and exc.connection_failed:
                     connection_failure_streak += 1
                     current.failures += 1

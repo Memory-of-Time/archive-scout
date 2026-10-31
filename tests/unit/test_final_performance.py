@@ -152,7 +152,7 @@ class FinalPerformanceTests(unittest.TestCase):
             with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", new=fake_get):
                 index_media(config, database, threading.Event())
             database.close()
-            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0]["showNumPages"], "true")
             self.assertNotIn("pageSize", calls[0])
             self.assertEqual(calls[1]["page"], "0")
