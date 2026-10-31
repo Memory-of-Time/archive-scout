@@ -69,6 +69,7 @@ from .discovery import discover_media, hosts_related, safe_document_text, target
 from .extensions import allowed_media_url, selected_extensions
 
 ALL_EXTENSIONS_STATE = "__all__"
+MEDIA_INDEX_REVISION = 7
 
 
 def media_query_signature(config: ProjectConfig, page_size: int | None = None, *, discovery_version: int = 2) -> str:
@@ -120,7 +121,7 @@ def _extra_collapse_affects_extreme(config: ProjectConfig) -> bool:
 
 def media_index_state_signature(config: ProjectConfig, *, page_size: int | None = None, revision: int | None = None) -> str:
     if revision is None:
-        revision = 6
+        revision = MEDIA_INDEX_REVISION
     payload = {"media_query_signature": media_query_signature(config, page_size), "index_revision": int(revision)}
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -131,7 +132,7 @@ def media_signature_candidates(config: ProjectConfig) -> tuple[tuple[str, str], 
     for size in [config.page_size, 5000, 25000, 1000, 10000, 50000, 100000, 150000]:
         for discovery_version in (2, 1):
             media_signature = media_query_signature(config, size, discovery_version=discovery_version)
-            for revision in (6, 5, 4, 3, 2):
+            for revision in (MEDIA_INDEX_REVISION, 6, 5, 4, 3, 2):
                 raw = json.dumps({'media_query_signature': media_signature, 'index_revision': revision},
                                  sort_keys=True, separators=(',', ':'))
                 item = (media_signature, hashlib.sha256(raw.encode()).hexdigest()[:20])
@@ -153,21 +154,6 @@ def extension_filter_regex(extensions: list[str]) -> str:
     # image.jpg&ref=thumb without a question mark. Accept those separators too.
     return rf"(?i).*(?:\.|%2e)(?:{escaped})(?:$|[?&#;].*)"
 
-
-
-def media_discovery_filter(extensions: list[str], media) -> str:
-    encoded = []
-    for extension in sorted(set(extensions)):
-        value = extension.casefold().lstrip(".")
-        encoded.append("".join(f"(?:{re.escape(char)}|%{ord(char):02x})" for char in value))
-    suffix = r"(?:\.|%2e)(?:" + "|".join(encoded) + r")(?:$|[?&#;\s]|%[0-9a-f]{2})"
-    alternatives = [suffix]
-    if media.include_images:
-        alternatives.append(r"\simage/[^\s]+\s")
-    if media.include_videos:
-        alternatives.extend([r"\svideo/[^\s]+\s",
-            r"\sapplication/(?:x-shockwave-flash|futuresplash|vnd\.rn-realmedia|x-mplayer2)(?:;[^\s]*)?\s"])
-    return (r"(?i).*(?:" + "|".join(alternatives) + r").*").replace("(?:", "(")
 
 def build_media_params(
     config: ProjectConfig,
@@ -196,9 +182,11 @@ def build_media_params(
     # representative. Keep the full timestamp universe until local selection.
     if config.media.normalized().snapshot_strategy == "all":
         params.extend(("collapse", value) for value in config.cdx_collapses)
-    if not exact and extensions:
-        # Use one full-record superset filter, then enforce the local policy.
-        params.append(("filter", media_discovery_filter(extensions, config.media)))
+    # Wayback rejects the previous fieldless full-record media expression as
+    # an invalid field spec. Separate original/mimetype filters would be AND,
+    # but local media policy needs suffix OR MIME. Enumerate this CDX scope
+    # without an automatic media predicate and apply _accept_media_rows locally.
+    # Retain the extensions argument for all existing query-builder callers.
     extras = parse_cdx_parameter_lines(config.cdx_extra_params)
     managed = {"page", "pagesize", "shownumpages", "showpagedindex", "offset"}
     for key, _ in extras:
@@ -341,7 +329,9 @@ def _adopt_compatible_media_state(
         ).fetchone()
         if not state:
             continue
-        current_proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': 6},
+        # A changed remote predicate changes the cursor universe. Only adopt
+        # checkpoints from this revision; retain older states and saved bodies.
+        current_proof = json.dumps({'media_query_signature': candidate_signature, 'index_revision': MEDIA_INDEX_REVISION},
                                    sort_keys=True, separators=(',', ':'))
         if candidate_state != hashlib.sha256(current_proof.encode()).hexdigest()[:20]:
             continue

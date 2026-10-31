@@ -19,7 +19,7 @@ from archive_scout.database.repositories import get_or_create_target, upsert_cap
 from archive_scout.downloads.rate_limit import FixedRateLimiter
 from archive_scout.events import Stopped
 from archive_scout.media.extensions import allowed_media_url
-from archive_scout.media.indexer import (build_media_params, extension_filter_regex, media_discovery_filter,
+from archive_scout.media.indexer import (build_media_params, extension_filter_regex, _accept_media_rows,
     index_media, _reuse_completed_main_index, _save_media_state, media_query_signature, media_index_state_signature)
 from archive_scout.network.transports import TransportResponse
 
@@ -152,27 +152,24 @@ class MissingMediaMembership(unittest.TestCase):
         self.assertEqual(len(transport.urls), 1)
         self.assertEqual(self.db.execute('SELECT complete FROM index_coverage').fetchone()[0], 1)
 
-    def test_encoded_extensions_and_extensionless_mime_survive_server_filter(self):
+    def test_encoded_extensions_and_extensionless_mime_survive_local_selection(self):
         urls = ['http://example.org/a.jpg', 'http://example.org/a.%6a%70%67',
                 'http://example.org/a%2E%4A%50%47', 'http://example.org/image',
                 'http://example.org/a.jpg&ref=thumb', 'http://example.org/a.jpg%3Fref=x']
-        rx = media_discovery_filter(['.jpg', '.wmv'], self.cfg.media)
-        self.assertNotIn(':', rx)
         for url in urls:
             with self.subTest(url=url):
                 self.assertTrue(allowed_media_url(url, self.cfg.media, 'image/jpeg')[0])
-                self.assertIsNotNone(re.fullmatch(rx, f'org,example)/ {STAMP} {url} image/jpeg 200 D 12'))
+                self.assertEqual(len(_accept_media_rows([row(url)], self.cfg.media)), 1)
         self.assertIsNone(re.fullmatch(extension_filter_regex(['.jpg']), urls[1]))
         self.assertIsNone(re.fullmatch(extension_filter_regex(['.jpg']), urls[3]))
 
-    def test_remote_superset_keeps_local_include_exclude_policy(self):
+    def test_local_selection_keeps_include_exclude_policy(self):
         for images, videos in ((True, False), (False, True), (True, True)):
             media = replace(self.cfg.media, include_images=images, include_videos=videos)
-            regex = re.compile(media_discovery_filter(['.jpg', '.wmv'], media))
             for mime in ('image/jpeg', 'video/x-ms-wmv', 'text/html'):
                 for url in ('http://example.org/a.jpg', 'http://example.org/a%2e%77%6d%76', 'http://example.org/opaque'):
-                    if allowed_media_url(url, media, mime)[0]:
-                        self.assertIsNotNone(regex.fullmatch(f'org,example)/ {STAMP} {url} {mime} 200 D 12'))
+                    self.assertEqual(bool(_accept_media_rows([row(url, mime)], media)),
+                                     allowed_media_url(url, media, mime)[0])
         self.assertFalse(allowed_media_url('http://example.org/a.png', self.cfg.media, 'image/png')[0])
 
     def test_old_media_completion_reindexes_without_resetting_saved_capture(self):
