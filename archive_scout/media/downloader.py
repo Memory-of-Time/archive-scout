@@ -332,7 +332,6 @@ def download_media(
     media_capture_ids: list[int] | None = None,
     media_signature: str | None = None,
     allow_partial_inventory: bool = False,
-    _selection_checked: bool = False,
 ) -> None:
     from ..coverage import IndexCoveragePending, require_media_coverage, require_embedded_coverage, media_coverage_gaps
     direct_signature = media_query_signature(config)
@@ -356,13 +355,6 @@ def download_media(
     except IndexCoveragePending:
         if not allow_partial_inventory:
             raise
-    if not inventory_complete and is_direct and config.media.snapshot_strategy != 'all' and not _selection_checked:
-        from .selection import resolve_direct_media_batches
-        for ready_ids in resolve_direct_media_batches(config, database, active_signature,
-                stop_event, callback, states, media_capture_ids):
-            download_media(config, database, stop_event, callback,
-                states=tuple(dict.fromkeys((*states, 'pending'))), media_capture_ids=ready_ids,
-                media_signature=active_signature, allow_partial_inventory=True, _selection_checked=True)
     from .indexer import _apply_snapshot_strategy
     if inventory_complete:
         _apply_snapshot_strategy(database, active_signature, config.media.snapshot_strategy)
@@ -371,13 +363,9 @@ def download_media(
     if not inventory_complete and config.media.snapshot_strategy != 'all':
         direct_complete = is_direct and not media_coverage_gaps(database, config)
         if not direct_complete:
-            from .selection import selection_proof_prefix
             clauses.append("""(media_captures.source_type IN ('embedded','external_embedded') OR EXISTS (SELECT 1 FROM media_discovery_queue q
                 WHERE q.query_signature=media_captures.query_signature
-                  AND q.original_url=media_captures.original_url AND q.state='indexed') OR EXISTS (SELECT 1 FROM media_discovery_queue p
-                WHERE p.query_signature=?||media_captures.timestamp
-                  AND p.original_url=media_captures.original_url AND p.state='indexed'))""")
-            params.append(selection_proof_prefix(active_signature))
+                  AND q.original_url=media_captures.original_url AND q.state='indexed'))""")
         comparison = '<' if config.media.snapshot_strategy == 'earliest' else '>'
         clauses.append(f"""NOT EXISTS (SELECT 1 FROM media_captures chosen
             WHERE chosen.original_url=media_captures.original_url
@@ -423,10 +411,7 @@ def download_media(
         total, row_iter = iter_media_download_rows(database, clauses, params)
     if not total:
         if callback:
-            held = int(database.execute("SELECT COUNT(*) FROM media_captures WHERE query_signature=? AND state IN ('pending','error')", (active_signature,)).fetchone()[0])
-            message = (f"No media captures are eligible in this selection; {held:,} indexed captures remain pending or failed. Unproven {config.media.snapshot_strategy} timestamps remain held while coverage is incomplete."
-                       if held and not inventory_complete else "No media captures to download.")
-            callback(ProgressEvent("media_download", message, 0, 0))
+            callback(ProgressEvent("media_download", "No media captures to download.", 0, 0))
         return
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
