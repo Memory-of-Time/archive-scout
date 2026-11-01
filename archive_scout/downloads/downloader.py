@@ -752,6 +752,27 @@ def download_archive(
                    "database_commit_seconds": 0.0,
                    "samples": 0}
     stage_samples = {"network_and_pacing_seconds": 0, "file_fsync_publish_seconds": 0}
+    owner_timings = {name: {'seconds': 0.0, 'maximum': 0.0, 'samples': 0}
+                     for name in ('outcome', 'refill', 'callback', 'completed_wait')}
+    finished_at = {}
+    finished_lock = threading.Lock()
+
+    def observe_owner(name, seconds):
+        timing = owner_timings[name]
+        timing['seconds'] += seconds
+        timing['maximum'] = max(timing['maximum'], seconds)
+        timing['samples'] += 1
+
+    def measured_fetch(row, streamed):
+        try:
+            if streamed:
+                return fetch_retain_streamed(row, config, client)
+            return fetch_parse_scan(row, config, jobs, client,
+                False if scanner_thread is not None else not acquire_only)
+        finally:
+            with finished_lock:
+                finished_at[int(row['id'])] = time.monotonic()
+
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     last_completion = time.monotonic()
@@ -780,6 +801,9 @@ def download_archive(
                         / stage_samples['file_fsync_publish_seconds'] if stage_samples['file_fsync_publish_seconds'] else None),
                     'avg_acquisition_seconds': (stage_stats['network_and_pacing_seconds']
                         / stage_samples['network_and_pacing_seconds'] if stage_samples['network_and_pacing_seconds'] else None),
+                    'owner_stages': {name: {'mean_seconds': value['seconds'] / max(1, value['samples']),
+                                            'max_seconds': value['maximum']}
+                                     for name, value in owner_timings.items()},
                 }
 
             diagnostics.batch_metrics = batch_metrics
@@ -828,12 +852,7 @@ def download_archive(
                     # memory-based API for compatible plugins/tests.
                     streamed = (isinstance(getattr(client, "transport", None), ResilientTransport)
                         and getattr(type(client).get, "__module__", "") == "archive_scout.cdx.client")
-                    worker = fetch_retain_streamed if streamed else fetch_parse_scan
-                    if streamed:
-                        futures[pool.submit(worker, row, config, client)] = row
-                    else:
-                        futures[pool.submit(worker, row, config, jobs, client,
-                            False if scanner_thread is not None else not acquire_only)] = row
+                    futures[pool.submit(measured_fetch, row, streamed)] = row
     
             submit_available()
             while futures:
@@ -868,6 +887,10 @@ def download_archive(
                 last_completion = time.monotonic()
                 for future in done:
                     row = futures.pop(future)
+                    outcome_started = time.monotonic()
+                    with finished_lock:
+                        finished = finished_at.pop(int(row['id']), outcome_started)
+                    observe_owner('completed_wait', max(0.0, outcome_started - finished))
                     outcome_state = None
                     retained_after_failure = None
                     try:
@@ -1070,6 +1093,8 @@ def download_archive(
                     rate = len(recent_commits) / min(30.0, elapsed)
                     invocation_rate = saved_this_pass / elapsed
                     cumulative_completed = max(0, min(cumulative_total, retained + excluded))
+                    observe_owner('outcome', time.monotonic() - outcome_started)
+                    callback_started = time.monotonic()
                     if callback:
                         callback(
                             ProgressEvent(
@@ -1111,7 +1136,10 @@ def download_archive(
                                 },
                             )
                         )
+                    observe_owner('callback', time.monotonic() - callback_started)
+                    refill_started = time.monotonic()
                     submit_available()
+                    observe_owner('refill', time.monotonic() - refill_started)
     finally:
         # Drain local scans on clean completion, but honor Stop promptly.
         scanner_finish.set()

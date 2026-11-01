@@ -1,5 +1,5 @@
 {
-  "version": "1.0.5",
+  "version": "1.2.7",
   "output_dir": "./archive-scout-project",
   "targets": ["example.com/*"],
   "keywords": ["video", "archive"],
@@ -16,7 +16,7 @@
   },
   "research": {
     "enabled": true,
-    "auto_build": true,
+    "auto_build": false,
     "vector_backend": "local-hash",
     "entity_extraction": true,
     "duplicate_clustering": true

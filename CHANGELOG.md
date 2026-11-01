@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.7 — pipeline audit and release refresh
+
+- Make automatic Research Intelligence indexing consistently optional and off by default; retain manual build/search and explicitly saved opt-in.
+- Restore useful all-snapshot embedded lookup concurrency with smaller exact-URL pages and bounded response reservations; reduce duplicate discovery work and unchanged queue writes.
+- Bound active CDX response work, return incomplete bodies to the checkpoint scheduler, and close failed urllib3 bodies without draining them.
+- Add text owner-stage timing evidence and retain public SQLite schema 11, existing capture identities and saved checkpoints.
+- Update application, package, default client identification, Windows and macOS version metadata and release checks to 1.2.7. Preserve deliberately saved 1.2.6 pacing and custom client identifiers.
+- See docs/V127_PIPELINE_AUDIT.md for measurements, regression coverage and unresolved limits.
+
 ## v1.2.5 — text consistency follow-through (same public version)
 
 - Share one text-representation policy across acquisition, imported local text, rescan and Hitlist: preserve literal plain-text angle brackets in FTS while still rendering verifiable HTML and honoring historical HTML suffixes.

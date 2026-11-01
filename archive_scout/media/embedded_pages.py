@@ -13,7 +13,7 @@ import threading
 
 from ..retry_budget import CursorHistory
 from ..cdx.client import HttpClient, RateLimitDeferred
-from ..cdx.indexer import PendingWindow, cdx_response_budget, validate_cdx_scope, _query_is_oversized
+from ..cdx.indexer import PendingWindow, validate_cdx_scope, _query_is_oversized
 from ..cdx.parallel import memory_limited_page_workers
 from ..database.repositories import (iter_media_discovery_rows, upsert_media_captures,
     mark_media_discovery_lookup, record_error, resolve_errors, blocked_site_hosts,
@@ -24,7 +24,7 @@ from ..site_status import host_from_url, site_issue_message, should_surface_site
 
 
 def index_all_embedded_pages(config, database, client, stop_event, callback, signature):
-    from .indexer import _request_media_resume, _embedded_row_kind
+    from .indexer import _request_media_resume, _embedded_row_kind, embedded_response_budget
     media = config.media.normalized()
     proof_key = f'media_embedded_pages_proof_v1:{signature}'
     if not database.execute('SELECT 1 FROM project_meta WHERE key=?', (proof_key,)).fetchone():
@@ -39,8 +39,12 @@ def index_all_embedded_pages(config, database, client, stop_event, callback, sig
             database.execute('INSERT INTO project_meta(key,value) VALUES(?,?)', (proof_key, '1'))
     attempt_limit = 2**63-1 if config.network.persistent_retries else config.max_attempts
     candidates = iter(iter_media_discovery_rows(database, signature, attempt_limit))
+    page_size = min(2000, config.page_size)
     workers = memory_limited_page_workers(min(10, config.network.cdx_workers),
-        3 * cdx_response_budget(config.page_size), config.network.cdx_memory_budget_mb)
+        3 * embedded_response_budget(page_size + 1), config.network.cdx_memory_budget_mb)
+    if callback:
+        callback(ProgressEvent('media_embed',
+            f'Embedded all-snapshot lookup: {workers} workers; up to {page_size:,} rows per page; shared CDX pacing retained.'))
     blocked = blocked_site_hosts(database)
     pool_cancel = threading.Event()
 
@@ -54,7 +58,7 @@ def index_all_embedded_pages(config, database, client, stop_event, callback, sig
         if not isinstance(value, dict):
             raise ValueError('Invalid embedded media cursor; checkpoint retained')
         return PendingWindow(config.from_date, config.to_date,
-            resume_key=value.get('resume_key'), page_size=int(value.get('page_size') or 0))
+            resume_key=value.get('resume_key'), page_size=min(page_size, int(value.get('page_size') or page_size)))
 
     def fetch(row, window):
         scope = client.cancellation_scope(pool_cancel) if isinstance(client, HttpClient) else nullcontext()

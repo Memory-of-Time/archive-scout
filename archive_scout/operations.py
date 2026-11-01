@@ -1011,11 +1011,14 @@ def run_project(
 
             paths.update(generate_media_reports(config, database))
         if config.research.enabled and config.research.auto_build:
+            emit(callback, ProgressEvent("research_index", "Automatic Research Intelligence indexing is enabled in the Research intelligence tab. Building the optional local index…"))
             research_summary = build_research_index(config, database, stop_event, callback)
             research_report = config.output_dir / "reports" / "research_index.json"
             import json as _json
             research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
             paths["research_index"] = research_report
+        else:
+            emit(callback, ProgressEvent("research_index", "Automatic Research Intelligence indexing is off; use Build / refresh index in the Research intelligence tab when needed."))
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
         outcomes = text_outcome_counts(database, config) if mode != 'rescan' else {'unfinished': 0, 'unavailable': 0}
         unresolved = outcomes['unfinished']

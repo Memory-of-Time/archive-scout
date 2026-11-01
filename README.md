@@ -1,4 +1,4 @@
-# Archive Scout v1.2.6
+# Archive Scout v1.2.7
 
 **Archive Scout** is an independent, cross-platform desktop and command-line tool for researching and preserving public Wayback Machine captures. It indexes archived URLs, acquires and validates saved bodies, scans selected keyword sets, supports media discovery, and produces reports.
 
@@ -42,9 +42,11 @@ A normal download pass can finish with confirmed missing or archive-blocked capt
 
 An eight-requests-per-second admission target is **not** a guarantee of eight saved captures per second on the live Internet Archive. Checkpoint safety and correct coverage take priority over throughput.
 
+Automatic Research Intelligence indexing is optional and off by default, including in the example project. Its checkbox is in **Research intelligence**; **Build / refresh index** remains available for a manual build. Existing projects retain an explicitly saved choice. See the [pipeline audit](docs/V127_PIPELINE_AUDIT.md) for embedded-media improvements, CDX failure handling, measurements and remaining limits.
+
 ## Projects and compatibility
 
-Archive Scout v1.2.6 uses **SQLite schema 11**. When a supported schema-10 project is opened, Scout first creates a required pre-upgrade backup and then adds independent domain coverage, current retry decisions and local derivation revisions without replacing retained captures, local bodies, scan history, or checkpoints. If a safety backup fails, the upgrade is refused. Keep your original project folder and `project.json`, back up that folder before upgrading, and **do not reopen a migrated schema-11 project with v1.2.5**. Never edit `schema_info` to force a downgrade.
+Archive Scout v1.2.7 uses **SQLite schema 11**. When a supported schema-10 project is opened, Scout first creates a required pre-upgrade backup and then adds independent domain coverage, current retry decisions and local derivation revisions without replacing retained captures, local bodies, scan history, or checkpoints. If a safety backup fails, the upgrade is refused. Keep your original project folder and `project.json`, back up that folder before upgrading, and **do not reopen a migrated schema-11 project with v1.2.5**. Never edit `schema_info` to force a downgrade.
 
 Before replacing an installation, stop any active run and back up its project folder. Reopen the same `project.json`; there is no required project reindex. Old `Scout` CLI commands remain supported, and existing GUI preferences stored under the legacy `Scout` settings directory are recognized. See [Project migration](docs/MIGRATION.md), [Project recovery](docs/PROJECT_RECOVERY.md) and the [operations and report snapshot guide](docs/OPERATIONS.md).
 

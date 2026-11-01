@@ -1483,9 +1483,11 @@ class ArchiveScoutApp(tk.Tk):
         settings.columnconfigure(1, weight=1)
         ttk.Label(settings, text="Local vector backend:").grid(row=0, column=0, sticky="w")
         ttk.Combobox(settings, textvariable=self.research_backend_var, values=("local-hash", "fastembed"), state="readonly", width=16).grid(row=0, column=1, sticky="w", padx=(5, 12))
-        ttk.Checkbutton(settings, text="Refresh research index after normal scans", variable=self.research_auto_var).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        ttk.Checkbutton(settings, text="Automatically build research index after scans (optional)", variable=self.research_auto_var).grid(row=0, column=2, sticky="w", padx=(0, 12))
         ttk.Label(settings, text="Result limit:").grid(row=0, column=3, sticky="e")
         ttk.Entry(settings, textvariable=self.research_limit_var, width=7).grid(row=0, column=4, padx=(5, 0))
+        ttk.Label(settings, text="Off by default. Automatic indexing includes vectors, entities, duplicate clusters and relationships, and can take several minutes. Use Build / refresh index whenever needed.",
+                  style="Muted.TLabel", wraplength=1080).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(6, 0))
 
         query = ttk.LabelFrame(tab, text="Research question", padding=8)
         query.grid(row=3, column=0, sticky="ew", pady=(10, 8))

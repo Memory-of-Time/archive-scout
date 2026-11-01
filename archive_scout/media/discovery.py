@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import hashlib
 import re
+from functools import lru_cache
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -70,9 +71,10 @@ def _normalize(raw: str, base_url: str) -> str:
 
 
 class _MediaParser(HTMLParser):
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, normalize=None) -> None:
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
+        self.normalize = normalize or (lambda raw: _normalize(raw, base_url))
         self.items: list[DiscoveredMedia] = []
 
     @staticmethod
@@ -80,7 +82,7 @@ class _MediaParser(HTMLParser):
         return {key.casefold(): html.unescape(value or "") for key, value in attrs}
 
     def _add(self, raw: str, hint: str = "") -> None:
-        value = _normalize(raw, self.base_url)
+        value = self.normalize(raw)
         if value:
             self.items.append(DiscoveredMedia(value, hint))
 
@@ -188,12 +190,16 @@ def _allowed(
 
 
 def discover_media(raw: str, base_url: str, media: MediaConfig, known_links: list[str] | None = None) -> list[DiscoveredMedia]:
+    @lru_cache(maxsize=2048)
+    def normalize(value):
+        return _normalize(value, base_url)
+
     candidates: list[DiscoveredMedia] = []
     for link in known_links or []:
-        value = _normalize(str(link), base_url)
+        value = normalize(str(link))
         if value:
             candidates.append(DiscoveredMedia(value, ""))
-    parser = _MediaParser(base_url)
+    parser = _MediaParser(base_url, normalize)
     try:
         parser.feed(raw)
         parser.close()
@@ -204,17 +210,22 @@ def discover_media(raw: str, base_url: str, media: MediaConfig, known_links: lis
     # text instead of feeding the whole document through a second HTMLParser.
     for pattern in (EMBED_URL_PATTERN, SCRIPT_MEDIA_PATTERN):
         for match in pattern.finditer(raw):
-            value = _normalize(match.group(1), base_url)
+            value = normalize(match.group(1))
             if value:
                 candidates.append(DiscoveredMedia(value, "video"))
     for match in CSS_URL_PATTERN.finditer(raw):
-        value = _normalize(match.group(2), base_url)
+        value = normalize(match.group(2))
         if value:
             candidates.append(DiscoveredMedia(value, "image"))
 
     unique: dict[str, DiscoveredMedia] = {}
+    checked = set()
     excluded_extensions = frozenset(media.exclude_extensions)
     for candidate in candidates:
+        key = (candidate.url, candidate.kind_hint)
+        if key in checked:
+            continue
+        checked.add(key)
         accepted = _allowed(candidate, media, excluded_extensions)
         if not accepted:
             continue

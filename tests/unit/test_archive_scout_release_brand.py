@@ -6,14 +6,48 @@ from archive_scout.constants import APP_NAME, VERSION, SCHEMA_VERSION
 class ScoutReleaseBrandTests(unittest.TestCase):
     def test_new_brand_preserves_schema(self):
         self.assertEqual(APP_NAME, "Archive Scout")
-        self.assertEqual(VERSION, "1.2.6")
+        self.assertEqual(VERSION, "1.2.7")
         self.assertEqual(SCHEMA_VERSION, 11)
+
+    def test_default_user_agent_and_saved_version_follow_release(self):
+        from archive_scout.config import ProjectConfig, project_config_from_payload
+        config=ProjectConfig(Path('.'),targets=[],keywords=[]).normalized()
+        self.assertIn(f'ArchiveScout/{VERSION} ',config.user_agent)
+        self.assertEqual(config.to_payload()['version'],VERSION)
+        restored=project_config_from_payload({'user_agent':'ArchiveScout/1.2.6 public web archive research client'},Path('project.json'))
+        self.assertEqual(restored.user_agent,config.user_agent)
+        custom=project_config_from_payload({'user_agent':'custom research client'},Path('project.json'))
+        self.assertEqual(custom.user_agent,'custom research client')
+
+    def test_v126_deliberately_saved_pacing_survives_version_bump(self):
+        from archive_scout.config import project_config_from_payload
+        config=project_config_from_payload({'version':'1.2.6','cdx_delay':.75,'download_delay':.2},Path('project.json'))
+        self.assertEqual(config.cdx_delay,.75)
+        self.assertEqual(config.download_delay,.2)
 
     def test_windows_numeric_version_metadata(self):
         source = (Path(__file__).resolve().parents[2] / "packaging/windows/version_info.txt").read_text()
         numeric_version = (*map(int, VERSION.split('.')), 0)
         self.assertIn(f"filevers={numeric_version}", source)
         self.assertIn(f"prodvers={numeric_version}", source)
+
+    def test_macos_bundle_metadata_uses_current_release(self):
+        import plistlib
+        import subprocess
+        import sys
+        import tempfile
+        root=Path(__file__).resolve().parents[2]
+        source=(root/'scripts/build_macos.sh').read_text()
+        block=source.split("<<'PYVERSION'\n",1)[1].split('\nPYVERSION',1)[0]
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'Info.plist'
+            path.write_bytes(plistlib.dumps({'CFBundleName':'Archive Scout','CFBundleVersion':'0.0.0'}))
+            result=subprocess.run([sys.executable,'-',str(path)],input=block,text=True,cwd=root,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            info=plistlib.loads(path.read_bytes())
+            self.assertEqual(info['CFBundleShortVersionString'],VERSION)
+            self.assertEqual(info['CFBundleVersion'],VERSION)
+            self.assertEqual(info['CFBundleName'],'Archive Scout')
 
     def test_three_platform_download_links_match_release_assets(self):
         root = Path(__file__).resolve().parents[2]

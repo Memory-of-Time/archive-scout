@@ -38,6 +38,19 @@ class BackendUnavailable(RuntimeError):
     pass
 
 
+class CdxResponseTimeout(TimeoutError):
+    pass
+
+
+def _deadline_remaining(deadline):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CdxResponseTimeout('CDX response exceeded its active request deadline; page checkpoint retained')
+    return remaining
+
+
 class CurlTransportError(OSError):
     """Preserve curl's exit code instead of inferring its phase from prose."""
 
@@ -192,6 +205,7 @@ def is_transport_connection_failure(exc: BaseException) -> bool:
 
 def is_transport_read_timeout(exc: BaseException) -> bool:
     read_types = (
+        CdxResponseTimeout,
         httpx.ReadTimeout,
         urllib3.exceptions.ReadTimeoutError,
     )
@@ -204,16 +218,18 @@ def _ssl_context() -> ssl.SSLContext:
     return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if truststore else ssl.create_default_context()
 
 
-def _read_limited(chunks: Iterable[bytes], max_bytes: int, stop_event: threading.Event) -> bytearray:
+def _read_limited(chunks: Iterable[bytes], max_bytes: int, stop_event: threading.Event, deadline=None) -> bytearray:
     data = bytearray()
     for chunk in chunks:
         if stop_event.is_set():
             raise Stopped
+        _deadline_remaining(deadline)
         if not chunk:
             continue
         data.extend(chunk)
         if len(data) > max_bytes:
             raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
+    _deadline_remaining(deadline)
     # Returning the bytearray avoids a full-size bytes copy at the exact moment
     # the response buffer is largest. Consumers only require the bytes-like API.
     return data
@@ -671,12 +687,17 @@ class HttpxBackend:
         max_bytes: int,
         stop_event: threading.Event,
         redirect_validator: Callable[[str, str], None] | None = None,
+        deadline: float | None = None,
     ) -> TransportResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
         current_url = url
         for _ in range(11):
             options = {"follow_redirects": False} if (redirect_validator is not None or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))) else {}
+            remaining = _deadline_remaining(deadline)
+            if remaining is not None:
+                options['timeout'] = httpx.Timeout(min(self.read_timeout, remaining),
+                    connect=min(self.connect_timeout, remaining))
             with self.client.stream("GET", current_url, headers=headers, **options) as response:
                 location = response.headers.get("Location")
                 if response.status_code in {301,302,303,307,308} and not location and redirect_validator:
@@ -698,7 +719,8 @@ class HttpxBackend:
                 announced = response.headers.get("Content-Length")
                 if announced and announced.isdigit() and int(announced) > max_bytes:
                     raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-                data = _read_limited(response.iter_bytes(1024 * 1024), max_bytes, stop_event)
+                data = _read_limited(response.iter_bytes() if deadline is not None else response.iter_bytes(1024 * 1024),
+                                     max_bytes, stop_event, deadline)
                 return TransportResponse(
                     status=int(response.status_code), headers=_copy_headers(response.headers.items()),
                     final_url=str(response.url), data=data, backend=self.name,
@@ -802,6 +824,8 @@ class Urllib3Backend:
 
     def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float,
                  trust_env: bool = True) -> None:
+        self.connect_timeout = max(1.0, float(connect_timeout))
+        self.read_timeout = max(1.0, float(read_timeout))
         self.timeout = urllib3.Timeout(connect=max(1.0, connect_timeout), read=max(1.0, read_timeout))
         self.trust_env = bool(trust_env)
         self.pool_size = max(2, int(pool_size))
@@ -841,11 +865,12 @@ class Urllib3Backend:
             pool.clear()
 
     @staticmethod
-    def _discard(response) -> None:
+    def _discard(response, *, complete=False) -> None:
         if response is None:
             return
         try:
-            response.drain_conn()
+            if not complete:
+                response.close()
             response.release_conn()
         except Exception:
             try:
@@ -860,6 +885,7 @@ class Urllib3Backend:
         max_bytes: int,
         stop_event: threading.Event,
         redirect_validator: Callable[[str, str], None] | None = None,
+        deadline: float | None = None,
     ) -> TransportResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -867,6 +893,7 @@ class Urllib3Backend:
         response = None
         try:
             for _ in range(11):
+                remaining = _deadline_remaining(deadline)
                 response = self._pool_for(current_url).request(
                     "GET",
                     current_url,
@@ -874,7 +901,8 @@ class Urllib3Backend:
                     preload_content=False,
                     redirect=False,
                     retries=False,
-                    timeout=self.timeout,
+                    timeout=(self.timeout if remaining is None else urllib3.Timeout(
+                        connect=min(self.connect_timeout, remaining), read=min(self.read_timeout, remaining))),
                 )
                 if int(response.status) not in {301, 302, 303, 307, 308}:
                     break
@@ -905,7 +933,9 @@ class Urllib3Backend:
             announced = response.headers.get("Content-Length")
             if announced and str(announced).isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-            data = _read_limited(response.stream(amt=1024 * 1024, decode_content=True), max_bytes, stop_event)
+            chunks = (iter(lambda: response.read1(64 * 1024, decode_content=True), b'')
+                      if deadline is not None else response.stream(amt=1024 * 1024, decode_content=True))
+            data = _read_limited(chunks, max_bytes, stop_event, deadline)
             result = TransportResponse(
                 status=int(response.status),
                 headers=_copy_headers(response.headers.items()),
@@ -914,7 +944,7 @@ class Urllib3Backend:
                 backend=self.name,
                 elapsed=time.monotonic() - started,
             )
-            self._discard(response)
+            self._discard(response, complete=True)
             response = None
             return result
         finally:
@@ -991,7 +1021,7 @@ class Urllib3Backend:
                 backend=self.name,
                 elapsed=time.monotonic() - started,
             )
-            self._discard(response)
+            self._discard(response, complete=True)
             response = None
             return result
         finally:
@@ -1076,13 +1106,14 @@ class CurlBackend:
 
     def request(self, url: str, headers: dict[str, str], max_bytes: int,
                 stop_event: threading.Event,
-                redirect_validator: Callable[[str, str], None] | None = None) -> TransportResponse:
+                redirect_validator: Callable[[str, str], None] | None = None,
+                deadline: float | None = None) -> TransportResponse:
         if redirect_validator is None and not (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None)):
-            return self._request_once(url, headers, max_bytes, stop_event)
+            return self._request_once(url, headers, max_bytes, stop_event, deadline=deadline)
         started = time.monotonic()
         current_url = url
         for _ in range(11):
-            response = self._request_once(current_url, headers, max_bytes, stop_event, False)
+            response = self._request_once(current_url, headers, max_bytes, stop_event, False, deadline=deadline)
             location = response.headers.get("location")
             if response.status in {301,302,303,307,308} and not location:
                 if redirect_validator:
@@ -1105,9 +1136,11 @@ class CurlBackend:
         max_bytes: int,
         stop_event: threading.Event,
         follow_redirects: bool = True,
+        deadline: float | None = None,
     ) -> TransportResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
+        remaining = _deadline_remaining(deadline)
         with tempfile.TemporaryDirectory(prefix="archive-scout-curl-") as temp_dir:
             header_path = Path(temp_dir) / "headers.txt"
             body_path = Path(temp_dir) / "body.bin"
@@ -1121,7 +1154,7 @@ class CurlBackend:
                 "--connect-timeout",
                 str(int(self.connect_timeout)),
                 "--max-time",
-                str(int(self.connect_timeout + self.read_timeout)),
+                str(self.connect_timeout + self.read_timeout if remaining is None else remaining),
                 "--max-filesize",
                 str(int(max_bytes)),
                 "--dump-header",
@@ -1324,6 +1357,7 @@ class ResilientTransport:
         if requested not in {"auto", "httpx", "urllib3", "curl"}:
             raise ValueError("network backend must be auto, httpx, urllib3, or curl")
         self.callback = callback
+        self.cdx_response_seconds = max(1.0, float(read_timeout))
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.recovery_probes: set[str] = set()
@@ -1468,6 +1502,10 @@ class ResilientTransport:
                 raise
             try:
                 options = {"redirect_validator": redirect_validator} if redirect_validator is not None else {}
+                if (isinstance(backend, (HttpxBackend, Urllib3Backend, CurlBackend))
+                        and urllib.parse.urlsplit(url).path.rstrip('/') in
+                        {'/cdx/search/cdx', '/web/timemap/json', '/web/timemap/cdx'}):
+                    options['deadline'] = time.monotonic() + self.cdx_response_seconds
                 response = backend.request(url, headers, max_bytes, stop_event, **options)
                 with self.lock:
                     changed = self.last_success != name
@@ -1510,7 +1548,10 @@ class ResilientTransport:
             self._backend_result(name, not is_transport_connection_failure(last_error))
             if isinstance(last_error, IncompleteRepresentationError):
                 break
-            if is_transport_read_timeout(last_error):
+            if is_transport_read_timeout(last_error) or (
+                'deadline' in options and is_transport_timeout(last_error)
+                and not is_transport_connection_failure(last_error)
+            ):
                 # Once a server has accepted the connection and stalled while
                 # returning a CDX body, changing Python HTTP stacks normally
                 # repeats the same long wait. Let the indexer retry or requeue

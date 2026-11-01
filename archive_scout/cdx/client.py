@@ -282,8 +282,9 @@ class HttpClient:
             self.host_gate.finish_request(permit, recovered=True)
             if self.coordinated_connection_recovery:
                 self.host_gate.connection_success()
-            raise TransientRequestError(f"representation failure for {url}: {exc}",
-                                        splittable=False) from exc
+            error_class = MalformedCDXResponse if splittable else TransientRequestError
+            raise error_class(f"representation failure for {url}: {exc}",
+                              splittable=splittable) from exc
         if exc.connection_failed:
             self.host_gate.finish_request(permit, recovered=False)
             if self.coordinated_connection_recovery:
@@ -728,6 +729,10 @@ class HttpClient:
                         endpoint=endpoint,
                     ) from exc
                 except MalformedCDXResponse as exc:
+                    if any(isinstance(error, IncompleteRepresentationError) for error in exception_chain(exc)):
+                        self._remember_endpoint_failure(endpoint)
+                        exc.endpoint = endpoint
+                        raise
                     first_error = first_error or exc
                     description = str(exc).casefold()
                     if any(token in description for token in
@@ -870,6 +875,10 @@ class HttpClient:
                         endpoint=endpoint,
                     ) from exc
                 except MalformedCDXResponse as exc:
+                    if any(isinstance(error, IncompleteRepresentationError) for error in exception_chain(exc)):
+                        self._remember_endpoint_failure(endpoint)
+                        exc.endpoint = endpoint
+                        raise
                     first_error = first_error or exc
                     description = str(exc).casefold()
                     if any(token in description for token in
@@ -1006,6 +1015,10 @@ class HttpClient:
                     endpoint=endpoint,
                 ) from exc
             except MalformedCDXResponse as exc:
+                if any(isinstance(error, IncompleteRepresentationError) for error in exception_chain(exc)):
+                    self._remember_endpoint_failure(endpoint)
+                    exc.endpoint = endpoint
+                    raise
                 exc.endpoint = endpoint
                 failure = exc
             except RateLimitDeferred:

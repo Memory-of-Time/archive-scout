@@ -247,6 +247,10 @@ class AcquisitionDiagnostics:
                 f"mean payload publication {self._timing(metrics['avg_payload_publication_seconds'])}; "
                 f"queue preparation {metrics['queue_preparation_seconds']:.3f}s. "
                 if metrics else '')
+            owner = metrics.get('owner_stages', {})
+            if owner:
+                stages += 'Owner stage maxima: ' + ', '.join(
+                    f"{name} {self._timing(value['max_seconds'])}" for name, value in owner.items()) + '. '
             self._emit(ProgressEvent('acquisition_health',
                 f"{self.kind.title()} acquisition health: build {self.build}; new saves {total_saved:,}; "
                 f"failures {dict(self.failures)}; responses {detail['response_counts']}; "

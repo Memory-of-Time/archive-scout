@@ -66,7 +66,7 @@ A finished download pass may include confirmed missing captures, explicit Waybac
 
 With the Summary report and its index-coverage field enabled, `reports/indexing_status.tsv` lists every selected text target, its unfinished scopes, and last recorded reasons. The live indexing queue also shows remaining, retrying, cooling and deferred target counts. Retry time excludes turns behind other targets. Text/media payload recovery allows complete fair sweeps up to the configured no-progress attempt allowance; saved cooldowns do not expire that allowance before an attempt. Persistent 429/503 gate rules and explicit request pacing still apply.
 
-Resumability preserves saved scan results including zero-hit documents, downloaded bytes, CDX cursors and unfinished media state. v1.2.6 uses **schema 11** and backs up supported schema-10 projects before adding independent domain coverage, current retry decisions and derivation revisions. The previous data remains in place; nevertheless make an independent project backup before upgrading and do not open the upgraded project in v1.2.5.
+Resumability preserves saved scan results including zero-hit documents, downloaded bytes, CDX cursors and unfinished media state. v1.2.7 uses **schema 11** and backs up supported schema-10 projects before adding independent domain coverage, current retry decisions and derivation revisions. The previous data remains in place; nevertheless make an independent project backup before upgrading and do not open the upgraded project in v1.2.5.
 
 ## Domains and corrected scan recipes
 
@@ -75,5 +75,15 @@ Enable **Extract domains** in Reports, or set `extract_domains: true` in project
 First enablement backfills available eligible saved bodies; missing or changed inputs remain unresolved. Existing valid extraction checkpoints prevent repeated reads. Domain detection is high recall: a filename such as `version.py` is also domain-like because `.py` is a real ending. No offline recognizer can prove historical registration or recover arbitrary encrypted JavaScript.
 
 Old single-rule scans unaffected by the scoring corrections can be adopted after their scope checks. Potentially affected multi-rule scans stay historical while a new scoring generation processes retained inputs; this one-time local work fixes demonstrated label/proximity errors without downloading them again. Explicit saved research choices remain intact; omitted auto-research now consistently defaults off.
+
+## Optional Research Intelligence and bounded CDX turns
+
+In **Research intelligence**, leave **Automatically build research index after scans (optional)** unchecked to finish normal scanning and reports without building vectors, entities, duplicate clusters or relationships. This is the default for new and example projects. An existing saved `research.auto_build: true` remains an explicit opt-in; uncheck it and save or run the project to change that choice. **Build / refresh index**, CLI `research-index`, and Research search remain independent of the automatic setting. Search needs an index that has already been built.
+
+CDX reads now check an active response deadline based on the CDX client's read timeout (normally capped at 120 seconds). This clock begins after request pacing, and does not change replay-download duration or the shared 429/503 gate. A failed or timed-out body never advances a cursor. Checks occur between reads, so an outstanding blocking read may extend the observed turn; this is not an instantaneous cancellation guarantee. Incomplete transport bodies return to the checkpoint scheduler instead of repeating the same broad query through every endpoint and format. Failed urllib3 responses close without draining an unwanted body.
+
+All-snapshot embedded lookups start with at most 2,000 rows per page, retain exact resume keys, and reserve memory for that smaller response. The worker count still respects the configured CDX concurrency and memory budget. Individual URLs with many captures require more smaller requests; ordinary domain-media indexing keeps its existing large pages. All shared CDX request-start pacing and terminal-response checks remain in effect.
+
+Text acquisition health now includes maximum outcome-processing, queue-refill, progress-callback and completed-result wait times. These complement the existing transfer and database timings when investigating a slow tail. See [the audit and validation evidence](V127_PIPELINE_AUDIT.md).
 
 After upgrade, use the usual dependency installation/update procedure or rebuild the executable. The build scripts include offline suffix assets in GUI and CLI bundles. Source tests are not native frozen-build certification.

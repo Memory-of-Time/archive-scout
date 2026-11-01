@@ -1024,9 +1024,13 @@ def queue_media_discovery_candidates(
             source_type=CASE WHEN source_type='' THEN ? ELSE source_type END,
             kind_hint=CASE WHEN COALESCE(kind_hint,'')='' THEN ? ELSE kind_hint END
         WHERE query_signature=? AND original_url=?
+          AND ((source_document_id IS NULL AND ? IS NOT NULL)
+            OR (source_type='' AND ?!='')
+            OR (COALESCE(kind_hint,'')='' AND ?!=''))
         """,
         (
-            (document_id, source_type, kind_hint, query_signature, url)
+            (document_id, source_type, kind_hint, query_signature, url,
+             document_id, source_type, kind_hint)
             for url, document_id, source_type, kind_hint in candidates
         ),
     )

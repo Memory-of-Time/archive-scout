@@ -14,6 +14,7 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     import httpx
     import urllib3
     from ..network.transports import (ContentEncodingMismatch,
+                                     CdxResponseTimeout,
                                      PayloadDigestMismatch, IncompleteRepresentationError,
                                      exception_chain, normalize_transport_error,
                                      is_transport_connection_failure)
@@ -30,7 +31,7 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
             return "connection", status, True
         if isinstance(current, (httpx.ConnectTimeout, urllib3.exceptions.ConnectTimeoutError)):
             return "connect_timeout", status, True
-        if isinstance(current, (httpx.ReadTimeout, urllib3.exceptions.ReadTimeoutError)):
+        if isinstance(current, (CdxResponseTimeout, httpx.ReadTimeout, urllib3.exceptions.ReadTimeoutError)):
             return "read_timeout", status, True
     if is_transport_connection_failure(exc):
         return "connection", status, True

@@ -58,6 +58,19 @@ python -m PyInstaller \
   run_cli.py
 
 APP="dist/Archive Scout.app"
+python - "$APP/Contents/Info.plist" <<'PYVERSION'
+import plistlib
+import sys
+from pathlib import Path
+from archive_scout.constants import VERSION
+path = Path(sys.argv[1])
+with path.open('rb') as handle:
+    info = plistlib.load(handle)
+info['CFBundleShortVersionString'] = VERSION
+info['CFBundleVersion'] = VERSION
+with path.open('wb') as handle:
+    plistlib.dump(info, handle)
+PYVERSION
 CLI="dist/ArchiveScoutCLI"
 PACKAGE="release/ArchiveScout-macOS-Universal"
 ZIP="release/ArchiveScout-macOS-Universal.zip"

@@ -11,7 +11,7 @@ def main() -> int:
     sys.path.insert(0, str(root))
     from archive_scout.constants import APP_NAME, VERSION, SCHEMA_VERSION
 
-    assert (APP_NAME, VERSION, SCHEMA_VERSION) == ("Archive Scout", "1.2.6", 11), "release metadata mismatch"
+    assert (APP_NAME, VERSION, SCHEMA_VERSION) == ("Archive Scout", "1.2.7", 11), "release metadata mismatch"
     project = (root / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'(?m)^name\s*=\s*"archive-scout"', project), "distribution name"
     assert re.search(r'(?m)^version\s*=\s*"' + re.escape(VERSION) + r'"', project), "distribution version"
@@ -43,6 +43,9 @@ def main() -> int:
     for file in ("Install Archive Scout.cmd", "Uninstall Archive Scout.cmd", "install.ps1", "uninstall.ps1"):
         assert (root / "packaging/windows" / file).is_file(), f"missing installer {file}"
     tests = (root / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    macos = (root / "scripts/build_macos.sh").read_text(encoding="utf-8")
+    for field in ('CFBundleShortVersionString', 'CFBundleVersion'):
+        assert f"info['{field}'] = VERSION" in macos, f"macOS version metadata missing {field}"
     assert "python scripts/run_tests.py" in tests, "CI canonical test runner missing"
     assert "xvfb-run" in tests, "Linux GUI test runner missing"
     assert (root / "archive_scout/ui/main_window.py").is_file()

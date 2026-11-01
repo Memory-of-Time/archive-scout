@@ -523,6 +523,10 @@ def _request_media_paged_batch(
     return PagedBatch(results, pages, current.page >= current.page_count and not current.retry_pages)
 
 
+def embedded_response_budget(page_size: int) -> int:
+    return min(64 * 1024 * 1024, max(8 * 1024 * 1024, int(page_size) * 1536))
+
+
 def _request_media_resume(
     config: ProjectConfig,
     client: HttpClient,
@@ -533,6 +537,7 @@ def _request_media_resume(
 ) -> tuple[list[CDXRow], bool, str | None]:
     # Cursor advancement must be atomic with inserted media inventory rows.
     page_size = current.page_size or config.page_size
+    response_budget = embedded_response_budget if exact else cdx_response_budget
     result = request_cdx_rows(
         client,
         cdx_endpoints(config),
@@ -546,7 +551,7 @@ def _request_media_resume(
             extensions=extensions,
             exact=exact,
         ),
-        max_bytes=cdx_response_budget(page_size),
+        max_bytes=response_budget(page_size),
         prefer_text=True,
     )
     rows, next_resume = result.rows, result.resume_key
@@ -558,10 +563,10 @@ def _request_media_resume(
         params = build_media_params(config, target, current.start, current.end, current.resume_key,
                                     page_size=page_size + 1, extensions=extensions, exact=exact)
         confirmation = (request_cdx_json_rows(client, cdx_endpoints(config), params,
-                                             max_bytes=cdx_response_budget(page_size + 1))
+                                             max_bytes=response_budget(page_size + 1))
                         if hasattr(client, 'transport') else
                         request_cdx_rows(client, cdx_endpoints(config), params,
-                                         max_bytes=cdx_response_budget(page_size + 1), prefer_text=False))
+                                         max_bytes=response_budget(page_size + 1), prefer_text=False))
         from ..cdx.client import MalformedCDXResponse
         if confirmation.rows[:len(rows)] != rows:
             raise MalformedCDXResponse("Media terminal response disagrees with native JSON; cursor retained", splittable=False)
@@ -574,7 +579,7 @@ def _request_media_resume(
             probe = request_cdx_json_rows(client, cdx_endpoints(config),
                 build_media_params(config, target, current.start, current.end, current.resume_key,
                                    page_size=smaller, extensions=extensions, exact=exact),
-                max_bytes=cdx_response_budget(smaller))
+                max_bytes=response_budget(smaller))
             if (probe.resume_key and probe.resume_key != current.resume_key
                     and probe.rows == confirmation.rows[:len(probe.rows)]):
                 current.page_size = smaller
