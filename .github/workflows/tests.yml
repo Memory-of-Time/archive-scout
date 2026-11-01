@@ -52,7 +52,8 @@ jobs:
           xvfb-run -a -s '-screen 0 1280x800x24' python -m unittest \
             tests.unit.test_v123_ci_layout \
             tests.unit.test_v123_restoration.GuiRestorationTests \
-            tests.unit.test_v122_cdx_gui_speed.GUIThemeTests -v
+            tests.unit.test_v122_cdx_gui_speed.GUIThemeTests \
+            tests.unit.test_v126_pipeline_audit.ResearchTabTests -v
       - name: Offline benchmark smoke test
         if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.12'
         run: python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
