@@ -245,11 +245,29 @@ class AcquisitionTailTests(ProjectFixture):
 
 class ResearchTabTests(unittest.TestCase):
     def test_tab_exposes_optional_control_and_manual_build(self):
+        import gc
+        import os
+        import subprocess
+        import sys
+        import weakref
+        if os.environ.get('ARCHIVE_SCOUT_RESEARCH_TAB_TEST_CHILD') != '1':
+            name='tests.unit.test_v126_pipeline_audit.ResearchTabTests.'+self._testMethodName
+            result=subprocess.run([sys.executable,'-m','unittest',name,'-v'],
+                cwd=Path(__file__).resolve().parents[2],
+                env=dict(os.environ,ARCHIVE_SCOUT_RESEARCH_TAB_TEST_CHILD='1'),
+                text=True,capture_output=True,timeout=60)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            if 'skipped=1' in result.stderr:
+                self.skipTest('display is not available in the GUI child process')
+            return
         import tkinter as tk
         from tkinter import ttk
         from archive_scout.ui.main_window import ArchiveScoutApp
         try:root=tk.Tk()
         except tk.TclError:self.skipTest('display is not available')
+        app=None
+        controls=[]
+        references=[weakref.ref(root)]
         try:
             root.withdraw()
             app=Mock()
@@ -258,6 +276,8 @@ class ResearchTabTests(unittest.TestCase):
             app.research_backend_var=tk.StringVar(root,value='local-hash')
             app.research_limit_var=tk.StringVar(root,value='100')
             app.research_query_var=tk.StringVar(root)
+            references.extend(weakref.ref(value) for value in (app,app.research_auto_var,
+                app.research_backend_var,app.research_limit_var,app.research_query_var))
             ArchiveScoutApp.create_research_tab(app)
             def descendants(widget):
                 for child in widget.winfo_children():
@@ -271,5 +291,24 @@ class ResearchTabTests(unittest.TestCase):
             self.assertTrue(app.research_auto_var.get())
             app.research_index_button.invoke()
             app.start_research_index_ui.assert_called_once()
-        finally:root.destroy()
+        finally:
+            root.destroy()
+            controls.clear()
+            del app,root
+            gc.collect()
+        self.assertTrue(all(reference() is None for reference in references),
+                        'Research-tab fixture retained Tk objects after main-thread cleanup')
 
+
+class ResearchTabIsolationTests(unittest.TestCase):
+    def test_gui_launcher_preserves_child_failures(self):
+        import os
+        import subprocess
+        case=ResearchTabTests('test_tab_exposes_optional_control_and_manual_build')
+        with patch.dict(os.environ,{},clear=False):
+            os.environ.pop('ARCHIVE_SCOUT_RESEARCH_TAB_TEST_CHILD',None)
+            with patch('subprocess.run',return_value=subprocess.CompletedProcess([],134,'','Tcl failure')) as child:
+                with self.assertRaisesRegex(AssertionError,'Tcl failure'):
+                    case.test_tab_exposes_optional_control_and_manual_build()
+        self.assertEqual(child.call_count,1)
+        self.assertEqual(child.call_args.kwargs['env']['ARCHIVE_SCOUT_RESEARCH_TAB_TEST_CHILD'],'1')
