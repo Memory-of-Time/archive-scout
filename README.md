@@ -10,8 +10,6 @@
 
 [All releases](https://github.com/Memory-of-Time/archive-scout/releases) · [Report a bug](https://github.com/Memory-of-Time/archive-scout/issues)
 
-Links work once matching build artifacts have been published on GitHub. The [release workflow](.github/workflows/build-and-release.yml) defines and packages those filenames.
-
 ### Installation
 
 - **Windows:** Open `ArchiveScout.exe` in the extracted `ArchiveScout` folder, or run `Install Archive Scout.cmd` for current-user desktop/start-menu shortcuts. See [Windows instructions](packaging/windows/README-WINDOWS.txt).
