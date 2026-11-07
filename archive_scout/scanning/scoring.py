@@ -8,8 +8,10 @@ from itertools import combinations
 from ..constants import ARCHIVE_EXTENSIONS, MEDIA_EXTENSIONS
 from ..content import safe_urlsplit
 from ..utils import normalize_search
-from .keywords import CompiledRule, KeywordPrefilter, keyword_url_match
-from .snippets import make_snippets
+from .keywords import CompiledRule, KeywordPrefilter, keyword_url_match, matching_text
+from .snippets import field_snippets
+
+SCORING_RECIPE = 4
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|[\r\n]+")
 PARAGRAPH_SPLIT = re.compile(r"(?:\r?\n){2,}|</p\s*>|<br\s*/?>\s*<br\s*/?>", re.IGNORECASE)
@@ -40,17 +42,11 @@ def link_is_interesting(
 
 def _rule_identity(item):
     rule = item.rule
-    return (rule.expression, rule.kind, rule.case_sensitive, rule.whole_word, rule.weight)
+    return (rule.expression, rule.kind, rule.case_sensitive, rule.whole_word, rule.weight, rule.label)
 
 
-def _matches(item: CompiledRule, value: str, normalized_value: str):
-    """Yield regex matches without materializing a per-rule list."""
-    haystack = value if item.rule.case_sensitive else normalized_value
-    return item.pattern.finditer(haystack)
-
-
-def _match_count(item: CompiledRule, value: str, normalized_value: str) -> int:
-    return sum(1 for _ in _matches(item, value, normalized_value))
+def _match_count(item: CompiledRule, haystack: str) -> int:
+    return sum(1 for _ in item.pattern.finditer(haystack))
 
 
 def _matched_labels_in_segments(text: str, patterns: list[CompiledRule], splitter: re.Pattern[str]) -> int:
@@ -62,7 +58,7 @@ def _matched_labels_in_segments(text: str, patterns: list[CompiledRule], splitte
         labels = {
             item.rule.label
             for item in patterns
-            if item.rule.kind != "excluded" and item.pattern.search(segment if item.rule.case_sensitive else normalized_segment)
+            if item.rule.kind != "excluded" and item.pattern.search(matching_text(item, segment, normalized_segment))
         }
         if len(labels) >= 2:
             bonus += len(labels) * (len(labels) - 1)
@@ -80,8 +76,8 @@ def _proximity_bonus(text: str, patterns: list[CompiledRule], window_words: int 
         if item.rule.kind == "excluded":
             continue
         bucket = positions.setdefault(item.rule.label, [])
-        haystack = text if item.rule.case_sensitive else normalized
-        source_starts = [m.start() for m in WORD_PATTERN.finditer(text)] if item.rule.case_sensitive else starts
+        haystack = matching_text(item, text, normalized)
+        source_starts = starts if haystack is normalized else [m.start() for m in WORD_PATTERN.finditer(text)]
         for match in item.pattern.finditer(haystack):
             bucket.append(max(0, bisect.bisect_right(source_starts, match.start()) - 1))
         bucket.sort()
@@ -141,6 +137,8 @@ def analyze_content(
     prefilter: KeywordPrefilter | None = None,
     prepared_fields: dict[str, str] | None = None,
     prepared_normalized_fields: dict[str, str] | None = None,
+    *,
+    include_snippets: bool = True,
 ) -> dict:
     if prepared_fields is None or prepared_normalized_fields is None:
         fields, normalized_fields = prepare_analysis_fields(original, title, visible, raw, links)
@@ -178,11 +176,20 @@ def analyze_content(
     matched_identities = set()
     excluded_labels: set[str] = set()
     required_rules = [item for item in patterns if item.rule.kind == "required"]
+    snippet_rules: dict[str, dict[str, list[CompiledRule]]] = {}
 
     for field_name, value in fields.items():
         normalized_value = normalized_fields[field_name]
         for item in evaluation_patterns:
-            count = _match_count(item, value, normalized_value)
+            haystack = value if item.rule.case_sensitive else normalized_value
+            count = _match_count(item, haystack)
+            if count and include_snippets and item.rule.kind != "excluded":
+                snippet_rules.setdefault(field_name, {}).setdefault(haystack, []).append(item)
+            if item.rule.kind == "regex" and haystack != value:
+                original_count = _match_count(item, value)
+                if original_count and include_snippets:
+                    snippet_rules.setdefault(field_name, {}).setdefault(value, []).append(item)
+                count = max(count, original_count)
             if not count:
                 continue
             label = item.rule.label
@@ -221,9 +228,21 @@ def analyze_content(
     if excluded or missing_required:
         score = 0
     interesting_links = sorted({link for link in links if link_is_interesting(link, patterns, prefilter)})
-    snippets = make_snippets(visible or raw, positive_matched_rules) if positive_matched_rules else []
+    snippets = []
+    seen_fields = set()
+    for field_name in ("body", "title", "links", "source", "url"):
+        unique_groups = {}
+        for haystack, items in snippet_rules.get(field_name, {}).items():
+            identity = (haystack, frozenset(item.pattern for item in items))
+            if identity in seen_fields:
+                continue
+            seen_fields.add(identity)
+            unique_groups[haystack] = items
+        if unique_groups:
+            label = "URL" if field_name == "url" else field_name.capitalize()
+            snippets.extend(f"[{label}] {excerpt}" for excerpt in field_snippets(fields[field_name], unique_groups))
     return {
-        "score": int(round(score)),
+        "score": max(1, round(score)) if score > 0 else 0,
         "hits": dict(sorted(hits.items())),
         "hit_fields": {key: sorted(value) for key, value in hit_fields.items()},
         "snippets": snippets,

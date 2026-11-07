@@ -69,6 +69,7 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob], extract
                     job.prefilter,
                     prepared_fields,
                     prepared_normalized_fields,
+                    include_snippets=job.store_snippets,
                 ),
             )
             for job in jobs

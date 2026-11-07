@@ -413,6 +413,19 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
         outcomes = text_outcome_counts(database, config) if 'states' in opts.summary_fields else {'unfinished': 0, 'unavailable': 0}
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         keywords = json.loads(run["keywords_json"])
+        ranked, below_threshold, excluded, required_missing = database.execute(
+            """SELECT COUNT(CASE WHEN score>=? AND excluded=0 AND required_missing=0 THEN 1 END),
+                      COUNT(CASE WHEN score>0 AND score<? AND excluded=0 AND required_missing=0 THEN 1 END),
+                      COUNT(CASE WHEN excluded=1 THEN 1 END),
+                      COUNT(CASE WHEN required_missing=1 THEN 1 END)
+               FROM document_matches WHERE scan_run_id=?""",
+            (config.minimum_score, config.minimum_score, scan_run_id),
+        ).fetchone()
+        ranked_summary = (f"Ranked matches at score >= {config.minimum_score}: {ranked:,}\n"
+                          f"Below score threshold: {below_threshold:,}. Excluded by rules: {excluded:,}. "
+                          f"Missing required terms: {required_missing:,}.")
+        if need_ranked and 0 < opts.max_matches < ranked:
+            ranked_summary += f"\nRanked report shows {opts.max_matches:,} of {ranked:,} matches due to the configured match limit."
         values = {
             "heading": "Archive Scout", "generated": f"Generated: {utc_now()}",
             "output_directory": f"Output directory: {config.output_dir}",
@@ -425,7 +438,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
             "index_coverage": _index_coverage_status(database) + '\n' + format_index_status(text_index_status(database, config)),
-            "ranked_matches": f"Ranked matches at score >= {config.minimum_score}: {int(database.execute('SELECT COUNT(*) FROM document_matches WHERE scan_run_id=? AND score>=? AND excluded=0 AND required_missing=0', (scan_run_id, config.minimum_score)).fetchone()[0]):,}",
+            "ranked_matches": ranked_summary,
             "scan_diagnostic": (
                 "Scan status: " +
                 ("No bodies have recorded scan outcomes in this run. The run may be incomplete; "

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from ..cdx.parameters import cdx_query_signature
-from ..content import decode_bytes, parse_page, classify_replay_content
+from ..content import decode_bytes, parse_text_representation, classify_replay_content
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
 from ..domains import domain_text
@@ -59,16 +59,18 @@ def _scan_one(row: dict, jobs: list[ScanJob], extract_domains: bool = False) -> 
         from ..downloads.checkpoint import prove_file
         if not prove_file(path, row):
             raise PayloadIntegrityError(f"local retained body has no complete-transfer proof: capture {row['id']}")
-    raw = decode_bytes(data, row.get("response_content_type") or row.get("mimetype") or "")
+    content_type = row.get("response_content_type") or row.get("mimetype") or ""
+    raw = decode_bytes(data, content_type)
     replay_problem = classify_replay_content(raw, row.get("final_url") or "")
     if replay_problem:
         raise ArchivedErrorShell(replay_problem)
-    title, visible, links = parse_page(raw, row["original_url"])
+    title, visible, links = parse_text_representation(raw, row["original_url"], content_type)
     fields, normalized = prepare_analysis_fields(row["original_url"], title, visible, raw, links)
     analyses = {
         job.scan_run_id: analyze_content(
             row["original_url"], title, visible, raw, links,
             job.patterns, job.prefilter, fields, normalized,
+            include_snippets=job.store_snippets,
         )
         for job in jobs
     }

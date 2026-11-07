@@ -60,7 +60,13 @@ class ResponsiveLayoutTests(unittest.TestCase):
                         app.update()
                         tested += 1
                         self.assertLessEqual(app.sidebar_page.winfo_width(), 244)
-                        editors = (app.media_targets_text, app.media_include_text, app.media_exclude_text)
+                        editors = (app.media_targets_text, app.media_include_text, app.media_safety_label)
+                        warning = app.media_safety_label.cget("text")
+                        self.assertIn("info@archive.org", warning)
+                        self.assertIn("Site abuse", warning)
+                        self.assertIn("large, well-known sites", warning)
+                        self.assertFalse(hasattr(app, "media_exclude_text"))
+                        self.assertFalse(hasattr(app, "scope_var"))
                         measured = [widget.winfo_width() for widget in editors]
                         self.assertGreaterEqual(min(measured), 110)
                         self.assertLessEqual(max(measured)-min(measured), 20, measured)

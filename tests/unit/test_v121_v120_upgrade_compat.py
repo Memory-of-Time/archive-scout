@@ -111,7 +111,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             current = snapshot(new_root, [int(key) for key in original["capture_identity_samples"]])
             self.assertEqual(compare(original, current), [])
 
-    def test_resume_reuses_unaffected_single_rule_scan_without_resetting_results(self):
+    def test_resume_refreshes_legacy_scoring_without_resetting_results(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.make_old_project(root, 36)
@@ -125,18 +125,20 @@ class V120V121ResumeCompatibility(unittest.TestCase):
                 db.commit()
                 jobs = prepare_scan_jobs(db, cfg, "resume")
                 self.assertEqual(len(jobs), 1)
-                self.assertEqual(jobs[0].scan_run_id, original_run_id)
-                self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0],1)
+                current_run_id = jobs[0].scan_run_id
+                self.assertNotEqual(current_run_id, original_run_id)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0],2)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM document_matches").fetchone()[0],1)
                 self.assertEqual(db.execute("SELECT status FROM scan_runs WHERE id=?",(jobs[0].scan_run_id,)).fetchone()[0],"running")
-                db.execute("UPDATE scan_runs SET status='interrupted' WHERE id=?", (original_run_id,))
+                db.execute("UPDATE scan_runs SET status='interrupted' WHERE id=?", (current_run_id,))
                 db.commit()
+                self.assertEqual(prepare_scan_jobs(db, cfg, "resume")[0].scan_run_id, current_run_id)
                 incompatible = ProjectConfig(root, targets=["other.example/*"], keywords=["needle"],
                                              from_date=cfg.from_date,to_date=cfg.to_date,
                                              cdx_collapses=cfg.cdx_collapses,
                                              text_collapse_scope=cfg.text_collapse_scope).normalized()
                 newer = prepare_scan_jobs(db, incompatible, "resume")
-                self.assertNotEqual(newer[0].scan_run_id,original_run_id)
+                self.assertNotIn(newer[0].scan_run_id, (original_run_id, current_run_id))
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM document_matches WHERE scan_run_id=?",(original_run_id,)).fetchone()[0],1)
             finally:
                 db.close()

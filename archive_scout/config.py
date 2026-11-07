@@ -569,7 +569,10 @@ class ProjectConfig:
             connect_timeout=max(1.0, float(self.connect_timeout)),
             read_timeout=max(1.0, float(self.read_timeout)),
             max_attempts=min(20, max(1, int(self.max_attempts))),
-            user_agent=(DEFAULT_USER_AGENT if self.user_agent.strip() in {'', 'ArchiveScout/1.2.6 public web archive research client'}
+            user_agent=(DEFAULT_USER_AGENT if self.user_agent.strip() in {
+                '', 'ArchiveScout/1.2.6 public web archive research client',
+                'ArchiveScout/1.2.7 public web archive research client',
+            }
                         else self.user_agent.strip()),
             retry_error_categories=list(dict.fromkeys(value.strip() for value in self.retry_error_categories if value.strip())),
             retry_capture_ids=sorted({int(value) for value in self.retry_capture_ids if int(value) > 0}),
@@ -767,7 +770,7 @@ def project_config_from_payload(payload: dict, path: Path) -> ProjectConfig:
     # The 2026 service-oriented default is 2.5 seconds between CDX starts.
     # Migrate only historical untouched 0.75-second defaults; an explicit
     # custom interval other than that historical default is preserved.
-    if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) not in {"1.2.6", VERSION}:
+    if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) not in {"1.2.6", "1.2.7", VERSION}:
         loaded_cdx_delay = 1.5
     # v1.0.3 shipped conservative replay defaults (4 workers, 0.5 s
     # between request starts). Upgrade only that untouched pair to the v1.0.4

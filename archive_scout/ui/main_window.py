@@ -22,7 +22,7 @@ from ..ai.reports import generate_ai_reports
 from ..cdx.client import RateLimitDeferred
 from ..cdx.parameters import build_cdx_params, cdx_year_window
 from ..config import AIConfig, AnalysisConfig, KeywordSetConfig, MediaConfig, NetworkConfig, ProjectConfig, ResearchConfig, ReportConfig, REPORT_FIELD_NAMES, REPORT_OUTPUT_NAMES, load_project_config, save_project_config
-from ..constants import APP_NAME, CDX_URL, DEFAULT_IMAGE_EXTENSIONS, DEFAULT_VIDEO_EXTENSIONS, OPERATION_MODES, REVIEW_STATUSES, SCOPE_LABELS, VERSION
+from ..constants import APP_NAME, CDX_URL, DEFAULT_IMAGE_EXTENSIONS, DEFAULT_VIDEO_EXTENSIONS, OPERATION_MODES, REVIEW_STATUSES, VERSION
 from ..database.connection import open_database
 from ..database.repositories import (
     ai_result_rows,
@@ -231,7 +231,6 @@ class ArchiveScoutApp(tk.Tk):
         self.preset_var = tk.StringVar(value="Ogrish 9/11 research")
         self.mode_var = tk.StringVar(value="Index, download, scan, and report")
         self.operation_help_var = tk.StringVar(value=MODE_HELP["all"])
-        self.scope_var = tk.StringVar(value="All archived text pages (thorough)")
         self.from_date_var = tk.StringVar(value="2001")
         self.to_date_var = tk.StringVar(value="2010")
         self.cdx_match_type_var = tk.StringVar(value="Automatic")
@@ -871,7 +870,7 @@ class ArchiveScoutApp(tk.Tk):
         descriptions = (
             "Media sites/paths (blank uses Sites and paths)",
             "Include extensions",
-            "Exclude extensions",
+            "Media safety",
         )
         for column, description in enumerate(descriptions):
             ttk.Label(editors, text=description, anchor="w", wraplength=210, justify="left").grid(
@@ -879,8 +878,17 @@ class ArchiveScoutApp(tk.Tk):
             )
         self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
         self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
-        self.media_exclude_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
-        for column, widget in enumerate((self.media_targets_text, self.media_include_text, self.media_exclude_text)):
+        self.media_safety_label = ttk.Label(
+            editors,
+            text=("Archived sites can contain illegal material. Download media only from large, well-known sites "
+                  "to reduce your risk.\n\n"
+                  "If you encounter suspected illegal content, email info@archive.org with the subject “Site abuse”. "
+                  "Identify the subdomain (subdomain.example.com) or directory (example.com/directory/like/this/). "
+                  "If most of the site is affected, give the domain. Start with that location and let the Archive follow up. "
+                  "Leave files and direct file links out of the report."),
+            justify="left", anchor="nw", wraplength=210,
+        )
+        for column, widget in enumerate((self.media_targets_text, self.media_include_text, self.media_safety_label)):
             widget.grid(row=1, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
         settings = ttk.Frame(tab)
         settings.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -1175,15 +1183,6 @@ class ArchiveScoutApp(tk.Tk):
         for row, (label, variable) in enumerate(perf_rows):
             ttk.Label(performance, text=label + ":", wraplength=360).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(performance, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
-        row = len(perf_rows)
-        ttk.Label(performance, text="Download scope:").grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Combobox(performance, textvariable=self.scope_var, values=list(SCOPE_LABELS), state="readonly").grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
-        ttk.Label(
-            performance,
-            text="The existing download scope and size budget apply. Text/media classification follows this repository’s routing rules.",
-            style="Muted.TLabel", wraplength=520, justify="left",
-        ).grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-
         connection = ttk.LabelFrame(tab, text="Connection and indexing", padding=10)
         connection.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
         connection.columnconfigure(1, weight=1)
@@ -1790,7 +1789,7 @@ class ArchiveScoutApp(tk.Tk):
                 include_images=self.media_images_var.get(),
                 include_videos=self.media_videos_var.get(),
                 include_extensions=self.lines_from(self.media_include_text),
-                exclude_extensions=self.lines_from(self.media_exclude_text),
+                exclude_extensions=self.loaded_project_config.media.exclude_extensions if self.loaded_project_config else [],
                 discover_embedded=self.media_embedded_var.get() or external_after_scan,
                 allow_external_embeds=self.media_external_var.get() or external_after_scan,
                 snapshot_strategy=self.media_strategy_var.get(),
@@ -1867,7 +1866,6 @@ class ArchiveScoutApp(tk.Tk):
                 cdx_extra_params=self.lines_from(self.cdx_extra_text),
                 page_size=int(self.page_size_var.get()),
                 workers=int(self.workers_var.get()),
-                download_scope=SCOPE_LABELS[self.scope_var.get()],
                 minimum_score=int(self.minimum_score_var.get()),
                 max_file_mb=float(self.max_file_var.get()),
                 cdx_delay=float(self.cdx_delay_var.get()),
@@ -1911,8 +1909,7 @@ class ArchiveScoutApp(tk.Tk):
         mode = selected_mode
         if mode in {"all", "external_media_after_scan", "index", "download_only"} and not config.targets:
             raise ValueError("Add at least one site or path.")
-        effective_index_only = config.download_scope == "index_only" and mode in {"all", "external_media_after_scan", "download_only"}
-        if require_keywords and not effective_index_only and mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
+        if require_keywords and mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
             raise ValueError("Select at least one non-empty keyword set.")
         if mode == "merge_project" and not config.analysis.merge_source:
             raise ValueError("Choose a source project folder in Archive analysis.")
@@ -3021,17 +3018,12 @@ class ArchiveScoutApp(tk.Tk):
         self.import_source_var.set(config.import_source)
         self.replace_text(self.hitlist_text, config.hitlist_keywords)
         self.hitlist_file_var.set(config.hitlist_file)
-        for label, value in SCOPE_LABELS.items():
-            if value == config.download_scope:
-                self.scope_var.set(label)
-                break
         media = config.media
         self.media_enabled_var.set(media.enabled)
         self.replace_text(self.media_targets_text, media.targets)
         self.media_images_var.set(media.include_images)
         self.media_videos_var.set(media.include_videos)
         self.replace_text(self.media_include_text, media.include_extensions)
-        self.replace_text(self.media_exclude_text, media.exclude_extensions)
         self.media_embedded_var.set(media.discover_embedded)
         self.media_external_var.set(media.allow_external_embeds)
         self.media_strategy_var.set(media.snapshot_strategy)
@@ -3280,7 +3272,7 @@ class ArchiveScoutApp(tk.Tk):
                     include_images=self.media_images_var.get(),
                     include_videos=self.media_videos_var.get(),
                     include_extensions=self.lines_from(self.media_include_text),
-                    exclude_extensions=self.lines_from(self.media_exclude_text),
+                    exclude_extensions=self.loaded_project_config.media.exclude_extensions if self.loaded_project_config else [],
                     snapshot_strategy=self.media_strategy_var.get(),
                 )
             dashboard_var.set(format_media_policy_summary(media))

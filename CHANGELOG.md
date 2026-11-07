@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.8 — scan coverage and final interface changes
+
+- Replace the Media exclusion editor with site-level abuse reporting guidance and remove Download scope from Settings. New GUI runs scan eligible text across the selected sites and dates. Use **Index URLs only** when you only need the inventory.
+- Keep confirmed low-weight hits above zero and make the fast literal filter agree with Unicode case-insensitive matching. Collect regular-expression evidence from the original and normalized field. Use the larger per-field occurrence count for scoring so the two representations do not double-count the same hits.
+- Scan plain text consistently in background acquisition and Rescan. Record every distinct matching passage across body, title, links, source and URL. Merge overlapping contexts and preserve explicit report limits.
+- Report counts for score thresholds, exclusions and required terms. To refresh prior results, run **Rescan existing downloads with selected keyword sets**. Earlier scans and reviews remain available under their original scan runs.
+
 ## v1.2.7 — pipeline audit and release refresh
 
 - Make automatic Research Intelligence indexing consistently optional and off by default; retain manual build/search and explicitly saved opt-in.

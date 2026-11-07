@@ -162,9 +162,17 @@ def compile_keywords(keywords: Iterable[str | dict | KeywordRule]) -> list[Compi
     return [compile_rule(rule) for rule in parse_keyword_rules(keywords)]
 
 
+def matching_text(item: CompiledRule, original: str, normalized: str) -> str:
+    if item.rule.case_sensitive:
+        return original
+    if item.rule.kind == "regex" and original != normalized and not item.pattern.search(normalized):
+        return original
+    return normalized
+
+
 def keyword_url_match(url: str, patterns: list[CompiledRule]) -> bool:
     normalized = normalize_search(url)
-    return any(item.pattern.search(url if item.rule.case_sensitive else normalized) for item in patterns if item.rule.kind != "excluded")
+    return any(item.pattern.search(matching_text(item, url, normalized)) for item in patterns if item.rule.kind != "excluded")
 
 
 @dataclass(slots=True)
@@ -181,11 +189,11 @@ class KeywordPrefilter:
             return True
         if self.positive_automaton is not None:
             for value in normalized_fields.values():
-                if self.positive_automaton.search_any(value):
+                if self.positive_automaton.search_any(value.replace("ı", "i")):
                     return True
         for item in self.positive_slow_patterns:
             for field_name, value in fields.items():
-                haystack = value if item.rule.case_sensitive else normalized_fields[field_name]
+                haystack = matching_text(item, value, normalized_fields[field_name])
                 if item.pattern.search(haystack):
                     return True
         return False
@@ -208,7 +216,7 @@ class KeywordPrefilter:
         if self.candidate_automaton is not None:
             expressions: set[str] = set()
             for value in normalized_fields.values():
-                self.candidate_automaton.find_into(value, expressions)
+                self.candidate_automaton.find_into(value.replace("ı", "i"), expressions)
             for expression in expressions:
                 for item in self.literal_rules.get(expression, ()):
                     marker = id(item)
@@ -225,7 +233,7 @@ class KeywordPrefilter:
             if positive_found or item.rule.kind == "excluded":
                 continue
             for field_name, value in fields.items():
-                haystack = value if item.rule.case_sensitive else normalized_fields[field_name]
+                haystack = matching_text(item, value, normalized_fields[field_name])
                 if item.pattern.search(haystack):
                     positive_found = True
                     break
@@ -247,7 +255,7 @@ class KeywordPrefilter:
         if self.candidate_automaton is not None:
             expressions: set[str] = set()
             for value in normalized_fields.values():
-                self.candidate_automaton.find_into(value, expressions)
+                self.candidate_automaton.find_into(value.replace("ı", "i"), expressions)
             for expression in expressions:
                 for item in self.literal_rules.get(expression, ()):
                     marker = id(item)
@@ -271,7 +279,7 @@ def compile_prefilter(patterns: list[CompiledRule]) -> KeywordPrefilter:
     slow: list[CompiledRule] = []
     for item in patterns:
         if item.rule.kind != "regex" and not item.rule.case_sensitive and not item.rule.whole_word:
-            normalized = normalize_search(item.rule.expression)
+            normalized = normalize_search(item.rule.expression).replace("ı", "i")
             if normalized:
                 all_literals.append(normalized)
                 literal_rules.setdefault(normalized, []).append(item)

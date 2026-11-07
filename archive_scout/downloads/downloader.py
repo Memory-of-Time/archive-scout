@@ -433,6 +433,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
         job.scan_run_id: analyze_content(
             original, title, visible, raw, links, job.patterns, job.prefilter,
             prepared_fields, prepared_normalized_fields,
+            include_snippets=job.store_snippets,
         )
         for job in jobs
     }

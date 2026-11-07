@@ -41,6 +41,7 @@ from .reports.text import generate_index_reports, generate_reports
 from .research.index import build_research_index
 from .scanning.jobs import ScanJob
 from .scanning.rescanner import rescan_keyword_sets
+from .scanning.scoring import SCORING_RECIPE
 
 from .scanning.hitlist import load_hitlist, search_with_hitlist
 
@@ -184,7 +185,7 @@ def _scan_scope_identity(config: ProjectConfig) -> str:
     """Stable inventory scope; excludes request pacing and project location."""
     from .database.scope import scope_rows
     targets = scope_rows(config)
-    data = {"targets": targets, "from": config.from_date, "to": config.to_date, "scoring_recipe": 3}
+    data = {"targets": targets, "from": config.from_date, "to": config.to_date, "scoring_recipe": SCORING_RECIPE}
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -199,28 +200,33 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
     This check is performed at most once on an explicit Resume, never per URL.
     """
     allowed = ("interrupted", "failed", "complete") if include_complete else ("interrupted", "failed")
-    candidate = database.execute(
-        """SELECT id,metadata_json,status FROM scan_runs
+    candidates = database.execute(
+        """SELECT id,metadata_json,status,
+                  EXISTS (SELECT 1 FROM document_matches m WHERE m.scan_run_id=scan_runs.id) AS has_matches
+           FROM scan_runs
            WHERE keyword_set_id=? AND minimum_score=? AND status IN ("""
         + ",".join("?" for _ in allowed) + """)
            AND source_operation IN (""" + ("'rescan'" if rescan_only else "'all','download','resume','external_media_after_scan','retry_errors'") + """)
-           ORDER BY CASE status WHEN 'interrupted' THEN 0 ELSE 1 END,id DESC LIMIT 1""",
+           ORDER BY CASE status WHEN 'interrupted' THEN 0 ELSE 1 END,id DESC""",
         (keyword_set_id, config.minimum_score, *allowed),
-    ).fetchone()
-    if candidate is None:
+    )
+    for candidate in candidates:
+        try:
+            metadata = json.loads(candidate["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        storage = metadata.get('storage_policy') or {}
+        if candidate['has_matches'] and (
+            metadata.get('scoring_recipe') != SCORING_RECIPE
+            or (config.report.store_snippets and not storage.get('store_snippets', True))
+        ):
+            continue
+        break
+    else:
         return None
     run_id = int(candidate["id"])
-    try:
-        metadata = json.loads(candidate["metadata_json"] or "{}")
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(metadata, dict):
-        return None
-    if metadata.get("scoring_recipe") != 3 and database.execute("SELECT 1 FROM document_matches WHERE scan_run_id=? LIMIT 1",(run_id,)).fetchone():
-        from .scanning.keywords import compile_keywords
-        selected = config.selected_keyword_sets()
-        if not selected or len(compile_keywords(selected[0].rules)) != 1:
-            return None  # collisions and pair bonuses can alter multi-rule results
     if metadata.get("scope_identity"):
         if metadata["scope_identity"] != scope_id:
             # Preserve compatible interrupted scans from the earlier scope
@@ -234,7 +240,11 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
             previous_id = hashlib.sha256(json.dumps(previous_scope,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
             if metadata['scope_identity'] == old_id:
                 metadata.pop('saved_scope_proof', None)
-            elif metadata['scope_identity'] != previous_id:
+            elif metadata['scope_identity'] not in {
+                previous_id,
+                hashlib.sha256(json.dumps({**previous_scope, 'scoring_recipe': 3}, sort_keys=True,
+                                          separators=(',', ':')).encode()).hexdigest(),
+            }:
                 return None
     else:
         # Legacy scan metadata cannot establish a completed run's scope when
@@ -276,7 +286,7 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
             + saved_scope_predicate() + ") LIMIT 1", (run_id,)).fetchone():
             return None
     metadata['saved_scope_proof'] = 2
-    metadata['scoring_recipe'] = 3
+    metadata['scoring_recipe'] = SCORING_RECIPE
     metadata["scope_identity"] = scope_id
     database.execute(
         "UPDATE scan_runs SET status='running',completed_at=NULL,metadata_json=? WHERE id=?",
@@ -314,7 +324,7 @@ def prepare_scan_jobs(
                 config.minimum_score,
                 mode,
                 {"keyword_set": keyword_set.name, "rules": keyword_set.rules,
-                 "scope_identity": scope_id, "saved_scope_proof": 2, "scoring_recipe": 3,
+                 "scope_identity": scope_id, "saved_scope_proof": 2, "scoring_recipe": SCORING_RECIPE,
                  "historical_backfill_complete": False,
                  "historical_backfill_cursor": 0},
             )
@@ -323,7 +333,8 @@ def prepare_scan_jobs(
         metadata = json.loads(meta_row[0] or '{}')
         metadata['storage_policy'] = {key:getattr(storage,key) for key in ('store_keyword_counts','store_keyword_fields','store_snippets','store_interesting_links','create_default_reviews')}
         database.execute('UPDATE scan_runs SET metadata_json=? WHERE id=?',(json.dumps(metadata),run_id))
-        jobs.append(ScanJob.create(run_id, keyword_set.name, keyword_set.rules))
+        jobs.append(ScanJob.create(run_id, keyword_set.name, keyword_set.rules,
+                                   store_snippets=storage.store_snippets))
     database.commit()
     return jobs
 
@@ -391,8 +402,7 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
             ))) if callback else None,
             stop_event=stop_event,
         )
-        if index == 1:
-            paths.update(generated)
+        paths.update(generated)
         paths[f"scan_{job.scan_run_id}_folder"] = generated["scan_folder"]
     return paths
 

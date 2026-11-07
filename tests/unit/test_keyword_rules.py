@@ -43,7 +43,7 @@ class KeywordRuleTests(unittest.TestCase):
 
     def test_literal_prefilter_skips_full_scoring_for_nonmatching_page(self):
         job = ScanJob.create(1, "large", [f"exact: phrase-{index}" for index in range(342)])
-        with patch("archive_scout.scanning.scoring._matches", side_effect=AssertionError("full scan should be skipped")):
+        with patch("archive_scout.scanning.scoring._match_count", side_effect=AssertionError("full scan should be skipped")):
             result = analyze_content(
                 "http://example.com/ordinary",
                 "Ordinary page",
