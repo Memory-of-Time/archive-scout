@@ -8,10 +8,13 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from httpcore import ReadTimeout as HttpcoreReadTimeout
 
 from archive_scout.cdx.client import HttpClient, TransientRequestError
 from archive_scout.cdx.indexer import save_coverage_state
@@ -26,6 +29,7 @@ from archive_scout.downloads.rate_limit import (
 from archive_scout.downloads.validation import classify_exception
 from archive_scout.events import Stopped
 from archive_scout.network.replay_turn import ReplayTurn, ReplayTurnExpired, replay_turn
+from archive_scout.network.transports import _TimedNetworkStream
 from archive_scout.operations import run_project
 
 
@@ -86,6 +90,8 @@ class ReplayTurnBudgetTests(unittest.TestCase):
                         if self.path == "/slow":
                             self.drip(BODY)
                         else:
+                            if self.path == "/slow-pass":
+                                owner.disconnect.wait(.75)
                             self.wfile.write(BODY)
                 except OSError:
                     pass
@@ -184,14 +190,14 @@ class ReplayTurnBudgetTests(unittest.TestCase):
             client.close()
 
     def test_short_pass_yields_to_fresh_work_then_long_retry_saves_and_scans(self):
-        cfg = self.seed(["/slow", "/fast"])
+        cfg = self.seed(["/slow-pass", "/fast"])
         with self.redirect_fixture(), \
-                patch("archive_scout.downloads.downloader.TEXT_FIRST_TURN_SECONDS", .22), \
-                patch("archive_scout.downloads.downloader.TEXT_RETRY_TURN_SECONDS", 2.5):
+                patch("archive_scout.downloads.downloader.TEXT_FIRST_TURN_SECONDS", .5), \
+                patch("archive_scout.downloads.downloader.TEXT_RETRY_TURN_SECONDS", 6.0):
             result = run_project(cfg, "download")
         self.assertEqual(result.status, "complete")
-        self.assertEqual([p for p, _ in self.requests], ["/slow", "/fast", "/slow"])
-        with sqlite3.connect(self.root / "archive_scout.sqlite3") as database:
+        self.assertEqual([p for p, _ in self.requests], ["/slow-pass", "/fast", "/slow-pass"])
+        with closing(sqlite3.connect(self.root / "archive_scout.sqlite3")) as database:
             self.assertEqual(database.execute("SELECT state,download_attempts FROM captures ORDER BY id").fetchall(),
                              [("downloaded", 2), ("downloaded", 1)])
             self.assertEqual(database.execute("SELECT COUNT(*) FROM document_matches WHERE score>0").fetchone()[0], 2)
@@ -231,7 +237,7 @@ class ReplayTurnBudgetTests(unittest.TestCase):
                 self.assertTrue(prepared.wait(3))
                 time.sleep(.15)
                 self.assertEqual(self.requests, [])
-                with sqlite3.connect(self.root / "archive_scout.sqlite3") as database:
+                with closing(sqlite3.connect(self.root / "archive_scout.sqlite3")) as database:
                     self.assertEqual(database.execute("SELECT SUM(download_attempts) FROM captures").fetchone()[0], 0)
             finally:
                 worker.join(6)
@@ -336,3 +342,20 @@ class ReplayTurnBudgetTests(unittest.TestCase):
         finally:
             replay_turn.reset(token)
             client.close()
+
+    def test_socket_timeout_uses_the_limit_that_was_passed_to_the_socket(self):
+        stream = Mock()
+        stream.read.side_effect = HttpcoreReadTimeout("simulated socket timeout")
+        reader = _TimedNetworkStream(stream)
+        turn = ReplayTurn(20)
+        turn.start()
+        token = replay_turn.set(turn)
+        try:
+            with self.assertRaises(ReplayTurnExpired):
+                reader.read(1024, timeout=180)
+            with self.assertRaises(HttpcoreReadTimeout):
+                reader.read(1024, timeout=.1)
+            self.assertFalse(stream.read.call_args_list[0].kwargs["timeout"] > 20)
+            self.assertEqual(stream.read.call_args_list[1].kwargs["timeout"], .1)
+        finally:
+            replay_turn.reset(token)

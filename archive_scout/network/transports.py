@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import httpx
+from httpcore import ReadTimeout as HttpcoreReadTimeout
 import urllib3
 
 from ..events import Stopped
@@ -684,7 +685,14 @@ class _TimedNetworkStream:
         self.stream = stream
 
     def read(self, max_bytes, timeout=None):
-        return self.stream.read(max_bytes, timeout=replay_timeout(timeout))
+        remaining = replay_timeout()
+        deadline_limited = remaining is not None and (timeout is None or remaining <= timeout)
+        try:
+            return self.stream.read(max_bytes, timeout=remaining if deadline_limited else timeout)
+        except HttpcoreReadTimeout as exc:
+            if deadline_limited:
+                raise ReplayTurnExpired("text replay exceeded its active deadline; capture remains retryable") from exc
+            raise
 
     def write(self, buffer, timeout=None):
         self.stream.write(buffer, timeout=replay_timeout(timeout))
