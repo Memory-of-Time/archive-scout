@@ -23,6 +23,9 @@ from ..constants import RETRYABLE_STATUS
 from ..downloads.rate_limit import FixedRateLimiter, SharedHostGate
 from ..events import Stopped
 from ..json_codec import JSONDecodeErrors, loads as json_loads
+from ..network.replay_turn import (
+    ReplayDispatchDeferred, ReplayTurnExpired, ReplayTurnInterrupted, replay_timeout, replay_turn,
+)
 from ..network.transports import (
     RedirectPolicyError,
     PermitRevoked,
@@ -264,21 +267,27 @@ class HttpClient:
             except Exception:
                 pass  # Diagnostics cannot alter acquisition or retry outcomes.
 
+    def _observe_rejected_response(self, error, url, backend="") -> bool:
+        detail = next((item.transfer_diagnostic for item in exception_chain(error)
+                       if hasattr(item, 'transfer_diagnostic')), {})
+        if detail.get('response_status') is None:
+            return False
+        if self.response_callback is not None:
+            try:
+                self.response_callback({'status': int(detail['response_status']),
+                    'url': url, 'backend': backend, 'validation_rejected': True,
+                    'decoded_bytes': int(detail.get('decoded_bytes_received', 0))})
+            except Exception:
+                pass
+        return True
+
     def _finish_failed_transport_turn(self, exc, url, permit, *, splittable):
         """Persistent owners retry failed turns; do not multiply physical trials."""
         if any(isinstance(normalize_transport_error(error), IncompleteRepresentationError)
                for _, error in exc.failures):
             # The server answered. A bad body is not a failed connectivity probe.
-            if self.response_callback is not None:
-                for backend, error in exc.failures:
-                    detail = getattr(error, 'transfer_diagnostic', {})
-                    if detail.get('response_status') is not None:
-                        try:
-                            self.response_callback({'status': int(detail['response_status']),
-                                'url': url, 'backend': backend, 'validation_rejected': True,
-                                'decoded_bytes': int(detail.get('decoded_bytes_received', 0))})
-                        except Exception:
-                            pass
+            for backend, error in exc.failures:
+                self._observe_rejected_response(error, url, backend)
             self.host_gate.finish_request(permit, recovered=True)
             if self.coordinated_connection_recovery:
                 self.host_gate.connection_success()
@@ -475,6 +484,7 @@ class HttpClient:
         total_rate_wait = 0.0
         gate_deadline = time.monotonic() + (self.rate_limit_max_wait or 300.0)
         destination = Path(destination)
+        turn = replay_turn.get()
 
         while True:
             ensure_frozen_bundle_available()
@@ -482,9 +492,16 @@ class HttpClient:
             if destination.exists() and not _partial_metadata_path(destination).is_file():
                 destination.unlink(missing_ok=True)
             gate_started = time.monotonic()
-            permit = (self.host_gate.acquire_request(self.stop_event, deadline=gate_deadline)
-                      if isinstance(self.host_gate, SharedHostGate)
-                      else self.host_gate.acquire_request(self.stop_event))
+            if turn is not None and isinstance(self.host_gate, SharedHostGate):
+                permit = self.host_gate.acquire_request(self.stop_event, wait=False)
+                if permit is None:
+                    if turn.deadline is not None:
+                        raise ReplayTurnInterrupted("text replay interrupted by shared admission; retry scheduled")
+                    raise ReplayDispatchDeferred("Wayback gate is waiting for recovery")
+            else:
+                permit = (self.host_gate.acquire_request(self.stop_event, deadline=gate_deadline)
+                          if isinstance(self.host_gate, SharedHostGate)
+                          else self.host_gate.acquire_request(self.stop_event))
             turn_started = time.monotonic()
             try:
                 with (nullcontext() if isinstance(self.transport, ResilientTransport)
@@ -523,7 +540,7 @@ class HttpClient:
                         )
                     attempts_exhausted = self.rate_limit_attempts > 0 and rate_attempt >= self.rate_limit_attempts
                     wait_exhausted = self.rate_limit_max_wait > 0 and total_rate_wait > self.rate_limit_max_wait
-                    if attempts_exhausted or wait_exhausted:
+                    if turn is not None or attempts_exhausted or wait_exhausted:
                         raise RateLimitDeferred(
                             f"Wayback continued returning HTTP {status} after {rate_attempt} coordinated pauses. Progress was saved for resume.",
                             status=status, waited=total_rate_wait,
@@ -568,7 +585,16 @@ class HttpClient:
                 raise
             except PermitRevoked:
                 self.host_gate.finish_request(permit, recovered=False)
+                if turn is not None and turn.deadline is not None:
+                    raise ReplayTurnInterrupted("text replay interrupted by shared admission; retry scheduled") from None
                 continue
+            except ReplayTurnExpired as exc:
+                self._discard_untracked_partial(destination)
+                reachable = self._observe_rejected_response(exc, url)
+                self.host_gate.finish_request(permit, recovered=reachable)
+                if reachable and self.coordinated_connection_recovery:
+                    self.host_gate.connection_success()
+                raise
             except (RateLimitDeferred, Stopped):
                 self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
@@ -957,9 +983,10 @@ class HttpClient:
         wait_seconds = max(float(retry_after or 0), min(2.0, 0.25 * (attempt + 1)))
         if self.retry_callback:
             self.retry_callback(attempt + 2, self.retries, reason, wait_seconds)
-        self.stop_event.wait(wait_seconds)
+        self.stop_event.wait(replay_timeout(wait_seconds))
         if self.stop_event.is_set():
             raise Stopped
+        replay_timeout()
 
     def get_cdx_json_any(
         self,

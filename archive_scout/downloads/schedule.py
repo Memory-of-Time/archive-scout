@@ -47,7 +47,8 @@ def restore_increased_size_limit(database, config):
 
 def record_failure(database: sqlite3.Connection, capture_id: int, category: str,
                    status: int | None, retryable: bool, base_seconds: float,
-                   max_seconds: float, *, max_bytes: int | None = None) -> None:
+                   max_seconds: float, *, max_bytes: int | None = None,
+                   not_before: float = 0.0) -> None:
     routing = ('failed' if retryable else
                f'failed_size_limit:{int(max_bytes)}' if category=='oversized_response' and max_bytes is not None
                else f'failed_nonretryable:{category}')
@@ -73,7 +74,7 @@ def record_failure(database: sqlite3.Connection, capture_id: int, category: str,
         next_eligible_at=excluded.next_eligible_at,
         failure_count=excluded.failure_count,last_category=excluded.last_category,
         last_status=excluded.last_status,updated_at=excluded.updated_at""",
-        (capture_id, time.time()+delay, count, category, status, utc_now()))
+        (capture_id, max(time.time()+delay, not_before), count, category, status, utc_now()))
     if _retry_queue_exists(database):
         database.execute('''INSERT OR REPLACE INTO archive_scout_ready_retries
             SELECT capture_id,next_eligible_at FROM text_retry_schedule WHERE capture_id=?''', (capture_id,))

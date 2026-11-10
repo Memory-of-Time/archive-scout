@@ -27,7 +27,8 @@ def build_fingerprint():
     digest = hashlib.sha256()
     found = False
     for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
-                 'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'cdx/client.py',
+                 'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'network/replay_turn.py',
+                 'cdx/client.py',
                  'cdx/indexer.py', 'cdx/status.py',
                  'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
         path = root / name
@@ -253,6 +254,10 @@ class AcquisitionDiagnostics:
                            f"last save {metrics['seconds_since_last_save']:.0f}s ago; "
                            f"backend waiters {transport.get('backend_waiters', '?')}; "
                            f"backend probes {transport.get('probe_backends', ())}. ")
+            if metrics.get('active_replay_budget_seconds') is not None:
+                stages += (f"Active replay budget {metrics['active_replay_budget_seconds']:.1f}s; "
+                           f"shared dispatch wait {metrics['shared_dispatch_wait_seconds']:.1f}s; "
+                           f"unattempted deferrals {metrics['dispatch_deferrals_before_request']:,}. ")
             owner = metrics.get('owner_stages', {})
             if owner:
                 stages += 'Owner stage maxima: ' + ', '.join(

@@ -34,6 +34,7 @@ from .schedule import record_failure, clear_retry, prepare_retry_queue, select_d
 from .checkpoint import write_receipt, discard_receipt, sync_directory
 from .diagnostics import AcquisitionDiagnostics
 from .redirects import make_replay_redirect_validator
+from ..network.replay_turn import ReplayDispatchDeferred, ReplayTurn, replay_turn
 from ..network.transports import RedirectPolicyError, ResilientTransport
 
 
@@ -453,6 +454,10 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
     }
 
 
+TEXT_FIRST_TURN_SECONDS = 20.0
+TEXT_RETRY_TURN_SECONDS = 90.0
+
+
 def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpClient) -> dict:
     """Stream the full replay to a capture-identity-bound staging file.
 
@@ -764,10 +769,22 @@ def download_archive(
         timing['maximum'] = max(timing['maximum'], seconds)
         timing['samples'] += 1
 
-    def measured_fetch(row, streamed):
+    configured_turn_seconds = config.connect_timeout + config.read_timeout
+    retry_budget = max(TEXT_RETRY_TURN_SECONDS, configured_turn_seconds) if (
+        config.connect_timeout > 30 or config.read_timeout > 180) else TEXT_RETRY_TURN_SECONDS
+    turn_seconds = min(configured_turn_seconds, retry_budget if capture_ids else TEXT_FIRST_TURN_SECONDS)
+    transport = getattr(client, "transport", None)
+    streamed = (isinstance(transport, ResilientTransport)
+                and getattr(type(client).get, "__module__", "") == "archive_scout.cdx.client")
+
+    def measured_fetch(row):
         try:
             if streamed:
-                return fetch_retain_streamed(row, config, client)
+                token = replay_turn.set(ReplayTurn(turn_seconds))
+                try:
+                    return fetch_retain_streamed(row, config, client)
+                finally:
+                    replay_turn.reset(token)
             return fetch_parse_scan(row, config, jobs, client,
                 False if scanner_thread is not None else not acquire_only)
         finally:
@@ -782,6 +799,13 @@ def download_archive(
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-scout") as pool:
             futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
+
+            parked: deque[sqlite3.Row] = deque()
+            fresh_remaining = initial_queue_size
+            dispatch_wait_seconds = 0.0
+            dispatch_deferrals = 0
+            idle_wait_started = None
+            dispatch_suspended = False
 
             def batch_metrics() -> dict:
                 # Called only at the existing 30-second health interval and
@@ -804,6 +828,11 @@ def download_archive(
                     'scanner_active': scanner_thread is not None and scanner_thread.is_alive(),
                     'queue_preparation_seconds': queue_preparation_seconds,
                     'initial_queue_size': initial_queue_size,
+                    'active_replay_budget_seconds': turn_seconds if streamed else None,
+                    'shared_dispatch_wait_seconds': dispatch_wait_seconds + (
+                        now-idle_wait_started if idle_wait_started is not None else 0.0),
+                    'dispatch_deferrals_before_request': dispatch_deferrals,
+                    'parked_captures': len(parked),
                     'committed_samples': samples,
                     'avg_owner_commit_seconds': stage_stats['database_commit_seconds']/samples if samples else None,
                     'avg_payload_publication_seconds': (stage_stats['file_fsync_publish_seconds']
@@ -820,14 +849,19 @@ def download_archive(
             fresh_admitted = 0
 
             def submit_available() -> None:
-                nonlocal fresh_admitted, total
+                nonlocal fresh_admitted, fresh_remaining, total
                 slots = max_inflight - len(futures)
+                if streamed and slots > 0:
+                    slots = transport.dispatch_slots(client.host_gate.dispatch_slots(slots))
                 if slots <= 0:
                     return
                 rows: list[sqlite3.Row] = []
                 for _ in range(slots):
                     if stop_event.is_set():
                         raise Stopped
+                    if parked:
+                        rows.append(parked.popleft())
+                        continue
                     retry_row = None
                     # Interleave one due retry after each bounded block of
                     # fresh work. Read only indexed SQLite eligibility; do
@@ -839,10 +873,14 @@ def download_archive(
                         rows.append(retry_row)
                         total += 1  # an additional physical attempt, not a new capture identity
                         continue
+                    if not fresh_remaining:
+                        break
                     try:
                         row = next(row_iter)
                     except StopIteration:
+                        fresh_remaining = 0
                         break
+                    fresh_remaining -= 1
                     fresh_admitted += 1
                     rows.append(row)
                 if not rows:
@@ -856,20 +894,41 @@ def download_archive(
                         ((now, int(row["id"])) for row in rows),
                     )
                 for row in rows:
-                    # Real network acquisition streams directly to disk.
-                    # Nonstandard fixture transports retain the established
-                    # memory-based API for compatible plugins/tests.
-                    streamed = (isinstance(getattr(client, "transport", None), ResilientTransport)
-                        and getattr(type(client).get, "__module__", "") == "archive_scout.cdx.client")
-                    futures[pool.submit(measured_fetch, row, streamed)] = row
-    
-            submit_available()
-            while futures:
+                    futures[pool.submit(measured_fetch, row)] = row
+
+            while futures or fresh_remaining or parked:
                 if stop_event.is_set():
                     for pending in futures:
                         pending.cancel()
                     raise Stopped
-                done, _ = concurrent.futures.wait(futures, timeout=5.0, return_when=concurrent.futures.FIRST_COMPLETED)
+                if (streamed and not dispatch_suspended and config.rate_limit_max_wait > 0
+                        and (fresh_remaining or parked)
+                        and client.host_gate.remaining() > config.rate_limit_max_wait):
+                    dispatch_suspended = True
+                    if callback:
+                        callback(ProgressEvent("download_incomplete",
+                            "Server cooldown exceeds the configured wait limit. Unstarted captures remain queued for resume.",
+                            detail={"retain_notice": True}))
+                if not dispatch_suspended:
+                    refill_started = time.monotonic()
+                    submit_available()
+                    observe_owner('refill', time.monotonic() - refill_started)
+                if not futures and dispatch_suspended:
+                    break
+                if not futures and (fresh_remaining or parked):
+                    if idle_wait_started is None:
+                        idle_wait_started = time.monotonic()
+                    if stop_event.wait(0.25):
+                        raise Stopped
+                    done = set()
+                else:
+                    if idle_wait_started is not None:
+                        dispatch_wait_seconds += time.monotonic()-idle_wait_started
+                        idle_wait_started = None
+                    if not futures:
+                        break
+                    done, _ = concurrent.futures.wait(futures, timeout=5.0,
+                                                      return_when=concurrent.futures.FIRST_COMPLETED)
                 if not done:
                     now = time.monotonic()
                     diagnostics.summary(saved_this_pass)
@@ -936,6 +995,14 @@ def download_archive(
                                 and not analysis.get("excluded") and not analysis.get("required_missing")
                                 for analysis in result["analyses"].values()
                             ))
+                    except ReplayDispatchDeferred:
+                        with database_write_lock, database:
+                            database.execute("""UPDATE captures SET state=?,download_attempts=?,updated_at=?
+                                WHERE id=? AND state='downloading'""",
+                                (row['state'], row['download_attempts'], utc_now(), row['id']))
+                        parked.append(row)
+                        dispatch_deferrals += 1
+                        continue
                     except NonTextResponse as exc:
                         outcome_state = 'skipped'
                         with database_write_lock, database:
@@ -966,20 +1033,22 @@ def download_archive(
                                     media_query_signature(config),source_type="text_replay_deferred",
                                 )
                     except RateLimitDeferred as exc:
+                        category = 'rate_limit' if exc.status == 429 else 'http_server_error'
                         # A finite per-request rate-limit wait budget is not
                         # an explicit user Stop. Preserve the URL as due later;
                         # let independent local scans and permitted work continue.
                         failures += 1
-                        diagnostics.failure(row, 'rate_limit', exc)
+                        diagnostics.failure(row, category, exc)
                         with database_write_lock, database:
                             database.execute("UPDATE captures SET state='error',updated_at=? WHERE id=?",
                                 (utc_now(), row["id"]))
-                            record_error(database, "download", "rate_limit", repr(exc),
+                            record_error(database, "download", category, repr(exc),
                                 capture_id=int(row["id"]), http_status=getattr(exc,"status",429), retryable=True)
-                            record_failure(database, int(row["id"]), "rate_limit",
+                            record_failure(database, int(row["id"]), category,
                                 getattr(exc,"status",429), True,
                                 max(config.network.retry_base_seconds, float(getattr(exc,"waited",0) or 0)),
-                                config.network.retry_max_seconds)
+                                config.network.retry_max_seconds,
+                                not_before=time.time()+float(getattr(exc, "waited", 0) or 0))
                         if callback:
                             callback(ProgressEvent("rate_limit",
                                 "Wayback request turn reached its rate-limit wait budget; "
@@ -1148,9 +1217,6 @@ def download_archive(
                             )
                         )
                     observe_owner('callback', time.monotonic() - callback_started)
-                    refill_started = time.monotonic()
-                    submit_available()
-                    observe_owner('refill', time.monotonic() - refill_started)
     finally:
         # Drain local scans on clean completion, but honor Stop promptly.
         scanner_finish.set()

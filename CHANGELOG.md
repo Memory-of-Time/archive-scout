@@ -1,6 +1,9 @@
 # Changelog
 
 ## v1.2.9 — acquisition recovery
+- Give active text replays one shared deadline across connect, headers, body, fallback and redirects. Preserve expired captures as retryable and give the later recovery sweep a longer budget.
+- Suspend text dispatch during shared host and backend cooldowns while local scans continue. Restore unstarted captures without charging an attempt if a cooldown begins after queue admission. Persist server retry deadlines and include rejected HTTP responses in diagnostics.
+
 
 - Recheck backend availability before each physical request. Late results from older requests cannot overwrite a newer recovery decision, and a healthy backend can take work while another backend is recovering.
 - Bound urllib3 pool checkout, separate pool waits from connection failures, and keep redirect pacing and host permits scoped to each request.

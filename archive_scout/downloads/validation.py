@@ -3,9 +3,15 @@ from __future__ import annotations
 import re
 import urllib.error
 
+from ..network.replay_turn import ReplayTurnExpired, ReplayTurnInterrupted
+
 
 
 def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
+    if isinstance(exc, ReplayTurnExpired):
+        return "replay_deadline", None, True
+    if isinstance(exc, ReplayTurnInterrupted):
+        return "replay_interrupted", None, True
     message = str(exc).casefold()
     category_token = message.split(":",1)[0]
     status = getattr(exc, "status", None)

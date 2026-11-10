@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import errno
 import http.client
+import io
 import json
 import re
 import base64
@@ -28,6 +29,9 @@ import urllib3
 
 from ..events import Stopped
 from ..runtime import ensure_frozen_bundle_available
+from .replay_turn import (
+    ReplayDispatchDeferred, ReplayTurnExpired, ReplayTurnInterrupted, replay_timeout, replay_turn,
+)
 
 try:
     import truststore
@@ -675,6 +679,45 @@ def _pace_redirect_hop(stop_event: threading.Event) -> None:
         raise Stopped
 
 
+class _TimedNetworkStream:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def read(self, max_bytes, timeout=None):
+        return self.stream.read(max_bytes, timeout=replay_timeout(timeout))
+
+    def write(self, buffer, timeout=None):
+        self.stream.write(buffer, timeout=replay_timeout(timeout))
+
+    def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        return _TimedNetworkStream(self.stream.start_tls(
+            ssl_context, server_hostname, timeout=replay_timeout(timeout)))
+
+    def get_extra_info(self, info):
+        return self.stream.get_extra_info(info)
+
+    def close(self):
+        self.stream.close()
+
+
+class _TimedNetworkBackend:
+    def __init__(self, backend):
+        self.backend = backend
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        stream = self.backend.connect_tcp(host, port, timeout=replay_timeout(timeout),
+                                          local_address=local_address, socket_options=socket_options)
+        return _TimedNetworkStream(stream)
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        stream = self.backend.connect_unix_socket(path, timeout=replay_timeout(timeout),
+                                                  socket_options=socket_options)
+        return _TimedNetworkStream(stream)
+
+    def sleep(self, seconds):
+        self.backend.sleep(replay_timeout(seconds))
+
+
 class HttpxBackend:
     name = "httpx"
 
@@ -699,6 +742,15 @@ class HttpxBackend:
                 pool=max(5.0, self.connect_timeout),
             ),
         )
+
+        # HTTPX builds direct and proxy HTTPcore pools itself. Decorate their
+        # sync streams before use so pooled sockets use the current replay's
+        # deadline on each read, including split headers and chunk framing.
+        for transport in {self.client._transport, *self.client._mounts.values()}:
+            pool = getattr(transport, "_pool", None)
+            network = getattr(pool, "_network_backend", None)
+            if network is not None:
+                pool._network_backend = _TimedNetworkBackend(network)
 
     def close(self) -> None:
         self.client.close()
@@ -782,8 +834,12 @@ class HttpxBackend:
             request_headers["Accept-Encoding"] = "identity"
         if _redirect_depth > 10:
             raise RuntimeError(f"too many redirects: {url}")
-        with self.client.stream("GET", url, headers=request_headers,
-                                **({"follow_redirects": False} if redirect_validator or _managed_redirects() else {})) as response:
+        options = {"follow_redirects": False} if redirect_validator or _managed_redirects() else {}
+        if replay_turn.get() is not None:
+            options["timeout"] = httpx.Timeout(
+                connect=replay_timeout(self.connect_timeout), read=replay_timeout(self.read_timeout),
+                write=replay_timeout(self.connect_timeout), pool=replay_timeout(max(5.0, self.connect_timeout)))
+        with self.client.stream("GET", url, headers=request_headers, **options) as response:
             _backend_received_headers(int(response.status_code))
             if (redirect_validator or _managed_redirects()) and int(response.status_code) in {301,302,303,307,308}:
                 location = response.headers.get("location")
@@ -814,7 +870,7 @@ class HttpxBackend:
             if announced and announced.isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
             try:
-                raw_chunks = response.iter_raw(64 * 1024) if not retain_partial else response.iter_bytes(64 * 1024)
+                raw_chunks = response.iter_raw() if not retain_partial else response.iter_bytes(64 * 1024)
                 verified_chunks = (_decoded_verified_chunks(raw_chunks, fields, stop_event, expected_digest=expected_digest)
                                    if not retain_partial else raw_chunks)
                 total, content_hash, preview = _write_limited(
@@ -845,6 +901,53 @@ class HttpxBackend:
             )
 
 
+class _TimedSocketFile(io.RawIOBase):
+    def __init__(self, sock):
+        self.socket = sock
+        self.timeout = sock.gettimeout()
+        self.raw = sock.makefile("rb", buffering=0)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.socket.settimeout(replay_timeout(self.timeout))
+        return self.raw.readinto(buffer)
+
+    def close(self):
+        try:
+            self.raw.close()
+        finally:
+            super().close()
+
+
+class _TimedResponseSocket:
+    def __init__(self, sock):
+        self.socket = sock
+
+    def makefile(self, mode):
+        return io.BufferedReader(_TimedSocketFile(self.socket))
+
+
+class _TimedUrllib3Response(http.client.HTTPResponse):
+    def __init__(self, sock, *args, **kwargs):
+        if replay_turn.get() is not None:
+            sock = _TimedResponseSocket(sock)
+        super().__init__(sock, *args, **kwargs)
+
+
+def _timed_urllib3_pools(manager):
+    # Use an instance-local mapping. Default, HTTP-proxy and SOCKS
+    # managers keep their own connection classes and TLS behavior.
+    pools = {}
+    for scheme, pool in manager.pool_classes_by_scheme.items():
+        connection = type("Timed" + pool.ConnectionCls.__name__, (pool.ConnectionCls,),
+                          {"response_class": _TimedUrllib3Response})
+        pools[scheme] = type("Timed" + pool.__name__, (pool,), {"ConnectionCls": connection})
+    manager.pool_classes_by_scheme = pools
+    return manager
+
+
 class Urllib3Backend:
     name = "urllib3"
 
@@ -856,10 +959,10 @@ class Urllib3Backend:
         self.trust_env = bool(trust_env)
         self.pool_size = max(2, int(pool_size))
         self.pool_timeout = max(5.0, self.connect_timeout)
-        self.pool = urllib3.PoolManager(
+        self.pool = _timed_urllib3_pools(urllib3.PoolManager(
             num_pools=4, maxsize=self.pool_size, block=True,
             ssl_context=_ssl_context(), retries=False,
-        )
+        ))
         self.proxy_pools: dict[str, object] = {}
         self.proxy_lock = threading.Lock()
 
@@ -883,7 +986,7 @@ class Urllib3Backend:
                 else:
                     pool = urllib3.ProxyManager(proxy, num_pools=4,
                         maxsize=self.pool_size, block=True, retries=False)
-                self.proxy_pools[proxy] = pool
+                self.proxy_pools[proxy] = _timed_urllib3_pools(pool)
             return self.proxy_pools[proxy]
 
     def close(self) -> None:
@@ -982,6 +1085,17 @@ class Urllib3Backend:
 
 
 
+    def _download_chunks(self, response):
+        if replay_turn.get() is None:
+            yield from response.stream(amt=64 * 1024, decode_content=False)
+            return
+        while True:
+            replay_timeout()
+            chunk = response.read1(64 * 1024, decode_content=False)
+            if not chunk:
+                return
+            yield chunk
+
     def download(
         self,
         url: str,
@@ -1000,7 +1114,10 @@ class Urllib3Backend:
             for _ in range(11):
                 response = self._pool_for(current_url).request(
                     "GET", current_url, headers=headers, preload_content=False,
-                    redirect=False, retries=False, timeout=self.timeout, pool_timeout=self.pool_timeout,
+                    redirect=False, retries=False,
+                    timeout=(self.timeout if replay_turn.get() is None else urllib3.Timeout(
+                        connect=replay_timeout(self.connect_timeout), read=replay_timeout(self.read_timeout))),
+                    pool_timeout=replay_timeout(self.pool_timeout),
                 )
                 if int(response.status) not in {301, 302, 303, 307, 308}:
                     break
@@ -1035,7 +1152,7 @@ class Urllib3Backend:
             if announced and str(announced).isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
             total, content_hash, preview = _write_limited(
-                _decoded_verified_chunks(response.stream(amt=64 * 1024, decode_content=False),
+                _decoded_verified_chunks(self._download_chunks(response),
                                          fields, stop_event, expected_digest=expected_digest),
                 destination, max_bytes, stop_event,
                 response_metadata=response_diagnostic(response.status, fields, current_url),
@@ -1271,8 +1388,8 @@ class CurlBackend:
             raw_path = Path(temp_dir) / "raw-response.bin"
             command = [
                 self.executable, "--disable", "--location", "--http1.1",
-                "--silent", "--show-error", "--connect-timeout", str(int(self.connect_timeout)),
-                "--max-time", str(int(self.connect_timeout + self.read_timeout)),
+                "--silent", "--show-error", "--connect-timeout", str(max(.001, replay_timeout(self.connect_timeout))),
+                "--max-time", str(max(.001, replay_timeout(self.connect_timeout + self.read_timeout))),
                 "--max-filesize", str(int(max_bytes)), "--dump-header", str(header_path),
                 "--output", str(raw_path), "--write-out", "%{http_code}\n%{url_effective}",
             ]
@@ -1451,6 +1568,14 @@ class ResilientTransport:
                 "preferred_backend": self.last_success,
             }
 
+    def dispatch_slots(self, slots: int) -> int:
+        with self.condition:
+            now = time.monotonic()
+            if any(name not in self.cooldown_until for name in self.order):
+                return slots
+            return min(slots, sum(self.cooldown_until[name] <= now and name not in self.recovery_probes
+                                  for name in self.order))
+
     def _await_backend(self, name: str, stop_event: threading.Event,
                        alternatives: Iterable[str] = (), *, wait: bool = True,
                        permit_checker: Callable[[], bool] | None = None) -> _BackendTurn | None:
@@ -1516,9 +1641,14 @@ class ResilientTransport:
             names = [name for name in (pinned or self._ordered_names()) if name not in attempted]
             if not names:
                 return
-            turn = self._await_backend(names[0], stop_event, names[1:], wait=not attempted,
-                                       permit_checker=permit_checker)
+            replay = replay_turn.get()
+            turn = self._await_backend(names[0], stop_event, names[1:],
+                                       wait=not attempted and replay is None, permit_checker=permit_checker)
             if turn is None:
+                if not attempted and replay is not None:
+                    if replay.deadline is not None:
+                        raise ReplayTurnInterrupted("text replay interrupted by backend recovery; retry scheduled")
+                    raise ReplayDispatchDeferred("network backends are waiting for recovery")
                 return
             context = self._start_backend(turn, len(attempted), stop_event, permit_checker)
             if context is not None:
@@ -1540,6 +1670,13 @@ class ResilientTransport:
         with self.condition:
             if self.backend_generations.get(turn.name, 0) != turn.generation:
                 return None
+        replay = replay_turn.get()
+        if replay is not None:
+            try:
+                replay.start()
+            except ReplayTurnExpired:
+                self._backend_result(turn, None)
+                raise
         on_headers = (lambda: self._backend_reachable(turn)) if turn.probe else None
         return _backend_controls.set(_BackendControls(pacer, permit_checker, on_headers))
 
@@ -1646,11 +1783,13 @@ class ResilientTransport:
                 else:
                     response = backend.download(url, headers, destination, max_bytes, stop_event, **kwargs)
                 self._backend_reachable(turn)
+                if 200 <= response.status < 300:
+                    replay_timeout()
                 return response
             except RedirectPolicyError:
                 self._backend_result(turn, True)  # successful response, policy refused redirect
                 raise
-            except (PermitRevoked, Stopped):
+            except (PermitRevoked, ReplayTurnExpired, Stopped):
                 self._backend_result(turn, None)
                 raise
             except OSError as exc:
@@ -1675,6 +1814,12 @@ class ResilientTransport:
                 destination.unlink(missing_ok=True)
             last_error = failures[-1][1]
             pool_timeout = is_transport_pool_timeout(last_error)
+            if replay_turn.get() is not None and is_transport_timeout(last_error):
+                try:
+                    replay_timeout()
+                except ReplayTurnExpired as exc:
+                    self._backend_result(turn, None)
+                    raise exc from last_error
             self._backend_result(turn, None if partial_ready or pool_timeout
                                  else not is_transport_connection_failure(last_error))
             if partial_ready or pool_timeout or isinstance(last_error, IncompleteRepresentationError):

@@ -485,7 +485,15 @@ def recover_transient_text_errors(
     # Every selected failure receives a complete fair sweep. Project size and
     # saved eligibility delays must not exhaust a URL's attempts before it runs.
     budget = NoProgressBudget(config, count_only=True)
+    from .downloads.rate_limit import shared_host_gate
+    host_gate = (shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
+                 if config.rate_limit_max_wait > 0 else None)
     while True:
+        if host_gate is not None and host_gate.remaining() > config.rate_limit_max_wait:
+            emit(callback, ProgressEvent("download_incomplete",
+                "Server cooldown exceeds the configured wait limit. Text retry checkpoints were retained.",
+                detail={"retain_notice": True}))
+            return 1
         attempted = 0
         made_progress = False
         for ids in _retryable_text_batches(config, database, respect_selection=respect_selection, automatic=True):

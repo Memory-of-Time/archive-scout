@@ -12,6 +12,7 @@ _shared_rate_states: dict[str, tuple[threading.Condition, list[float]]] = {}
 _shared_host_gates: dict[str, "SharedHostGate"] = {}
 
 from ..events import Stopped
+from ..network.replay_turn import replay_timeout
 
 
 class FixedRateLimiter:
@@ -31,9 +32,10 @@ class FixedRateLimiter:
                 now = time.monotonic()
                 wait = max(0.0, self.next_request - now)
                 if wait <= 0:
+                    replay_timeout()
                     self.next_request = now + self.delay
                     break
-                self.condition.wait(timeout=min(max(wait, 0.05), 0.5))
+                self.condition.wait(timeout=replay_timeout(min(max(wait, 0.05), 0.5)))
         yield
 
     def wait(self, stop_event: threading.Event) -> None:
@@ -139,13 +141,22 @@ class SharedHostGate:
                     "remaining_pause": max(0.0, self.blocked_until-time.monotonic()),
                     "reason": self.reason}
 
-    def acquire_request(self, stop_event: threading.Event, *, deadline: float | None = None) -> HostPermit:
+    def dispatch_slots(self, slots: int) -> int:
+        with self.condition:
+            if self.blocked_until > time.monotonic() or self.probe_inflight:
+                return 0
+            return min(slots, 1) if self.probe_required else slots
+
+    def acquire_request(self, stop_event: threading.Event, *, deadline: float | None = None,
+                        wait: bool = True) -> HostPermit | None:
         while True:
             with self.condition:
                 if stop_event.is_set():
                     raise Stopped
                 now = time.monotonic()
                 remaining = self.blocked_until - now
+                if not wait and (remaining > 0 or self.probe_inflight):
+                    return None
                 if deadline is not None and ((remaining > 0 and self.blocked_until >= deadline)
                         or (now >= deadline and self.probe_inflight)):
                     from ..cdx.client import RateLimitDeferred
