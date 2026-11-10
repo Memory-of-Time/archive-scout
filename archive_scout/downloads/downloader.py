@@ -787,7 +787,15 @@ def download_archive(
                 # Called only at the existing 30-second health interval and
                 # final summary. No new per-capture I/O, queue or sampling task.
                 samples = stage_stats['samples']
+                now = time.monotonic()
+                transport_health = (client.transport.snapshot()
+                    if isinstance(getattr(client, "transport", None), ResilientTransport) else {})
+                while recent_commits and recent_commits[0] <= now - 30.0:
+                    recent_commits.popleft()
                 return {
+                    'recent_saves_per_second': len(recent_commits) / min(30.0, max(0.001, now-started)),
+                    'seconds_since_last_save': now-last_save,
+                    'transport': transport_health,
                     'configured_workers': config.workers,
                     'download_delay_seconds': config.download_delay,
                     'queued_running_tasks': len(futures),
@@ -879,6 +887,8 @@ def download_archive(
                             f"host pause {status['remaining_pause']:.1f}s; "
                             f"last successful save {now-last_save:.0f}s ago; "
                             f"backend waiters {transport_health.get('backend_waiters', '?')}; "
+                            f"backend probes {transport_health.get('probe_backends', ())}; "
+                            f"oldest backend probe {transport_health.get('oldest_probe_seconds', '?')}s; "
                             f"cooling backends {transport_health.get('cooling_backends', ())}; "
                             f"backend cooldown max {transport_health.get('cooldown_seconds', '?')}s. "
                             "Remaining worker occupancy may be network, filesystem, scanner, or DB work."

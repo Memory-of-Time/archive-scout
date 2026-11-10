@@ -189,7 +189,7 @@ class RecoveryTransport(unittest.TestCase):
             200, {}, url, dest, len(BODY), hashlib.sha256(BODY).hexdigest(), BODY, 'healthy', 0)
         try:
             # Simulate selection made before a peer discovered the failure.
-            with patch.object(transport, '_ordered_names', return_value=['httpx']):
+            with patch.object(transport, '_ordered_names', return_value=['httpx', 'healthy']):
                 started = time.monotonic()
                 with tempfile.TemporaryDirectory() as tmp:
                     result = transport.download(self.url, {}, Path(tmp)/'out', 10000, threading.Event())

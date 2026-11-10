@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.9 — acquisition recovery
+
+- Recheck backend availability before each physical request. Late results from older requests cannot overwrite a newer recovery decision, and a healthy backend can take work while another backend is recovering.
+- Bound urllib3 pool checkout, separate pool waits from connection failures, and keep redirect pacing and host permits scoped to each request.
+- Reopen recovered Python backends on successful response headers while continuing to validate every body before saving. Stall diagnostics report backend probes, waiters and recent validated saves.
+
 ## v1.2.8 — scan coverage and final interface changes
 
 - Replace the Media exclusion editor with site-level abuse reporting guidance and remove Download scope from Settings. New GUI runs scan eligible text across the selected sites and dates. Use **Index URLs only** when you only need the inventory.

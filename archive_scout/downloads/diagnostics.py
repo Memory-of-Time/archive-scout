@@ -247,6 +247,12 @@ class AcquisitionDiagnostics:
                 f"mean payload publication {self._timing(metrics['avg_payload_publication_seconds'])}; "
                 f"queue preparation {metrics['queue_preparation_seconds']:.3f}s. "
                 if metrics else '')
+            if 'recent_saves_per_second' in metrics:
+                transport = metrics.get('transport', {})
+                stages += (f"Recent saves {metrics['recent_saves_per_second']:.1f}/s (30s); "
+                           f"last save {metrics['seconds_since_last_save']:.0f}s ago; "
+                           f"backend waiters {transport.get('backend_waiters', '?')}; "
+                           f"backend probes {transport.get('probe_backends', ())}. ")
             owner = metrics.get('owner_stages', {})
             if owner:
                 stages += 'Owner stage maxima: ' + ', '.join(
