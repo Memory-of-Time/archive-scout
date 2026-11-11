@@ -4,6 +4,7 @@ import hashlib
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from archive_scout.cdx.client import HttpClient
@@ -255,30 +256,34 @@ class PerformanceEngineTests(unittest.TestCase):
             keyword_set_id = get_or_create_keyword_set(database, "parallel", ["archive needle"])
             run_id = start_scan_run(database, keyword_set_id, "parallel", 1, "rescan")
             progress = []
-            rescan_documents(
-                database,
-                run_id,
-                ["archive needle"],
-                threading.Event(),
-                progress.append,
-                workers=4,
-            )
-            self.assertEqual(
-                database.execute("SELECT COUNT(*) FROM document_matches WHERE scan_run_id=?", (run_id,)).fetchone()[0],
-                24,
-            )
-            self.assertTrue(progress)
-            self.assertEqual(progress[-1].detail["workers"], 4)
             database.commit()
-            before = database.total_changes
-            rescan_documents(
-                database,
-                run_id,
-                ["archive needle"],
-                threading.Event(),
-                workers=4,
-            )
-            self.assertEqual(database.total_changes - before, 0)
+            cases = [(4, None, 4), (3, 1024**3, 3), (1, 1024**3, 1), (4, 16*1024**2, 1)]
+            for index, (cpus, memory, expected_workers) in enumerate(cases):
+                with self.subTest(cpus=cpus, available_memory=memory), \
+                     patch('archive_scout.scanning.capacity.os.cpu_count', return_value=cpus), \
+                     patch('archive_scout.scanning.capacity.os.sched_getaffinity',
+                           return_value=set(range(cpus)), create=True), \
+                     patch('archive_scout.scanning.capacity.available_memory', return_value=memory):
+                    progress.clear()
+                    before = database.total_changes
+                    rescan_documents(
+                        database,
+                        run_id,
+                        ["archive needle"],
+                        threading.Event(),
+                        progress.append,
+                        workers=4,
+                    )
+                    self.assertEqual(
+                        database.execute("SELECT COUNT(*) FROM document_matches WHERE scan_run_id=?",
+                                         (run_id,)).fetchone()[0],
+                        24,
+                    )
+                    self.assertTrue(progress)
+                    self.assertEqual(progress[-1].detail["workers"], expected_workers)
+                    database.commit()
+                    if index:
+                        self.assertEqual(database.total_changes - before, 0)
             database.close()
 
 
