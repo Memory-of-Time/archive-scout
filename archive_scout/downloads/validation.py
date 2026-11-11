@@ -39,6 +39,8 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
             return "connect_timeout", status, True
         if isinstance(current, (CdxResponseTimeout, httpx.ReadTimeout, urllib3.exceptions.ReadTimeoutError)):
             return "read_timeout", status, True
+    if any(getattr(current, "response_started", False) for current in exception_chain(exc)):
+        return "response_transfer", status, True
     if is_transport_connection_failure(exc):
         return "connection", status, True
     from ..cdx.client import TransientRequestError, MalformedCDXResponse

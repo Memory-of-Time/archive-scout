@@ -184,7 +184,8 @@ class SharedHostGate:
     def permit_is_current(self, permit: HostPermit) -> bool:
         with self.condition:
             if permit.generation != self.generation:
-                return False
+                return (permit.probe and self.generation == permit.generation + 1
+                        and not self.probe_required and self.blocked_until <= time.monotonic())
             if self.blocked_until > time.monotonic():
                 return False
             if permit.probe:

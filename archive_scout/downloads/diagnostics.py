@@ -17,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from ..constants import VERSION
 from ..events import ProgressEvent
-from ..network.transports import exception_chain
+from ..network.transports import exception_chain, transport_failure_phase
 from ..utils import utc_now
 
 
@@ -30,7 +30,7 @@ def build_fingerprint():
                  'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'network/replay_turn.py',
                  'cdx/client.py',
                  'cdx/indexer.py', 'cdx/status.py',
-                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
+                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'scanning/capacity.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
         path = root / name
         if path.is_file():
             try:
@@ -105,6 +105,8 @@ class AcquisitionDiagnostics:
         self.recent_responses = deque(maxlen=2048)
         self.controls = deque(maxlen=8)
         self.failures = Counter()
+        self.transport_failures = Counter()
+        self.resource_sample = (time.monotonic(), time.process_time())
         self.samples = set()
         self.phase_saved_base = 0
         self.batch_saved = 0
@@ -149,6 +151,11 @@ class AcquisitionDiagnostics:
         self.failures[category] += 1
         if not self.enabled:
             return
+        exhausted = next((error for error in exception_chain(exc) if getattr(error, 'failures', None)), None)
+        if exhausted is not None:
+            for backend, error in exhausted.failures:
+                backend = backend if backend in {'httpx', 'urllib3', 'curl'} else 'other'
+                self.transport_failures[backend + ':' + transport_failure_phase(error)] += 1
         if self.callback and self.failures[category] == 1:
             self._emit(ProgressEvent('acquisition_health',
                 f'{self.kind.title()} acquisition failure [{category}] for capture {row["id"]}; '
@@ -199,7 +206,13 @@ class AcquisitionDiagnostics:
             def mean(key):
                 values = [float(item[key]) for item in recent if key in item]
                 return sum(values)/len(values) if values else None
+            now, cpu = time.monotonic(), time.process_time()
+            elapsed, used = now-self.resource_sample[0], cpu-self.resource_sample[1]
+            self.resource_sample = (now, cpu)
             return {'build_id': self.build, 'response_counts': dict(self.responses),
+                    'transport_failure_phases': dict(self.transport_failures),
+                    'resource_interval_seconds': elapsed,
+                    'process_cpu_cores_used': used/elapsed if elapsed > 0 else None,
                     'validation_rejected_response_counts': dict(self.rejected_responses),
                     'failure_categories': dict(self.failures),
                     'avg_gate_wait_seconds': self.timings['gate_wait_seconds']/self.timing_counts['gate_wait_seconds'] if self.timing_counts['gate_wait_seconds'] else None,
@@ -258,6 +271,12 @@ class AcquisitionDiagnostics:
                 stages += (f"Active replay budget {metrics['active_replay_budget_seconds']:.1f}s; "
                            f"shared dispatch wait {metrics['shared_dispatch_wait_seconds']:.1f}s; "
                            f"unattempted deferrals {metrics['dispatch_deferrals_before_request']:,}. ")
+            gate = metrics.get('host_gate', {})
+            if gate:
+                stages += (f"Host admission {metrics.get('dispatch_slots', '?')} slots; "
+                           f"pause {gate.get('remaining_pause', 0):.1f}s; "
+                           f"probe required {gate.get('probe_required')}; "
+                           f"reason {gate.get('reason') or 'none'}. ")
             owner = metrics.get('owner_stages', {})
             if owner:
                 stages += 'Owner stage maxima: ' + ', '.join(

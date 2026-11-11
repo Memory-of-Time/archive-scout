@@ -515,7 +515,7 @@ def recover_transient_text_errors(
             budget.attempted()
         remaining = next(_retryable_text_batches(config, database, batch_size=1,
                                                 respect_selection=respect_selection, automatic=True), [])
-        from .downloads.schedule import next_due
+        from .downloads.schedule import next_due, PERSISTENT_NETWORK_CATEGORIES
         earliest = next_due(database, config, respect_selection=respect_selection)
         if not remaining and earliest is None:
             return 0
@@ -529,6 +529,12 @@ def recover_transient_text_errors(
         # Waiting on a previously saved long cooldown is bounded too, without
         # consuming an attempt or overriding its persistent due time.
         budget.waiting()
+        if budget.exhausted and next_due(database, config, respect_selection=respect_selection,
+                categories=PERSISTENT_NETWORK_CATEGORIES) is not None:
+            budget.progress()
+            emit(callback, ProgressEvent("download_retry",
+                "Temporary network failures remain scheduled; persistent recovery continues automatically. "
+                "Capture-specific validation failures retain their checkpoints and separate retry delays."))
         if budget.exhausted:
             emit(callback, ProgressEvent("download_incomplete", incomplete_retry_message("Text recovery"),
                                          detail={"retain_notice": True}))

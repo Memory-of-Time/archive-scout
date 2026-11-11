@@ -820,6 +820,8 @@ def download_archive(
                     'recent_saves_per_second': len(recent_commits) / min(30.0, max(0.001, now-started)),
                     'seconds_since_last_save': now-last_save,
                     'transport': transport_health,
+                    'host_gate': client.host_gate.snapshot(),
+                    'dispatch_slots': transport.dispatch_slots(client.host_gate.dispatch_slots(max_inflight)) if streamed else max_inflight,
                     'configured_workers': config.workers,
                     'download_delay_seconds': config.download_delay,
                     'queued_running_tasks': len(futures),
@@ -944,6 +946,7 @@ def download_archive(
                             f"workers waiting at Wayback gate {status['waiting_workers']}; "
                             f"probe active {status['recovery_probe']}; "
                             f"host pause {status['remaining_pause']:.1f}s; "
+                            f"host recovery required {status['probe_required']}; reason {status['reason'] or 'none'}; "
                             f"last successful save {now-last_save:.0f}s ago; "
                             f"backend waiters {transport_health.get('backend_waiters', '?')}; "
                             f"backend probes {transport_health.get('probe_backends', ())}; "

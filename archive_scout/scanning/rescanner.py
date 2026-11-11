@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterator
 from collections import deque
@@ -202,10 +203,12 @@ def rescan_keyword_sets(
             callback(ProgressEvent("rescan", empty_message, 0, 0))
         return
 
-    worker_count = max(1, min(32, int(workers or min(8, os.cpu_count() or 4))))
+    from .capacity import scan_capacity
+    worker_count, byte_budget = scan_capacity(workers, RESCAN_BYTE_BUDGET)
     max_inflight = max(worker_count, worker_count * 3)
     rows = _document_rows(database, clauses, params)
     completed = 0
+    capacity_sample_at = time.monotonic()
     submitted_order: deque[int] = deque()
     finished_ids: set[int] = set()
     in_flight_bytes = 0
@@ -236,7 +239,7 @@ def rescan_keyword_sets(
                 except OSError:
                     disk_bytes = max(1, int(row.get("size_bytes") or 1))
                 estimate = max(1, disk_bytes) * 3 + 2 * len(str(row.get("body_text") or ""))
-                if futures and in_flight_bytes + estimate > RESCAN_BYTE_BUDGET:
+                if futures and in_flight_bytes + estimate > byte_budget:
                     deferred_row = row
                     return
                 future = pool.submit(_analyze_saved_document, row, jobs, extract_domains or bool(scope_config and scope_config.extract_domains))
@@ -246,6 +249,10 @@ def rescan_keyword_sets(
 
         submit_available()
         while futures:
+            if time.monotonic() - capacity_sample_at >= 30:
+                admitted_workers, byte_budget = scan_capacity(worker_count, RESCAN_BYTE_BUDGET)
+                max_inflight = admitted_workers * 3
+                capacity_sample_at = time.monotonic()
             if stop_event.is_set():
                 for pending in futures:
                     pending.cancel()

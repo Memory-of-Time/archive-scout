@@ -281,10 +281,17 @@ class HttpClient:
                 pass
         return True
 
+    def _received_headers(self, permit, status):
+        if status in {429, 503} or 300 <= status < 400:
+            return
+        self.host_gate.finish_request(permit, recovered=True)
+        if self.coordinated_connection_recovery:
+            self.host_gate.connection_success()
+
     def _finish_failed_transport_turn(self, exc, url, permit, *, splittable):
         """Persistent owners retry failed turns; do not multiply physical trials."""
         if any(isinstance(normalize_transport_error(error), IncompleteRepresentationError)
-               for _, error in exc.failures):
+               or getattr(error, "response_started", False) for _, error in exc.failures):
             # The server answered. A bad body is not a failed connectivity probe.
             for backend, error in exc.failures:
                 self._observe_rejected_response(error, url, backend)
@@ -333,6 +340,7 @@ class HttpClient:
                     options = {"redirect_validator": redirect_validator} if redirect_validator is not None else {}
                     if isinstance(self.transport, ResilientTransport):
                         options["permit_checker"] = lambda: self.host_gate.permit_is_current(permit)
+                        options["response_callback"] = lambda status: self._received_headers(permit, status)
                     response = self.transport.request(url, headers, max_bytes, self.stop_event, **options)
                 status = int(response.status)
 
@@ -513,6 +521,7 @@ class HttpClient:
                         response = self.transport.download(
                             url, headers, destination, max_bytes, self.stop_event,
                             retain_partial=retain_partial, expected_digest=expected_digest,
+                            response_callback=lambda status: self._received_headers(permit, status),
                             **({"redirect_validator": redirect_validator, "permit_checker":
                                 lambda: self.host_gate.permit_is_current(permit)}
                                if redirect_validator else {"permit_checker":

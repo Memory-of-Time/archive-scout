@@ -209,8 +209,8 @@ class PayloadTailTests(Fixture):
             self.media(f'http://example.org/{n}.jpg')
         self.db.execute("UPDATE media_captures SET state='error'")
         for row in self.db.execute('SELECT id FROM media_captures').fetchall():
-            record_error(self.db,'media_download','connection','offline',media_capture_id=row[0],retryable=True)
-            self.db.execute("INSERT INTO media_retry_schedule VALUES(?,0,1,'connection',NULL,'now')",(row[0],))
+            record_error(self.db,'media_download','incomplete_representation','malformed fixture',media_capture_id=row[0],retryable=True)
+            self.db.execute("INSERT INTO media_retry_schedule VALUES(?,0,1,'incomplete_representation',NULL,'now')",(row[0],))
         self.db.commit();calls=[]
         def failure(*args,**kwargs):calls.extend(kwargs['media_capture_ids'])
         with patch('archive_scout.media.downloader.download_media',side_effect=failure):

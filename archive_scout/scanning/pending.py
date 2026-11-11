@@ -235,12 +235,13 @@ def scan_pending_saved(
     if not has_pending:
         return 0
     count = None  # No count on the acquisition hot path; cursor is bounded.
-    worker_count = max(1, min(32, int(workers or min(8, os.cpu_count() or 4))))
+    from .capacity import scan_capacity
+    worker_count, estimated_budget = scan_capacity(workers, SCAN_BYTE_BUDGET)
     max_inflight = worker_count * 2
-    estimated_budget = SCAN_BYTE_BUDGET
     rows = iter(_pending_rows(database, config))
     next_row = next(rows, None)
     completed = 0
+    capacity_sample_at = time.monotonic()
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="archive-local-scan"
@@ -248,6 +249,10 @@ def scan_pending_saved(
         futures: dict[concurrent.futures.Future, tuple[dict, int]] = {}
         in_flight_bytes = 0
         while futures or next_row is not None:
+            if time.monotonic() - capacity_sample_at >= 30:
+                admitted_workers, estimated_budget = scan_capacity(worker_count, SCAN_BYTE_BUDGET)
+                max_inflight = admitted_workers * 2
+                capacity_sample_at = time.monotonic()
             if stop_event.is_set():
                 for future in futures:
                     future.cancel()

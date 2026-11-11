@@ -6,6 +6,12 @@ import time
 from ..utils import utc_now
 
 
+PERSISTENT_NETWORK_CATEGORIES = frozenset({
+    'connection', 'connect_timeout', 'read_timeout', 'timeout', 'response_transfer',
+    'connection_pool_timeout', 'replay_deadline', 'replay_interrupted', 'rate_limit', 'http_server_error',
+})
+
+
 def automatic_retry_allowed(capture_id='c.id'):
     return f"""NOT EXISTS (SELECT 1 FROM capture_routing decision
         WHERE decision.capture_id={capture_id} AND
@@ -171,7 +177,7 @@ def retry_selection(database: sqlite3.Connection, config, alias: str = "c") -> t
     return "".join(" AND " + item for item in clauses), params
 
 
-def next_due(database: sqlite3.Connection, config=None, *, respect_selection=False) -> float | None:
+def next_due(database: sqlite3.Connection, config=None, *, respect_selection=False, categories=()) -> float | None:
     if config is not None:
         from .downloader import _populate_download_scopes
         _populate_download_scopes(database, config)
@@ -183,6 +189,9 @@ def next_due(database: sqlite3.Connection, config=None, *, respect_selection=Fal
     else:
         scope = ""
     selection, params = retry_selection(database, config) if respect_selection and config else ("", [])
+    if categories:
+        selection += " AND s.last_category IN (" + ",".join("?" for _ in categories) + ")"
+        params.extend(sorted(categories))
     row = database.execute("""SELECT MIN(s.next_eligible_at) FROM text_retry_schedule s
         JOIN captures c ON c.id=s.capture_id WHERE c.state='error' AND EXISTS
         (SELECT 1 FROM errors e WHERE e.capture_id=c.id AND e.retryable=1

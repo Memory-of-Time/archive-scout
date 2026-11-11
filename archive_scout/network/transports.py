@@ -190,6 +190,8 @@ def is_transport_connection_failure(exc: BaseException) -> bool:
         urllib3.exceptions.ConnectTimeoutError,
         urllib3.exceptions.ProxyError,
     )
+    if getattr(exc, "response_started", False):
+        return False
     for current in exception_chain(exc):
         if isinstance(current, connection_types):
             return True
@@ -212,6 +214,31 @@ def is_transport_connection_failure(exc: BaseException) -> bool:
             )):
                 return True
     return False
+
+
+def transport_failure_phase(exc):
+    if isinstance(exc, IncompleteRepresentationError):
+        return 'representation'
+    if is_transport_pool_timeout(exc):
+        return 'pool'
+    if getattr(exc, 'response_started', False):
+        return 'response_timeout' if is_transport_timeout(exc) else 'response_transfer'
+    chain = list(exception_chain(exc))
+    if any(isinstance(error, (socket.gaierror, urllib3.exceptions.NameResolutionError))
+           or isinstance(error, CurlTransportError) and error.curl_code in {5, 6} for error in chain):
+        return 'dns'
+    if any(isinstance(error, (ssl.SSLError, httpx.ProxyError, urllib3.exceptions.ProxyError))
+           or isinstance(error, CurlTransportError) and error.curl_code in {35, 60, 97} for error in chain):
+        return 'tls_or_proxy'
+    if any(isinstance(error, ConnectionRefusedError)
+           or isinstance(error, OSError) and (error.errno in {errno.ECONNREFUSED, 10061}
+                or getattr(error, 'winerror', None) == 10061) for error in chain):
+        return 'connection_refused'
+    if is_transport_connection_failure(exc):
+        return 'connect_timeout' if is_transport_timeout(exc) else 'connection_setup'
+    if is_transport_timeout(exc):
+        return 'response_timeout'
+    return 'transport_other'
 
 
 def is_transport_read_timeout(exc: BaseException) -> bool:
@@ -648,11 +675,13 @@ def _copy_headers(items: Iterable[tuple[object, object]]) -> dict[str, str]:
     return headers
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _BackendControls:
     pacer: object
     permit_checker: Callable[[], bool] | None
     on_headers: Callable[[], None] | None
+    response_callback: Callable[[int], None] | None = None
+    response_status: int | None = None
 
 
 _backend_controls: ContextVar[_BackendControls | None] = ContextVar("backend_controls", default=None)
@@ -665,8 +694,25 @@ def _managed_redirects() -> bool:
 
 def _backend_received_headers(status: int) -> None:
     controls = _backend_controls.get()
-    if 200 <= status < 300 and controls is not None and controls.on_headers is not None:
+    if controls is None or not 200 <= status <= 599:
+        return
+    controls.response_status = status
+    if controls.on_headers is not None:
         controls.on_headers()
+        controls.on_headers = None
+    if controls.response_callback is not None:
+        controls.response_callback(status)
+
+
+def _response_error(exc):
+    normalized = normalize_transport_error(exc)
+    controls = _backend_controls.get()
+    if controls is not None and controls.response_status is not None:
+        normalized.response_started = True
+        if not hasattr(normalized, 'transfer_diagnostic'):
+            normalized.transfer_diagnostic = next((error.transfer_diagnostic for error in exception_chain(exc)
+                if hasattr(error, 'transfer_diagnostic')), {'response_status': controls.response_status})
+    return normalized
 
 
 def _pace_redirect_hop(stop_event: threading.Event) -> None:
@@ -678,6 +724,8 @@ def _pace_redirect_hop(stop_event: threading.Event) -> None:
             raise PermitRevoked("host permit expired before a redirected physical request")
     if stop_event.is_set():
         raise Stopped
+    if controls is not None:
+        controls.response_status = None
 
 
 class _TimedNetworkStream:
@@ -1208,7 +1256,7 @@ class CurlBackend:
 
     @staticmethod
     def _early_control_status(path: Path, *, redirects: bool = False,
-                              process_finished: bool = False) -> tuple[int, dict[str, str]] | None:
+                              process_finished: bool = False, any_status: bool = False) -> tuple[int, dict[str, str]] | None:
         """Read a bounded complete header block, never a potentially huge body.
 
         Curl writes `--dump-header` as soon as response headers arrive. This
@@ -1232,7 +1280,9 @@ class CurlBackend:
         last = blocks[-1].decode("iso-8859-1", "replace")
         parts = last.splitlines()[0].split()
         accepted = {"429", "503"} | ({"301", "302", "303", "307", "308"} if redirects else set())
-        if len(parts) < 2 or parts[1] not in accepted:
+        if len(parts) < 2 or (parts[1] not in accepted and not (any_status and parts[1].isdigit() and 200 <= int(parts[1]) <= 599)):
+            return None
+        if "connection established" in last.splitlines()[0].casefold():
             return None
         fields = {}
         lines = last.splitlines()
@@ -1333,7 +1383,13 @@ class CurlBackend:
                 creationflags=creationflags, env=self._curl_environment(),
             )
             early_control = None
+            headers_observed = False
             while proc.poll() is None:
+                if not headers_observed:
+                    received = self._early_control_status(header_path, any_status=True)
+                    if received is not None:
+                        _backend_received_headers(received[0])
+                        headers_observed = True
                 early_control = self._early_control_status(header_path, redirects=not follow_redirects)
                 if early_control is not None:
                     proc.kill()
@@ -1343,6 +1399,10 @@ class CurlBackend:
                     proc.wait(timeout=5)
                     raise Stopped
             stdout, stderr = proc.communicate()
+            if not headers_observed:
+                received = self._early_control_status(header_path, any_status=True, process_finished=True)
+                if received is not None:
+                    _backend_received_headers(received[0])
             if early_control is None:
                 # A short redirect can finish (or close its irrelevant body)
                 # between polls. Its headers still take priority over curl's
@@ -1412,7 +1472,13 @@ class CurlBackend:
                 creationflags=creationflags, env=self._curl_environment(),
             )
             early_control = None
+            headers_observed = False
             while proc.poll() is None:
+                if not headers_observed:
+                    received = self._early_control_status(header_path, any_status=True)
+                    if received is not None:
+                        _backend_received_headers(received[0])
+                        headers_observed = True
                 early_control = self._early_control_status(header_path,
                     redirects=bool(redirect_validator or _managed_redirects()))
                 if early_control is not None:
@@ -1424,6 +1490,10 @@ class CurlBackend:
                     destination.unlink(missing_ok=True)
                     raise Stopped
             stdout, stderr = proc.communicate()
+            if not headers_observed:
+                received = self._early_control_status(header_path, any_status=True, process_finished=True)
+                if received is not None:
+                    _backend_received_headers(received[0])
             if early_control is None:
                 early_control = self._early_control_status(header_path,
                     redirects=bool(redirect_validator or _managed_redirects()),
@@ -1643,7 +1713,7 @@ class ResilientTransport:
         if self._backend_result(turn, True) and self.callback:
             self.callback(f"Network backend: {turn.name}")
 
-    def _backend_turns(self, stop_event, permit_checker, *, pinned=None):
+    def _backend_turns(self, stop_event, permit_checker, *, pinned=None, response_callback=None):
         attempted = set()
         while len(attempted) < 2:
             names = [name for name in (pinned or self._ordered_names()) if name not in attempted]
@@ -1658,12 +1728,12 @@ class ResilientTransport:
                         raise ReplayTurnInterrupted("text replay interrupted by backend recovery; retry scheduled")
                     raise ReplayDispatchDeferred("network backends are waiting for recovery")
                 return
-            context = self._start_backend(turn, len(attempted), stop_event, permit_checker)
+            context = self._start_backend(turn, len(attempted), stop_event, permit_checker, response_callback)
             if context is not None:
                 attempted.add(turn.name)
                 yield turn, context
 
-    def _start_backend(self, turn, attempt_number, stop_event, permit_checker):
+    def _start_backend(self, turn, attempt_number, stop_event, permit_checker, response_callback=None):
         pacer = getattr(self, "physical_pacer", None) or getattr(self, "fallback_pacer", None)
         try:
             if pacer is not None and (getattr(self, "physical_pacer", None) is not None or attempt_number):
@@ -1686,7 +1756,7 @@ class ResilientTransport:
                 self._backend_result(turn, None)
                 raise
         on_headers = (lambda: self._backend_reachable(turn)) if turn.probe else None
-        return _backend_controls.set(_BackendControls(pacer, permit_checker, on_headers))
+        return _backend_controls.set(_BackendControls(pacer, permit_checker, on_headers, response_callback))
 
     def request(
         self,
@@ -1696,9 +1766,10 @@ class ResilientTransport:
         stop_event: threading.Event,
         redirect_validator: Callable[[str, str], None] | None = None,
         permit_checker: Callable[[], bool] | None = None,
+        response_callback: Callable[[int], None] | None = None,
     ) -> TransportResponse:
         failures: list[tuple[str, BaseException]] = []
-        for turn, context in self._backend_turns(stop_event, permit_checker):
+        for turn, context in self._backend_turns(stop_event, permit_checker, response_callback=response_callback):
             name = turn.name
             backend = self.backends[name]
             try:
@@ -1720,7 +1791,7 @@ class ResilientTransport:
                 if exc.errno in {28, 122} or getattr(exc, "winerror", None) in {39, 112}:
                     self._backend_result(turn, None)
                     raise
-                failures.append((name, normalize_transport_error(exc)))
+                failures.append((name, _response_error(exc)))
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
                 # must not be retried using another backend.
@@ -1729,16 +1800,16 @@ class ResilientTransport:
                     # Release an exclusive recovery probe before propagating.
                     self._backend_result(turn, None)
                     raise
-                failures.append((name, normalize_transport_error(exc)))
+                failures.append((name, _response_error(exc)))
             except Exception as exc:
-                failures.append((name, normalize_transport_error(exc)))
+                failures.append((name, _response_error(exc)))
             finally:
                 _backend_controls.reset(context)
             last_error = failures[-1][1]
             # A read/first-byte timeout does not establish a broken backend.
             pool_timeout = is_transport_pool_timeout(last_error)
             self._backend_result(turn, None if pool_timeout else not is_transport_connection_failure(last_error))
-            if pool_timeout or isinstance(last_error, IncompleteRepresentationError):
+            if pool_timeout or getattr(last_error, "response_started", False) or isinstance(last_error, IncompleteRepresentationError):
                 break
             if is_transport_read_timeout(last_error) or (
                 'deadline' in options and is_transport_timeout(last_error)
@@ -1770,11 +1841,12 @@ class ResilientTransport:
         expected_digest: str = "",
         redirect_validator: Callable[[str, str], None] | None = None,
         permit_checker: Callable[[], bool] | None = None,
+        response_callback: Callable[[int], None] | None = None,
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
         pinned = (["httpx"] if retain_partial and destination.exists()
                   and _partial_metadata_path(destination).is_file() and "httpx" in self.backends else None)
-        for turn, context in self._backend_turns(stop_event, permit_checker, pinned=pinned):
+        for turn, context in self._backend_turns(stop_event, permit_checker, pinned=pinned, response_callback=response_callback):
             name = turn.name
             backend = self.backends[name]
             try:
@@ -1804,16 +1876,16 @@ class ResilientTransport:
                 if exc.errno in {28, 122} or getattr(exc, "winerror", None) in {39, 112}:
                     self._backend_result(turn, None)
                     raise
-                failures.append((name, normalize_transport_error(exc)))
+                failures.append((name, _response_error(exc)))
             except RuntimeError as exc:
                 if str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     # Local response-policy refusal means the route answered.
                     # Release an exclusive recovery probe before propagating.
                     self._backend_result(turn, None)
                     raise
-                failures.append((name, normalize_transport_error(exc)))
+                failures.append((name, _response_error(exc)))
             except Exception as exc:
-                failures.append((name, normalize_transport_error(exc)))
+                failures.append((name, _response_error(exc)))
             finally:
                 _backend_controls.reset(context)
             partial_ready = bool(retain_partial and _partial_metadata_path(destination).is_file()
@@ -1830,7 +1902,7 @@ class ResilientTransport:
                     raise exc from last_error
             self._backend_result(turn, None if partial_ready or pool_timeout
                                  else not is_transport_connection_failure(last_error))
-            if partial_ready or pool_timeout or isinstance(last_error, IncompleteRepresentationError):
+            if partial_ready or pool_timeout or getattr(last_error, "response_started", False) or isinstance(last_error, IncompleteRepresentationError):
                 break
             if is_transport_read_timeout(last_error):
                 if self.callback:
