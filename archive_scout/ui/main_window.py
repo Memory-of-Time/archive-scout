@@ -349,6 +349,7 @@ class ArchiveScoutApp(tk.Tk):
         self.dashboard_refresh_mode_var = tk.StringVar(value="manual")
         self.dashboard_refresh_seconds_var = tk.StringVar(value="10")
         self.acquisition_update_seconds_var = tk.StringVar(value="0.5")
+        self.show_error_activity_var = tk.BooleanVar(value=True)
         self.dashboard_eta_enabled_var = tk.BooleanVar(value=False)
         self.dashboard_eta_var = tk.StringVar(value="Estimated time remaining: off")
         self.dashboard_last_refresh_var = tk.StringVar(value="Not refreshed yet")
@@ -1183,6 +1184,13 @@ class ArchiveScoutApp(tk.Tk):
         for row, (label, variable) in enumerate(perf_rows):
             ttk.Label(performance, text=label + ":", wraplength=360).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(performance, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Checkbutton(performance, text="Show error updates in Activity",
+                        variable=self.show_error_activity_var,
+                        command=self._error_activity_changed).grid(row=len(perf_rows), column=0,
+                            columnspan=2, sticky="w", pady=(8, 3))
+        ttk.Label(performance, text="Errors remain recorded in the database and reports when hidden here.",
+                  style="Muted.TLabel", wraplength=440).grid(row=len(perf_rows)+1,
+                      column=0, columnspan=2, sticky="w")
         connection = ttk.LabelFrame(tab, text="Connection and indexing", padding=10)
         connection.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
         connection.columnconfigure(1, weight=1)
@@ -2005,6 +2013,8 @@ class ArchiveScoutApp(tk.Tk):
             self.events.put(("error", traceback.format_exc()))
 
     def on_engine_event(self, event: ProgressEvent) -> None:
+        if not self.events.display_engine_event(event):
+            return
         # Routine download counters are presentation-only, coalesced in one slot.
         # Engine callbacks, local scanning, and CLI output are unchanged.
         if event.detail and event.detail.get("retain_notice"):
@@ -2015,6 +2025,10 @@ class ArchiveScoutApp(tk.Tk):
             self.events.put_notice(event)
         else:
             self.events.put_progress(event)
+
+    def _error_activity_changed(self) -> None:
+        self.events.show_error_updates = bool(self.show_error_activity_var.get())
+        self.save_app_state()
 
     def _acquisition_update_changed(self) -> None:
         selected = self.acquisition_update_seconds_var.get()
@@ -2035,6 +2049,8 @@ class ArchiveScoutApp(tk.Tk):
                 processed += 1
                 if kind in {"progress", "notice"}:
                     event = payload
+                    if not self.events.display_engine_event(event):
+                        continue
                     self.update_dashboard_from_progress(event)
                     self.status_var.set(event.message)
                     self.log(event.message)
@@ -3073,6 +3089,7 @@ class ArchiveScoutApp(tk.Tk):
                 "dashboard_refresh_seconds": self.dashboard_refresh_seconds_var.get(),
                 "dashboard_eta_enabled": self.dashboard_eta_enabled_var.get(),
                 "acquisition_update_seconds": self.acquisition_update_seconds_var.get(),
+                "show_error_activity": self.show_error_activity_var.get(),
             }
             path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         except Exception:
@@ -3100,6 +3117,8 @@ class ArchiveScoutApp(tk.Tk):
             selected = str(appearance.get("acquisition_update_seconds", "0.5"))
             if selected not in {"Every available update", "0.5", "1"}:
                 selected = "0.5"
+            self.show_error_activity_var.set(bool(appearance.get("show_error_activity", True)))
+            self.events.show_error_updates = self.show_error_activity_var.get()
             self.acquisition_update_seconds_var.set(selected)
             self.events.set_acquisition_interval(0.0 if selected == "Every available update" else float(selected))
             self.dashboard_eta_enabled_var.set(bool(appearance.get("dashboard_eta_enabled", False)))

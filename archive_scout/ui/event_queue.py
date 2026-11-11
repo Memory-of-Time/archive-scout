@@ -23,6 +23,20 @@ class CoalescingEventQueue(Generic[T]):
         self._last_acquisition = float('-inf')
         self._deferred_control: tuple[str, object] | None = None
         self._dropped_notices = 0
+        self.show_error_updates = True
+
+    def display_engine_event(self, event) -> bool:
+        if self.show_error_updates:
+            return True
+        if event.stage in {'site_issue', 'download_retry', 'media_retry', 'index_retry',
+                           'rate_limit', 'acquisition_stall', 'redirect_skipped', 'database_wait'}:
+            return False
+        if event.stage == 'network' and any(token in event.message.casefold()
+                for token in ('failed', 'timed out', 'requeueing', 'unavailable')):
+            return False
+        if event.stage == 'acquisition_health' and 'acquisition failure [' in event.message:
+            return False
+        return True
 
     def set_acquisition_interval(self, seconds: float) -> None:
         if seconds not in (0.0, 0.5, 1.0):

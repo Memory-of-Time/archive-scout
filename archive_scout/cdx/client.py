@@ -248,6 +248,8 @@ class HttpClient:
         )
         if isinstance(self.transport, ResilientTransport):
             self.transport.physical_pacer = limiter
+            if transport is None:
+                self.transport.BACKEND_RECOVERY_SECONDS = self.connection_retry_seconds
 
     def close(self) -> None:
         self.transport.close()

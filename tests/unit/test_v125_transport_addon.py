@@ -134,6 +134,7 @@ class RecoveryAdmission(unittest.TestCase):
     def test_real_transport_cools_failed_curl_and_keeps_healthy_alternate(self):
         transport=ResilientTransport(pool_size=1,connect_timeout=1,read_timeout=1,mode='httpx',trust_env=False)
         self.addCleanup(transport.close)
+        transport.CONNECTION_FAILURE_THRESHOLD = 1
         first=Mock();first.download.side_effect=CurlTransportError(35,'reset')
         second=Mock();second.download.side_effect=lambda url,headers,path,*args,**kwargs: TransportFileResponse(200,{},url,path,0,'',b'','httpx',0)
         transport.backends['curl']=first

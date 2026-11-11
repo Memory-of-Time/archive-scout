@@ -7,6 +7,7 @@ import hashlib
 import errno
 import os
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -633,6 +634,7 @@ def download_archive(
     excluded = progress_counts.get('skipped', 0)
     queue_preparation_seconds = time.monotonic()-queue_started
     initial_queue_size = total
+    database.commit()
     if not total:
         if callback:
             callback(ProgressEvent(
@@ -758,6 +760,10 @@ def download_archive(
                    "database_commit_seconds": 0.0,
                    "samples": 0}
     stage_samples = {"network_and_pacing_seconds": 0, "file_fsync_publish_seconds": 0}
+    admission_busy = {"retries": 0, "seconds": 0.0}
+    batch_phase = "acquiring"
+    cleanup_started = None
+    batch_failure = None
     owner_timings = {name: {'seconds': 0.0, 'maximum': 0.0, 'samples': 0}
                      for name in ('outcome', 'refill', 'callback', 'completed_wait')}
     finished_at = {}
@@ -835,6 +841,11 @@ def download_archive(
                         now-idle_wait_started if idle_wait_started is not None else 0.0),
                     'dispatch_deferrals_before_request': dispatch_deferrals,
                     'parked_captures': len(parked),
+                    'database_admission_busy': dict(admission_busy),
+                    'batch_phase': batch_phase,
+                    'cleanup_seconds': time.monotonic()-cleanup_started if cleanup_started is not None else 0.0,
+                    'batch_failure': {'type': type(batch_failure).__name__,
+                        'sqlite_errorcode': getattr(batch_failure, 'sqlite_errorcode', None)} if batch_failure else None,
                     'committed_samples': samples,
                     'avg_owner_commit_seconds': stage_stats['database_commit_seconds']/samples if samples else None,
                     'avg_payload_publication_seconds': (stage_stats['file_fsync_publish_seconds']
@@ -857,44 +868,80 @@ def download_archive(
                     slots = transport.dispatch_slots(client.host_gate.dispatch_slots(slots))
                 if slots <= 0:
                     return
-                rows: list[sqlite3.Row] = []
-                for _ in range(slots):
-                    if stop_event.is_set():
-                        raise Stopped
-                    if parked:
-                        rows.append(parked.popleft())
-                        continue
-                    retry_row = None
-                    # Interleave one due retry after each bounded block of
-                    # fresh work. Read only indexed SQLite eligibility; do
-                    # not rebuild the complete acquisition queue or pool.
-                    if config.network.persistent_retries and fresh_admitted >= 16 and not capture_ids:
-                        retry_row = select_due_retry(database, time.time())
-                        fresh_admitted = 0
-                    if retry_row is not None:
-                        rows.append(retry_row)
-                        total += 1  # an additional physical attempt, not a new capture identity
-                        continue
-                    if not fresh_remaining:
-                        break
-                    try:
-                        row = next(row_iter)
-                    except StopIteration:
-                        fresh_remaining = 0
-                        break
-                    fresh_remaining -= 1
-                    fresh_admitted += 1
-                    rows.append(row)
-                if not rows:
-                    return
-                now = utc_now()
-                with database_write_lock, database:
-                    database.executemany("DELETE FROM archive_scout_download_queue WHERE id=?",
-                                         ((int(row["id"]),) for row in rows))
-                    database.executemany(
-                        "UPDATE captures SET state='downloading',download_attempts=download_attempts+1,updated_at=? WHERE id=?",
-                        ((now, int(row["id"])) for row in rows),
-                    )
+                busy_timeout = int(database.execute("PRAGMA busy_timeout").fetchone()[0])
+                database.execute("PRAGMA busy_timeout=250")
+                admission_started = time.monotonic()
+                busy_attempts = 0
+                try:
+                    while True:
+                        rows: list[sqlite3.Row] = []
+                        try:
+                            if stop_event.is_set():
+                                raise Stopped
+                            with database_write_lock, database:
+                                database.execute("BEGIN IMMEDIATE")
+                                for _ in range(slots):
+                                    if stop_event.is_set():
+                                        raise Stopped
+                                    if parked:
+                                        rows.append(parked.popleft())
+                                        continue
+                                    retry_row = None
+                                    # Interleave one due retry after each bounded block of
+                                    # fresh work. Read only indexed SQLite eligibility; do
+                                    # not rebuild the complete acquisition queue or pool.
+                                    if config.network.persistent_retries and fresh_admitted >= 16 and not capture_ids:
+                                        retry_row = select_due_retry(database, time.time())
+                                        fresh_admitted = 0
+                                    if retry_row is not None:
+                                        if any(item["id"] == retry_row["id"] for item in rows):
+                                            continue
+                                        rows.append(retry_row)
+                                        total += 1  # an additional physical attempt, not a new capture identity
+                                        continue
+                                    if not fresh_remaining:
+                                        break
+                                    try:
+                                        row = next(row_iter)
+                                    except StopIteration:
+                                        fresh_remaining = 0
+                                        break
+                                    fresh_remaining -= 1
+                                    fresh_admitted += 1
+                                    rows.append(row)
+                                if rows:
+                                    ids = [int(row['id']) for row in rows]
+                                    fields = ','.join('?' for _ in ids)
+                                    current = {int(row['id']): row for row in database.execute(
+                                        "SELECT * FROM captures WHERE id IN ("+fields+") AND state IN ('pending','error')", ids)}
+                                    database.executemany("DELETE FROM archive_scout_download_queue WHERE id=?",
+                                                        ((cid,) for cid in ids))
+                                    if config.network.persistent_retries and not capture_ids:
+                                        database.executemany("DELETE FROM archive_scout_ready_retries WHERE capture_id=?",
+                                                            ((cid,) for cid in ids))
+                                    rows = [current[cid] for cid in ids if cid in current]
+                                    database.executemany(
+                                        "UPDATE captures SET state='downloading',download_attempts=download_attempts+1,updated_at=? WHERE id=?",
+                                        ((utc_now(), int(row['id'])) for row in rows))
+                            break
+                        except sqlite3.OperationalError as exc:
+                            from ..scanning.pending import _sqlite_write_busy
+                            if not _sqlite_write_busy(exc):
+                                raise
+                            database.rollback()
+                            parked.extendleft(reversed(rows))
+                            busy_attempts += 1
+                            admission_busy['retries'] += 1
+                            if callback and (busy_attempts == 1 or busy_attempts % 20 == 0):
+                                callback(ProgressEvent('database_wait',
+                                    'SQLite writer busy; unstarted captures retained while queue admission retries.',
+                                    detail={'sqlite_errorcode': getattr(exc, 'sqlite_errorcode', None)}))
+                            if stop_event.wait(min(.5, .05 * busy_attempts)):
+                                raise Stopped
+                finally:
+                    if busy_attempts:
+                        admission_busy['seconds'] += time.monotonic() - admission_started
+                    database.execute(f"PRAGMA busy_timeout={busy_timeout}")
                 for row in rows:
                     futures[pool.submit(measured_fetch, row)] = row
 
@@ -1221,6 +1268,9 @@ def download_archive(
                         )
                     observe_owner('callback', time.monotonic() - callback_started)
     finally:
+        batch_failure = sys.exc_info()[1]
+        batch_phase = "stopped" if isinstance(batch_failure, Stopped) else "failed" if batch_failure else "batch_finished"
+        cleanup_started = time.monotonic()
         # Drain local scans on clean completion, but honor Stop promptly.
         scanner_finish.set()
         scanner_wakeup.set()

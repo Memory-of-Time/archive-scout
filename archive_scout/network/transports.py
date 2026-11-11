@@ -1574,6 +1574,7 @@ class ResilientTransport:
     """
 
     BACKEND_RECOVERY_SECONDS = 30.0
+    CONNECTION_FAILURE_THRESHOLD = 3
 
     def __init__(
         self,
@@ -1595,6 +1596,7 @@ class ResilientTransport:
         self.recovery_probes: set[str] = set()
         self.probe_started: dict[str, float] = {}
         self.backend_generations: dict[str, int] = {}
+        self.connection_failure_streaks: dict[str, int] = {}
         self.backend_waiters = 0
         self.cooldown_until: dict[str, float] = {}
         self.fallback_pacer = None
@@ -1644,6 +1646,8 @@ class ResilientTransport:
                 "probe_backends": tuple(self.probe_started),
                 "oldest_probe_seconds": round(now - min(self.probe_started.values(), default=now), 1),
                 "preferred_backend": self.last_success,
+                "recovery_interval_seconds": self.BACKEND_RECOVERY_SECONDS,
+                "connection_failure_streaks": dict(getattr(self, "connection_failure_streaks", {})),
             }
 
     def dispatch_slots(self, slots: int) -> int:
@@ -1691,23 +1695,35 @@ class ResilientTransport:
     def _backend_result(self, turn: _BackendTurn, succeeded: bool | None) -> bool:
         name = turn.name
         with self.condition:
-            if self.backend_generations.get(name, 0) != turn.generation:
+            if not hasattr(self, 'connection_failure_streaks'):
+                self.connection_failure_streaks = {}
+            current = self.backend_generations.get(name, 0)
+            if succeeded is True:
+                changed = self.last_success != name
+                recovering = name in self.cooldown_until or name in self.recovery_probes
+                self.last_success = name
+                self.connection_failure_streaks.pop(name, None)
+                self.cooldown_until.pop(name, None)
+                self.recovery_probes.discard(name)
+                self.probe_started.pop(name, None)
+                if recovering:
+                    self.backend_generations[name] = current + 1
+                self.condition.notify_all()
+                return changed
+            if current != turn.generation:
                 return False
             if turn.probe:
                 self.recovery_probes.discard(name)
                 self.probe_started.pop(name, None)
-            changed = succeeded is True and self.last_success != name
-            if succeeded is True:
-                self.last_success = name
-                if turn.probe:
-                    self.cooldown_until.pop(name, None)
-            elif succeeded is False:
-                self.cooldown_until[name] = time.monotonic() + self.BACKEND_RECOVERY_SECONDS
-            if succeeded is False or (turn.probe and succeeded is not None):
-                self.backend_generations[name] = turn.generation + 1
+            if succeeded is False:
+                streak = self.connection_failure_streaks.get(name, 0) + 1
+                self.connection_failure_streaks[name] = min(streak, self.CONNECTION_FAILURE_THRESHOLD)
+                if turn.probe or streak >= self.CONNECTION_FAILURE_THRESHOLD:
+                    self.cooldown_until[name] = time.monotonic() + self.BACKEND_RECOVERY_SECONDS
+                    self.backend_generations[name] = current + 1
             if turn.probe or succeeded is False:
                 self.condition.notify_all()
-            return changed
+            return False
 
     def _backend_reachable(self, turn: _BackendTurn) -> None:
         if self._backend_result(turn, True) and self.callback:
@@ -1755,7 +1771,7 @@ class ResilientTransport:
             except ReplayTurnExpired:
                 self._backend_result(turn, None)
                 raise
-        on_headers = (lambda: self._backend_reachable(turn)) if turn.probe else None
+        on_headers = lambda: self._backend_reachable(turn)
         return _backend_controls.set(_BackendControls(pacer, permit_checker, on_headers, response_callback))
 
     def request(
@@ -1808,7 +1824,8 @@ class ResilientTransport:
             last_error = failures[-1][1]
             # A read/first-byte timeout does not establish a broken backend.
             pool_timeout = is_transport_pool_timeout(last_error)
-            self._backend_result(turn, None if pool_timeout else not is_transport_connection_failure(last_error))
+            self._backend_result(turn, None if pool_timeout or (is_transport_read_timeout(last_error)
+                and not getattr(last_error, "response_started", False)) else not is_transport_connection_failure(last_error))
             if pool_timeout or getattr(last_error, "response_started", False) or isinstance(last_error, IncompleteRepresentationError):
                 break
             if is_transport_read_timeout(last_error) or (
@@ -1900,7 +1917,8 @@ class ResilientTransport:
                 except ReplayTurnExpired as exc:
                     self._backend_result(turn, None)
                     raise exc from last_error
-            self._backend_result(turn, None if partial_ready or pool_timeout
+            self._backend_result(turn, None if partial_ready or pool_timeout or (is_transport_read_timeout(last_error)
+                                     and not getattr(last_error, "response_started", False))
                                  else not is_transport_connection_failure(last_error))
             if partial_ready or pool_timeout or getattr(last_error, "response_started", False) or isinstance(last_error, IncompleteRepresentationError):
                 break

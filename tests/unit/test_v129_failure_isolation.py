@@ -164,13 +164,14 @@ class IsolationTests(unittest.TestCase):
         transport.backends['alternate'].download.assert_not_called()
         self.assertFalse((self.root / 'reset').exists())
 
-    def test_setup_refusal_still_cools_backend_and_keeps_phase(self):
+    def test_single_setup_refusal_keeps_phase_without_cooling_backend(self):
         transport = self.client().transport
         with patch.object(transport.backends['httpx'], 'download', side_effect=ConnectionRefusedError(10061, 'actively refused')):
             with self.assertRaises(TransportExhaustedError) as failed:
                 transport.download(self.url('/good'), {}, self.root / 'refused', 10000, threading.Event())
         self.assertEqual(classify_exception(failed.exception)[0], 'connection')
-        self.assertIn('httpx', transport.cooldown_until)
+        self.assertNotIn('httpx', transport.cooldown_until)
+        self.assertEqual(transport.connection_failure_streaks['httpx'], 1)
         self.assertEqual(transport_failure_phase(failed.exception.failures[0][1]), 'connection_refused')
 
     def test_proxy_connect_headers_are_not_origin_reachability(self):
@@ -203,7 +204,8 @@ class IsolationTests(unittest.TestCase):
             with self.assertRaises(TransportExhaustedError) as failed:
                 transport.download(self.url('/good'), {}, self.root / 'redirect', 10000, threading.Event())
         self.assertEqual(classify_exception(failed.exception)[0], 'connection')
-        self.assertIn('httpx', transport.cooldown_until)
+        self.assertNotIn('httpx', transport.cooldown_until)
+        self.assertEqual(transport.connection_failure_streaks['httpx'], 1)
 
     def test_measured_cpu_and_memory_cap_local_scan_admission(self):
         with patch('archive_scout.scanning.capacity.os.cpu_count', return_value=16), \
