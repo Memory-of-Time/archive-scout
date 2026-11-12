@@ -3366,7 +3366,7 @@ class ArchiveScoutApp(tk.Tk):
             return
         if not counts.get("_exact", True):
             self.dashboard_last_refresh_var.set(
-                "Refresh exceeded the query deadline; existing totals retained. Try again after heavy disk activity."
+                "Refresh could not finish; existing totals retained. Automatic refresh will retry. Older projects need the summary upgrade."
             )
             return
         def display_count(key: str) -> str:

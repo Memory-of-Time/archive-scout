@@ -724,6 +724,7 @@ def download_archive(
             try:
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA recursive_triggers=ON")
                 connection.execute("PRAGMA busy_timeout=1500")
                 connection.execute("PRAGMA temp_store=FILE")
                 while not stop_event.is_set():
@@ -946,6 +947,8 @@ def download_archive(
                     futures[pool.submit(measured_fetch, row)] = row
 
             while futures or fresh_remaining or parked:
+                if scanner_failures:
+                    raise RuntimeError("background scanner failed; acquisition paused with retained bodies recoverable") from scanner_failures[0]
                 if stop_event.is_set():
                     for pending in futures:
                         pending.cancel()

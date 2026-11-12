@@ -44,7 +44,7 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
         version = database_version(path)
-    if migrate and version in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
+    if migrate and version in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
         # Migration must not modify the only copy if a safety backup fails.
         from ..projects.backups import create_project_backup
         create_project_backup(root, reason=f"before_schema_{SCHEMA_VERSION}", keep=5)
@@ -54,6 +54,7 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         database.execute("PRAGMA journal_mode=WAL")
         database.execute("PRAGMA synchronous=NORMAL")
         database.execute("PRAGMA foreign_keys=ON")
+        database.execute("PRAGMA recursive_triggers=ON")
         database.execute("PRAGMA temp_store=FILE")
         database.execute("PRAGMA cache_size=-65536")
         database.execute("PRAGMA mmap_size=268435456")

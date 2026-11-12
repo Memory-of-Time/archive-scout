@@ -364,7 +364,7 @@ class SnapshotAccountingTests(Fixture):
             fired=False
             def execute(connection, sql, parameters=()):
                 cursor=super(SnapshotConnection,connection).execute(sql,parameters)
-                if '(SELECT COUNT(*) FROM captures)' in sql and not connection.fired:
+                if ('(SELECT COUNT(*) FROM captures)' in sql or 'FROM dashboard_capture_counts' in sql) and not connection.fired:
                     connection.fired=True
                     upsert_capture(writer,{'timestamp':'20080101000000','original':'http://example.org/b',
                         'mimetype':'text/html','statuscode':'200','length':'4'},tid,'fixture')

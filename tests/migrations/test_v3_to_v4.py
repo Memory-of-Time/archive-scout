@@ -23,7 +23,7 @@ class V3ToV4MigrationTests(unittest.TestCase):
             database.close()
 
             modern = open_database(root)
-            self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 11)
+            self.assertEqual(modern.execute("SELECT version FROM schema_info").fetchone()[0], 12)
             for table in ("analysis_runs", "legacy_assets", "provenance_edges", "first_appearances", "project_merges"):
                 self.assertIsNotNone(modern.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
             forum_columns = {row[1] for row in modern.execute("PRAGMA table_info(forum_threads)")}

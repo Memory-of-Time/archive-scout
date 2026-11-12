@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.0 — large-project sustainability
+- Maintain exact dashboard summaries in the same SQLite transactions as capture, routing, match, error, network-event and media changes; construct them once during backed-up schema-12 upgrade.
+- Replace repeated dashboard history scans with compact summary reads while preserving manual/automatic refresh settings and WAL snapshot consistency.
+- Add a pending-scan keyset index and a document-error lookup index to remove measured history-dependent lookup costs.
+- Stop new acquisition promptly after an unexpected local scanner-supervisor failure, preserving retained bodies and unstarted work.
+- Keep bounded, rotating five-minute acquisition-health history and include summary/schema code in build fingerprints.
+- Rebuild dashboard summaries during explicit project repair; retain source routing, integrity checks, retry budgets and GUI/CLI contracts.
+
 ## v1.2.9 — acquisition recovery
 - Give active text replays one shared deadline across connect, headers, body, fallback and redirects. Preserve expired captures as retryable and give the later recovery sweep a longer budget.
 - Suspend text dispatch during shared host and backend cooldowns while local scans continue. Restore unstarted captures without charging an attempt if a cooldown begins after queue admission. Persist server retry deadlines and include rejected HTTP responses in diagnostics.

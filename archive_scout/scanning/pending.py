@@ -160,6 +160,7 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
     if not targets:
         return
     cursor_id = 0
+    cursor_time = ''
     target_slots = ",".join("?" for _ in targets)
     while True:
         batch = database.execute(
@@ -167,7 +168,7 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
                  COALESCE(v.content_hash,d.content_hash) AS expected_hash,
                  COALESCE(v.bytes_saved,d.size_bytes) AS expected_size,
                  v.response_content_type AS response_content_type,v.final_url AS final_url
-               FROM captures c
+               FROM captures c INDEXED BY captures_pending_scan_idx
                LEFT JOIN documents d ON d.capture_id=c.id
                LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                WHERE c.state='downloaded_unscanned'
@@ -175,14 +176,15 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
                    WHERE t.pattern IN (""" + target_slots + """) AND
                    (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                        WHERE m.capture_id=c.id AND m.target_id=t.id)))
-               AND c.id>? ORDER BY c.id LIMIT 500""",
-            (signature, config.from_date, config.to_date, *targets, cursor_id),
+               AND (c.timestamp,c.id)>(?,?) ORDER BY c.timestamp,c.id LIMIT 500""",
+            (signature, config.from_date, config.to_date, *targets, cursor_time, cursor_id),
         ).fetchall()
         if not batch:
             return
         for row in batch:
             entry = dict(row)
             cursor_id = entry["id"]
+            cursor_time = entry["timestamp"]
             if not entry.get("path"):
                 from ..downloads.downloader import capture_path
                 entry["path"] = str(capture_path(config.output_dir, entry["id"], entry["timestamp"], entry["original_url"]))

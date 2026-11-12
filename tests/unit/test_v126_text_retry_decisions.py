@@ -117,7 +117,7 @@ class LatestDecisionTests(Fixture):
     def test_schema_and_existing_attempts_remain_intact(self):
         cid=self.seed();self.db.execute('UPDATE captures SET download_attempts=123');self.db.commit()
         self.hold(cid)
-        self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],11)
+        self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],12)
         self.assertEqual(self.db.execute('SELECT download_attempts FROM captures').fetchone()[0],123)
 
 

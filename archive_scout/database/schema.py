@@ -909,7 +909,7 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v7_to_v8(database)
         elif version == 7:
             migrate_v7_to_v8(database)
-        elif version in (8, 9, 10):
+        elif version in (8, 9, 10, 11):
             database.executescript(BASE_SCHEMA_SQL)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
@@ -944,3 +944,10 @@ def initialize_schema(database: sqlite3.Connection) -> None:
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('fts5','1')")
     except Exception:
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('fts5','0')")
+    database.executescript("""
+        CREATE INDEX IF NOT EXISTS captures_pending_scan_idx ON captures(query_signature,timestamp,id)
+            WHERE state='downloaded_unscanned';
+        CREATE INDEX IF NOT EXISTS errors_document_lookup_idx ON errors(document_id,operation,resolved);
+    """)
+    from .dashboard import initialize_dashboard
+    initialize_dashboard(database)

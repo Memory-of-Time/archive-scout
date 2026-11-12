@@ -79,7 +79,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             old_root = Path(temp)/"old"; new_root=Path(temp)/"relocated"
             signature, _ = self.make_old_project(old_root)
             original = snapshot(old_root)
-            self.assertEqual(original["schema_version"], 11)
+            self.assertEqual(original["schema_version"], 12)
             self.assertEqual(original["counts"]["captures"], 2100)
             self.assertEqual(original["counts"]["documents"], 1)
             shutil.move(str(old_root), str(new_root))
@@ -90,7 +90,7 @@ class V120V121ResumeCompatibility(unittest.TestCase):
             self.assertEqual(cdx_query_signature(loaded), signature)
             db = open_database(new_root)
             try:
-                self.assertEqual(db.execute("SELECT version FROM schema_info").fetchone()[0], 11)
+                self.assertEqual(db.execute("SELECT version FROM schema_info").fetchone()[0], 12)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM captures").fetchone()[0], 2100)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)

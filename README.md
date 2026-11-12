@@ -1,4 +1,4 @@
-# Archive Scout v1.2.9
+# Archive Scout v1.3.0
 
 **Archive Scout** is an independent, cross-platform desktop and command-line tool for researching and preserving public Wayback Machine captures. It indexes archived URLs, acquires and validates saved bodies, scans selected keyword sets, supports media discovery, and produces reports.
 
@@ -44,9 +44,15 @@ An eight-requests-per-second admission target is **not** a guarantee of eight sa
 
 Automatic Research Intelligence indexing is optional and off by default, including in the example project. Its checkbox is in **Research intelligence**; **Build / refresh index** remains available for a manual build. Existing projects retain an explicitly saved choice. See the [pipeline audit](docs/V127_PIPELINE_AUDIT.md) for embedded-media improvements, CDX failure handling, measurements and remaining limits.
 
+## v1.3.0 large-project reliability
+
+Dashboard refresh reads compact transaction-maintained summaries instead of repeatedly counting the complete inventory. Pending local scans use a keyset index rather than sorting project history on every batch. Unexpected scanner-supervisor failures stop further acquisition with completed files retained. Optional acquisition diagnostics now keep a bounded five-minute history alongside the latest health snapshot. Network pacing and saved-body validation contracts are unchanged.
+
+See [v1.3.0 validation and limits](docs/V130_SUSTAINABILITY.md). Local fixture measurements do not establish overnight live Wayback performance.
+
 ## Projects and compatibility
 
-Archive Scout v1.2.9 uses **SQLite schema 11**. When a supported schema-10 project is opened, Scout first creates a required pre-upgrade backup and then adds independent domain coverage, current retry decisions and local derivation revisions without replacing retained captures, local bodies, scan history, or checkpoints. If a safety backup fails, the upgrade is refused. Keep your original project folder and `project.json`, back up that folder before upgrading, and **do not reopen a migrated schema-11 project with v1.2.5**. Never edit `schema_info` to force a downgrade.
+Archive Scout v1.3.0 uses **SQLite schema 12**. Opening a supported older project first creates a required pre-upgrade database backup. The upgrade adds transaction-maintained dashboard summaries and scan/error lookup indexes. Existing inventory, saved bodies, matches, reviews, retry history and checkpoints remain in place; no reindex is required. Summary construction is a one-time database pass and may take time on a large project. If a safety backup fails, the upgrade is refused. Keep an independent project backup and **do not reopen a schema-12 project with an older Scout version**. Never edit `schema_info` to force a downgrade.
 
 Before replacing an installation, stop any active run and back up its project folder. Reopen the same `project.json`; there is no required project reindex. Old `Scout` CLI commands remain supported, and existing GUI preferences stored under the legacy `Scout` settings directory are recognized. See [Project migration](docs/MIGRATION.md), [Project recovery](docs/PROJECT_RECOVERY.md) and the [operations and report snapshot guide](docs/OPERATIONS.md).
 
@@ -67,4 +73,4 @@ MIT-licensed. Not affiliated with the Internet Archive.
 
 Current-selection Rescan and media discovery, full-read evidence checks, earliest-media admission, current retry decisions, corrected scoring and hostname search, generation-safe analysis, verified merge/import identities, bounded maintenance state, and independent optional full-hostname domain extraction. See `docs/V126_AUDIT_IMPLEMENTATION.md` for changes, costs and remaining limits.
 
-Projects migrate additively to schema 11 after a required backup. Keep an independent copy of project data and do not reopen the upgraded project with v1.2.5.
+Projects migrate additively to schema 12 after a required backup. Keep an independent copy of project data and use v1.3.0 for the upgraded project.

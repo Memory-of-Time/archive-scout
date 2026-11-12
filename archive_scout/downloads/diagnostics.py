@@ -28,7 +28,7 @@ def build_fingerprint():
     found = False
     for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
                  'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'network/replay_turn.py',
-                 'cdx/client.py',
+                 'cdx/client.py', 'database/dashboard.py', 'database/schema.py', 'ui/dashboard.py',
                  'cdx/indexer.py', 'cdx/status.py',
                  'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'scanning/capacity.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
         path = root / name
@@ -92,6 +92,8 @@ def _process_memory():
 class AcquisitionDiagnostics:
     MAX_SAMPLES = 16
     MAX_SAMPLE_BYTES = 20 * 1024
+    HISTORY_MAX_BYTES = 4 * 1024 * 1024
+    HISTORY_INTERVAL_SECONDS = 300
 
     def __init__(self, root, callback, *, enabled=True, kind="text"):
         self.root, self.callback, self.enabled = Path(root), callback, enabled
@@ -231,6 +233,26 @@ class AcquisitionDiagnostics:
     def _timing(value):
         return "unknown (no samples)" if value is None else f"{value:.3f}s"
 
+    def _append_history(self, detail):
+        now = time.monotonic()
+        previous = getattr(self, '_last_history', None)
+        if previous is not None and now - previous < self.HISTORY_INTERVAL_SECONDS:
+            return
+        record = (json.dumps({**detail, 'observed_at': utc_now()}, sort_keys=True)+'\n').encode('utf-8')
+        if len(record) > self.HISTORY_MAX_BYTES:
+            return
+        path = self.summary_path/'history.jsonl'
+        if path.exists() and path.stat().st_size + len(record) > self.HISTORY_MAX_BYTES:
+            oldest = path.with_name('history.jsonl.2')
+            oldest.unlink(missing_ok=True)
+            recent = path.with_name('history.jsonl.1')
+            if recent.exists():
+                recent.replace(oldest)
+            path.replace(recent)
+        with path.open('ab') as handle:
+            handle.write(record)
+        self._last_history = now
+
     def summary(self, saved, *, force=False):
         self.batch_saved = saved
         total_saved = self.phase_saved_base + saved
@@ -251,6 +273,7 @@ class AcquisitionDiagnostics:
             temporary = path.with_suffix('.tmp')
             temporary.write_text(json.dumps(detail, sort_keys=True), encoding='utf-8')
             os.replace(temporary, path)
+            self._append_history(detail)
         except OSError:
             pass
         if self.callback:

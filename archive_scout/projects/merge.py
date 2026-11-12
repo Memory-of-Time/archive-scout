@@ -247,9 +247,12 @@ def merge_projects(
                     if reconstructed:
                         # A derived text reconstruction cannot be misrepresented
                         # as the original raw-byte SHA-256 capture.
-                        database.execute("""INSERT OR REPLACE INTO capture_routing
+                        database.execute("""INSERT INTO capture_routing
                             (capture_id,resource_class,evidence,confident,routing,updated_at)
-                            VALUES(?,'text','merge:derived_text_original_raw_unavailable',0,'downloaded_scanned',?)""",
+                            VALUES(?,'text','merge:derived_text_original_raw_unavailable',0,'downloaded_scanned',?)
+                            ON CONFLICT(capture_id) DO UPDATE SET resource_class=excluded.resource_class,
+                            evidence=excluded.evidence,confident=excluded.confident,
+                            routing=excluded.routing,updated_at=excluded.updated_at""",
                             (capture_map[old_capture],utc_now()))
                 document_map[int(row["id"])] = document_id
                 summary["documents"] += 1

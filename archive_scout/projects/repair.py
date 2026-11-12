@@ -128,6 +128,9 @@ def repair_project(
             path.unlink(missing_ok=True)
             removed_parts += 1
 
+    from ..database.dashboard import initialize_dashboard
+    initialize_dashboard(database, rebuild=True)
+    actions.append('Transactional dashboard summaries rebuilt')
     database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     database.execute("PRAGMA optimize")
     database.commit()

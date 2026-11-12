@@ -36,6 +36,10 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
         database.execute("PRAGMA query_only=ON")
         database.execute("PRAGMA busy_timeout=250")
         database.execute("BEGIN")
+        from ..database.dashboard import read_summary
+        summary = read_summary(database)
+        if summary is not None:
+            return _summary_counts(*summary, include_classification=include_classification)
         row = database.execute(
             """
             SELECT
@@ -96,6 +100,43 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
         return {**{key:None for key in EMPTY_DASHBOARD},"_exact":False}
     finally:
         database.close()
+
+
+def _summary_counts(groups, media_groups, scalars, *, include_classification=True):
+    result = dict(EMPTY_DASHBOARD)
+    result.update(scalars)
+    result['captures'] = sum(row[3] for row in groups)
+    result['documents'] = sum(row[3] for row in groups if row[0] in ('downloaded','downloaded_unscanned'))
+    if not include_classification:
+        return {key:result[key] for key in ('captures','documents','matches','errors')}
+    skip_routes = {'skipped_non_text','skipped_url_filter','deferred_to_media','unsupported_non_text'}
+    states = {'pending':'pending','downloading':'downloading','downloaded':'saved_scanned',
+              'downloaded_unscanned':'downloaded_unscanned','error':'failed_captures'}
+    for state, routing, kind, count in groups:
+        result[kind if kind in ('text','image','video','audio','media_descriptor','other_binary','unknown') else 'unknown'] += count
+        bucket = (routing if routing in skip_routes else 'skipped_other') if state=='skipped' else states.get(state,'other_states')
+        result[bucket] += count
+    result['deferred'] = result['deferred_to_media']
+    result['failed'] = result['failed_captures']
+    result['skipped'] = sum(result[key] for key in (*skip_routes,'skipped_other'))
+    result['accounted_captures'] = sum(result[key] for key in
+        ('pending','downloading','saved_scanned','downloaded_unscanned','failed_captures','skipped','other_states'))
+    media = {}
+    selected_images = selected_videos = 0
+    for state, kind, count in media_groups:
+        media[state] = media.get(state,0)+count
+        if state not in ('excluded','skipped_strategy','skipped'):
+            if kind=='image': selected_images += count
+            elif kind=='video': selected_videos += count
+    result.update(media_candidates=sum(media.values()),
+        media_selected=sum(value for state,value in media.items() if state not in ('excluded','skipped_strategy','skipped')),
+        media_pending=media.get('pending',0),media_downloading=media.get('downloading',0),
+        media_downloaded=media.get('downloaded',0),media_excluded=sum(media.get(state,0) for state in ('excluded','skipped_strategy','skipped')),
+        media_errors=media.get('error',0),media_deferred_from_text=result['deferred'],
+        media_selected_images=selected_images,media_selected_videos=selected_videos)
+    result['_exact'] = True
+    result['_summary'] = True
+    return result
 
 def format_capture_accounting(counts):
     def number(key):
