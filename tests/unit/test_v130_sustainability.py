@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,7 +106,8 @@ class DashboardSummaryTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],12)
         backups=list((self.root/'backups').glob('*.sqlite3'))
         self.assertTrue(backups)
-        with sqlite3.connect(backups[0]) as original:
+        # SQLite's transaction context manager does not close its file handle.
+        with closing(sqlite3.connect(backups[0])) as original:
             self.assertEqual(original.execute('SELECT version FROM schema_info').fetchone()[0],11)
             self.assertEqual(original.execute('SELECT COUNT(*) FROM captures').fetchone()[0],30)
 
