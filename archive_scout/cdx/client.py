@@ -263,6 +263,7 @@ class HttpClient:
                     'pause_seconds': pause_seconds, 'gate_wait_seconds': gate_wait,
                     'request_turn_seconds': turn_seconds,
                     'backend_elapsed_seconds': float(response.elapsed),
+                    'encoding_recovery': response.headers.get('x-archive-scout-encoding-recovery', ''),
                     'decoded_bytes': int(getattr(response, 'bytes_written',
                         len(getattr(response, 'data', b'')))),
                 })

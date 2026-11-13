@@ -1,6 +1,10 @@
 # Changelog
 
 ## v1.3.0 — large-project sustainability
+- Recover nonempty, CDX-digest-proven payloads when a contradictory gzip header and broken HTTP framing otherwise reject the exact selected body; preserve strict rejection of wrong digests, genuine gzip truncation, empty bodies, limits and cancellation.
+- Remove the hidden elapsed retry cutoff from text, direct-media and embedded-media indexing. The explicit target time budget remains opt-in; failed-attempt limits and durable incomplete checkpoints remain enforced.
+- Space repeated text representation failures while fresh work proceeds, and retain bounded recovery proof samples in acquisition health history.
+- Capture bounded owner-stall thread locations when diagnostics are enabled; no thread variables, page bodies, database access or network probes are collected by the watchdog.
 - Maintain exact dashboard summaries in the same SQLite transactions as capture, routing, match, error, network-event and media changes; construct them once during backed-up schema-12 upgrade.
 - Replace repeated dashboard history scans with compact summary reads while preserving manual/automatic refresh settings and WAL snapshot consistency.
 - Add a pending-scan keyset index and a document-error lookup index to remove measured history-dependent lookup costs.

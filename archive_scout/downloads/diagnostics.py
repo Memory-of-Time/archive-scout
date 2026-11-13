@@ -26,7 +26,7 @@ def build_fingerprint():
     root = Path(__file__).resolve().parents[1]
     digest = hashlib.sha256()
     found = False
-    for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/schedule.py',
+    for name in ('downloads/downloader.py', 'downloads/diagnostics.py', 'downloads/watchdog.py', 'downloads/schedule.py',
                  'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'network/replay_turn.py',
                  'cdx/client.py', 'database/dashboard.py', 'database/schema.py', 'ui/dashboard.py',
                  'cdx/indexer.py', 'cdx/status.py',
@@ -106,6 +106,8 @@ class AcquisitionDiagnostics:
         self.rejected_responses = Counter()
         self.recent_responses = deque(maxlen=2048)
         self.controls = deque(maxlen=8)
+        self.representation_recovery_count = 0
+        self.representation_recoveries = deque(maxlen=8)
         self.failures = Counter()
         self.transport_failures = Counter()
         self.resource_sample = (time.monotonic(), time.process_time())
@@ -115,9 +117,11 @@ class AcquisitionDiagnostics:
         self.batch_metrics = None
         self.last_summary = time.monotonic()
         self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
+        from .watchdog import OwnerWatchdog
+        self.watchdog = OwnerWatchdog(self.summary_path, enabled=enabled)
 
     def close(self):
-        pass  # memory-only operation observations
+        self.watchdog.close()
 
     def begin_batch(self, callback):
         self.phase_saved_base += self.batch_saved
@@ -141,6 +145,13 @@ class AcquisitionDiagnostics:
             self.recent_responses.append((time.monotonic(), dict(detail)))
             if detail.get('validation_rejected'):
                 self.rejected_responses[str(detail['status'])] += 1
+            if detail.get('encoding_recovery'):
+                self.representation_recovery_count += 1
+                self.representation_recoveries.append({
+                    'url': _safe_url(detail.get('url', '')),
+                    'backend': detail.get('backend', ''),
+                    'proof': str(detail['encoding_recovery'])[:500],
+                    'observed_at': utc_now()})
             for key in ('gate_wait_seconds', 'request_turn_seconds', 'backend_elapsed_seconds'):
                 if key in detail:
                     self.timings[key] += max(0.0, float(detail[key]))
@@ -212,6 +223,8 @@ class AcquisitionDiagnostics:
             elapsed, used = now-self.resource_sample[0], cpu-self.resource_sample[1]
             self.resource_sample = (now, cpu)
             return {'build_id': self.build, 'response_counts': dict(self.responses),
+                    'representation_recovery_count': self.representation_recovery_count,
+                    'recent_representation_recoveries': list(self.representation_recoveries),
                     'transport_failure_phases': dict(self.transport_failures),
                     'resource_interval_seconds': elapsed,
                     'process_cpu_cores_used': used/elapsed if elapsed > 0 else None,

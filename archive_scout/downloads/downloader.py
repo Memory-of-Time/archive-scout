@@ -859,6 +859,7 @@ def download_archive(
                 }
 
             diagnostics.batch_metrics = batch_metrics
+            diagnostics.watchdog.start()
     
             fresh_admitted = 0
 
@@ -947,6 +948,7 @@ def download_archive(
                     futures[pool.submit(measured_fetch, row)] = row
 
             while futures or fresh_remaining or parked:
+                diagnostics.watchdog.beat('queue admission')
                 if scanner_failures:
                     raise RuntimeError("background scanner failed; acquisition paused with retained bodies recoverable") from scanner_failures[0]
                 if stop_event.is_set():
@@ -1009,6 +1011,7 @@ def download_archive(
                     continue
                 last_completion = time.monotonic()
                 for future in done:
+                    diagnostics.watchdog.beat('outcome processing')
                     row = futures.pop(future)
                     outcome_started = time.monotonic()
                     with finished_lock:
@@ -1274,6 +1277,7 @@ def download_archive(
         batch_failure = sys.exc_info()[1]
         batch_phase = "stopped" if isinstance(batch_failure, Stopped) else "failed" if batch_failure else "batch_finished"
         cleanup_started = time.monotonic()
+        diagnostics.watchdog.beat('scanner and transport cleanup')
         # Drain local scans on clean completion, but honor Stop promptly.
         scanner_finish.set()
         scanner_wakeup.set()
@@ -1286,6 +1290,7 @@ def download_archive(
         try:
             diagnostics.summary(saved_this_pass, force=True)
         finally:
+            diagnostics.watchdog.close()
             diagnostics.batch_metrics = None  # do not retain this batch's owners
     if callback and held_failures:
         size_detail = (f" {oversized_failures:,} exceeded the configured text size limit "

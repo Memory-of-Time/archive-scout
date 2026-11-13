@@ -778,7 +778,7 @@ def index_direct_media(
         extra = max(0, plan.planned - len(default_windows))
         total += extra - previous_extra
 
-        retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
+        retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config, count_only=True))
         retry_budget.resume()
         while plan.pending:
             if retry_budget.exhausted:
@@ -1547,7 +1547,7 @@ def index_embedded_media(
 def _complete_embedded_media(config, database, client, stop_event, callback, signature, *, external_only=False, acquire_ready=False):
     """Retry lookup turns without repeating saved-document discovery each turn."""
     turn = 0
-    budget = NoProgressBudget(config)
+    budget = NoProgressBudget(config, count_only=True)
     def progress_token():
         # Attempt counters and error timestamps are not successful progress.
         row = database.execute("SELECT SUM(state='indexed'),"

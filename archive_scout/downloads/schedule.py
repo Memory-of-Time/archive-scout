@@ -73,6 +73,8 @@ def record_failure(database: sqlite3.Connection, capture_id: int, category: str,
     # Deterministic capture-ID jitter disperses retries across restarts, without
     # a process-local RNG and without a large in-memory scheduling heap.
     backoff = min(max(1.0, max_seconds), max(0.1, base_seconds) * 2 ** min(12, count-1))
+    if count >= 3 and category in {'incomplete_representation', 'payload_digest_mismatch', 'content_encoding_mismatch'}:
+        backoff = max(backoff, min(60.0, max(1.0, max_seconds)))
     delay = backoff * (0.90 + (capture_id % 17) / 85.0)
     database.execute("""INSERT INTO text_retry_schedule
         (capture_id,next_eligible_at,failure_count,last_category,last_status,updated_at)

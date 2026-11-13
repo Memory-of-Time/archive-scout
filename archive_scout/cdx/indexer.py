@@ -1366,7 +1366,7 @@ def index_archive(
             total_windows += extra - counted_extra
             accounted[task_key] = (plan.completed, extra)
 
-            retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
+            retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config, count_only=True))
             retry_budget.resume()
             while plan.pending:
                 if retry_budget.exhausted:

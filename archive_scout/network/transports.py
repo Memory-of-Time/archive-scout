@@ -447,14 +447,20 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
     advertised = headers.get("content-length", "")
     expected_wire = int(advertised) if advertised.isdigit() else None
     received_wire = 0
+    framing_error = None
     if encoding in {"", "identity"}:
-        for chunk in chunks:
-            if stop_event.is_set():
-                raise Stopped
-            received_wire += len(chunk)
-            if repair_hash is not None:
-                repair_hash.update(chunk)
-            yield chunk
+        try:
+            for chunk in chunks:
+                if stop_event.is_set():
+                    raise Stopped
+                received_wire += len(chunk)
+                if repair_hash is not None:
+                    repair_hash.update(chunk)
+                yield chunk
+        except Exception as exc:
+            if repair_hash is None or not isinstance(normalize_transport_error(exc), IncompleteRepresentationError):
+                raise
+            framing_error = exc
     else:
         gzip_mode = encoding in {"gzip", "x-gzip"}
         decoder = zlib.decompressobj(16 + zlib.MAX_WBITS if gzip_mode else zlib.MAX_WBITS)
@@ -482,7 +488,9 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
                 pending = decoder.unconsumed_tail
         if not started or not decoder.eof:
             raise IncompleteRepresentationError(f"incomplete {encoding} stream; end marker or checksum missing")
-    if expected_wire is not None and expected_wire != received_wire:
+    if stop_event.is_set():
+        raise Stopped
+    if repair_hash is None and expected_wire is not None and expected_wire != received_wire:
         raise IncompleteRepresentationError(
             f"HTTP Content-Length mismatch: received {received_wire}, expected {expected_wire}")
     if repair_hash is not None:
@@ -492,6 +500,9 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
             error.actual_digest = actual
             raise error
         headers["x-archive-scout-encoding-recovery"] = "gzip header mismatch; CDX SHA-1 verified: " + actual
+        if framing_error is not None or (expected_wire is not None and expected_wire != received_wire):
+            headers["x-archive-scout-encoding-recovery"] += (
+                f"; replay framing contradicted verified payload ({received_wire} bytes, advertised {advertised or 'chunked'})")
 
 
 def _partial_metadata_path(destination: Path) -> Path:
@@ -1517,7 +1528,7 @@ class CurlBackend:
                 return TransportFileResponse(status, fields, url, destination, 0,
                     hashlib.sha256(b"").hexdigest(), b"", self.name,
                     time.monotonic()-started)
-            if proc.returncode != 0:
+            if proc.returncode not in {0, 18}:
                 destination.unlink(missing_ok=True)
                 message = (stderr or stdout or f"curl exited {proc.returncode}").strip()
                 if proc.returncode == 28:
@@ -1545,9 +1556,12 @@ class CurlBackend:
                     destination, 0, hashlib.sha256(b"").hexdigest(), b"", self.name,
                     time.monotonic()-started)
             with raw_path.open("rb") as raw:
-                raw_chunks = iter(lambda: raw.read(64 * 1024), b"")
+                def raw_chunks():
+                    yield from iter(lambda: raw.read(64 * 1024), b"")
+                    if proc.returncode == 18:
+                        raise CurlTransportError(18, (stderr or 'curl: incomplete transfer').strip())
                 size, content_hash, preview = _write_limited(
-                    _decoded_verified_chunks(raw_chunks, parsed_headers, stop_event, expected_digest=expected_digest),
+                    _decoded_verified_chunks(raw_chunks(), parsed_headers, stop_event, expected_digest=expected_digest),
                     destination, max_bytes, stop_event,
                     response_metadata=response_diagnostic(status, parsed_headers, final_url))
             return TransportFileResponse(
