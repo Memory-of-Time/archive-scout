@@ -495,15 +495,12 @@ def _can_split_cdx_window(current: PendingWindow, exc: TransientRequestError) ->
     """
     if not exc.splittable or exc.connection_failed:
         return False
-    if current.resume_key and (
-        current.failures < 3
-        or (_query_is_oversized(exc) and current.page_size > 100)
-    ):
+    if current.resume_key:
         # A CDX cursor follows URL-key order, not date order. Splitting a
         # progressed date range discards the cursor and repeats earlier work.
-        # Retry it first; explicit size pressure shrinks its page before any
-        # restart. Keep the existing eligible fallback after repeated failures
-        # so an unusable cursor cannot strand the remaining inventory forever.
+        # Retry the exact cursor regardless of the failure count. Explicit
+        # size pressure can shrink its page in _defer_transient_window, but
+        # is never permission to erase committed traversal progress.
         return False
     if getattr(exc, "status", None) in {408, 425, 429, 500, 502, 503, 504}:
         return False
@@ -864,7 +861,16 @@ def _is_adjacent_surt_host(hostname: str, suffix: str) -> bool:
     Certain CDX wildcard searches cross a SURT prefix boundary: querying
     *.liveleak.com can yield www.liveleak+quran.com. Those records must not
     be inserted or allowed to poison an otherwise verified continuation page.
+
+    Archived originals can also contain empty DNS labels (ogrish..com). Only
+    recognize that anomaly when removing those labels gives this exact domain
+    or its subdomain. Exclude the original; never rewrite it into a different
+    capture or relax the check for an arbitrary unrelated domain.
     """
+    if ".." in hostname:
+        nonempty_labels = ".".join(label for label in hostname.split(".") if label)
+        if nonempty_labels == suffix or nonempty_labels.endswith("." + suffix):
+            return True
     label, dot, remainder = suffix.partition(".")
     if not (dot and label and remainder and hostname.endswith("." + remainder)):
         return False
@@ -886,8 +892,9 @@ def validate_cdx_scope(
     unambiguous literal paths. Server regexes remain server-owned semantics.
 
     By default this is strictly rejecting. An indexing caller may opt into
-    discarding only a recognized adjacent SURT host spill from a successfully
-    parsed CDX response. This does not change the continuation or terminal
+    discarding only a recognized adjacent SURT host spill or empty-label host
+    anomaly from a successfully parsed CDX response. This does not change the
+    continuation or terminal
     validation, and date/status/path/other-host contradictions remain fatal.
     The supplied list is compacted in place (no second 100k-row allocation).
     Returns the number of excluded adjacent-host rows.
@@ -1867,9 +1874,7 @@ def index_archive(
                             total_windows += added
                             with database:
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            reason = ("; last-resort restart after repeated failures at the saved cursor"
-                                      if current.resume_key else "")
-                            emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split {target} {label} into {len(parts)} smaller windows (unfinished ranges retained{reason}).", completed_windows, total_windows, {"retain_notice": True}))
+                            emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split unstarted {target} {label} into {len(parts)} smaller windows (unfinished ranges retained).", completed_windows, total_windows, {"retain_notice": True}))
                             continue
                         if not target_config.cdx_collapses and _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
                             current.strategy = "paged"

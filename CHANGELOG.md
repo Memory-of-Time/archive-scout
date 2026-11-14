@@ -1,6 +1,8 @@
 # Changelog
 
 ## v1.3.0 — large-project sustainability
+- Prevent a recognized empty-label host anomaly in a mixed CDX page from blocking the selected site's valid captures; keep strict validation, audited exclusions and exact pagination checkpoints.
+- Never discard a committed resume key to split or restart a date range after repeated failures; retain same-cursor retry and page-size reduction for explicit size pressure.
 - Stop CDX transport-truncation failures from multiplying JSON/text and endpoint fallbacks; retain genuine format fallback and the exact index checkpoint.
 - Reuse operation-owned text worker pools across retry batches and select automatic retries from due schedules and unresolved legacy errors, preserving saved scope and retry eligibility.
 - Keep last-successful-save age and recent-save rate across retry batches, distinguish selected retry batches from full inventory progress, and throttle batch-end health output within an operation.

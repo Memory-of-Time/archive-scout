@@ -97,7 +97,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertTrue(all(e.detail['retain_notice'] and 'unrelated host' in e.message for e in notices))
             db.close()
 
-    def test_repeated_cursor_timeouts_retain_last_resort_recovery(self):
+    def test_repeated_cursor_timeouts_never_restart_the_date_range(self):
         with tempfile.TemporaryDirectory() as temp:
             cfg=replace(config(Path(temp)),max_attempts=8);db=open_database(cfg.output_dir);calls=[];events=[]
             def respond(_client,endpoints,params,**kwargs):
@@ -107,9 +107,9 @@ class RecoveryTests(unittest.TestCase):
                 raise Stopped
             with patch.object(HttpClient,'get_cdx_any',respond),patch('archive_scout.cdx.indexer.transient_backoff',return_value=0):
                 with self.assertRaises(Stopped):index_archive(cfg,db,threading.Event(),events.append)
-            self.assertEqual([p.get('resumeKey') for p in calls[1:5]],['SAVED']*4)
-            self.assertNotIn('resumeKey',calls[5])
-            self.assertTrue(any('last-resort restart' in e.message and e.detail['retain_notice'] for e in events))
+            self.assertEqual([p.get('resumeKey') for p in calls[1:]],['SAVED']*5)
+            self.assertTrue(all((p['from'],p['to'])==(cfg.from_date,cfg.to_date) for p in calls))
+            self.assertFalse(any('split' in e.message or 'switching' in e.message for e in events))
             self.assertEqual(db.execute('SELECT COUNT(*) FROM captures').fetchone()[0],1)
             self.assertEqual(db.execute('SELECT complete FROM index_coverage').fetchone()[0],0)
             db.close()
