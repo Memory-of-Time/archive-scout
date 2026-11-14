@@ -427,13 +427,20 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
     error_predicate = explicit_error_predicate(config) if manual else 'e.retryable=1'
     latest_decision = ' AND '+(selected_retry_allowed() if manual else automatic_retry_allowed())
     last_id = 0
+    source = ("""(
+        SELECT capture_id FROM text_retry_schedule WHERE next_eligible_at<=?
+        UNION SELECT e.capture_id FROM errors e WHERE e.resolved=0 AND e.ignored=0
+          AND e.retryable=1 AND e.capture_id IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=e.capture_id))
+        candidates CROSS JOIN captures c ON c.id=candidates.capture_id"""
+        if automatic else 'captures c')
     while True:
         # Explicit retry includes pending captures which a lifetime attempt
         # ceiling prevented from entering the normal queue. Automatic recovery
         # still considers only recorded retryable errors, once per sweep.
         exhausted = " OR (c.state='pending' AND c.download_attempts>=?)" if include_exhausted_pending else ""
         rows = database.execute(
-            """SELECT c.id FROM captures c
+            "SELECT c.id FROM " + source + """
                WHERE c.id>? AND EXISTS (SELECT 1 FROM targets t
                   JOIN archive_scout_retry_scopes s ON s.pattern=t.pattern
                    AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
@@ -446,8 +453,8 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
                         OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
                                    AND sched.next_eligible_at<=?)))"""
             + exhausted + ")" + latest_decision + selection + " ORDER BY c.id LIMIT ?",
-            (last_id, time.time(), *([config.max_attempts] if include_exhausted_pending else []),
-             *selected_params, batch_size),
+            (*([time.time()] if automatic else []), last_id, time.time(),
+             *([config.max_attempts] if include_exhausted_pending else []), *selected_params, batch_size),
         ).fetchall()
         if not rows:
             return

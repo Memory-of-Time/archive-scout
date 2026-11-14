@@ -1,6 +1,9 @@
 # Changelog
 
 ## v1.3.0 — large-project sustainability
+- Stop CDX transport-truncation failures from multiplying JSON/text and endpoint fallbacks; retain genuine format fallback and the exact index checkpoint.
+- Reuse operation-owned text worker pools across retry batches and select automatic retries from due schedules and unresolved legacy errors, preserving saved scope and retry eligibility.
+- Keep last-successful-save age and recent-save rate across retry batches, distinguish selected retry batches from full inventory progress, and throttle batch-end health output within an operation.
 - Recover nonempty, CDX-digest-proven payloads when a contradictory gzip header and broken HTTP framing otherwise reject the exact selected body; preserve strict rejection of wrong digests, genuine gzip truncation, empty bodies, limits and cancellation.
 - Remove the hidden elapsed retry cutoff from text, direct-media and embedded-media indexing. The explicit target time budget remains opt-in; failed-attempt limits and durable incomplete checkpoints remain enforced.
 - Space repeated text representation failures while fresh work proceeds, and retain bounded recovery proof samples in acquisition health history.

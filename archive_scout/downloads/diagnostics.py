@@ -116,12 +116,38 @@ class AcquisitionDiagnostics:
         self.batch_saved = 0
         self.batch_metrics = None
         self.last_summary = time.monotonic()
+        self.acquisition_started = self.last_summary
+        self.last_successful_save = None
+        self.build_announced = False
+        self.recent_saves = deque(maxlen=4096)
         self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
         from .watchdog import OwnerWatchdog
         self.watchdog = OwnerWatchdog(self.summary_path, enabled=enabled)
 
     def close(self):
         self.watchdog.close()
+        if self.batch_saved or self.phase_saved_base or self.failures:
+            self.summary(self.batch_saved, force=True)
+
+    def saved(self):
+        with self.lock:
+            self.last_successful_save = time.monotonic()
+            self.recent_saves.append(self.last_successful_save)
+
+    def save_metrics(self):
+        with self.lock:
+            now = time.monotonic()
+            while self.recent_saves and self.recent_saves[0] <= now-30.0:
+                self.recent_saves.popleft()
+            return {
+                'recent_saves_per_second': len(self.recent_saves)/min(30.0, max(.001, now-self.acquisition_started)),
+                'seconds_since_last_save': None if self.last_successful_save is None else now-self.last_successful_save,
+                'seconds_without_success': now-(self.last_successful_save if self.last_successful_save is not None else self.acquisition_started),
+            }
+
+    def save_age(self):
+        age = self.save_metrics()['seconds_since_last_save']
+        return 'none in this operation' if age is None else f'{age:.0f}s ago'
 
     def begin_batch(self, callback):
         self.phase_saved_base += self.batch_saved
@@ -273,6 +299,8 @@ class AcquisitionDiagnostics:
             return
         self.last_summary = time.monotonic()
         detail = self.snapshot()
+        if self.kind == 'text':
+            detail['operation_save_metrics'] = self.save_metrics()
         if self.batch_metrics is not None:
             try:
                 detail['acquisition'] = self.batch_metrics()
@@ -300,7 +328,7 @@ class AcquisitionDiagnostics:
             if 'recent_saves_per_second' in metrics:
                 transport = metrics.get('transport', {})
                 stages += (f"Recent saves {metrics['recent_saves_per_second']:.1f}/s (30s); "
-                           f"last save {metrics['seconds_since_last_save']:.0f}s ago; "
+                           f"last save {self.save_age()}; "
                            f"backend waiters {transport.get('backend_waiters', '?')}; "
                            f"backend probes {transport.get('probe_backends', ())}. ")
             if metrics.get('active_replay_budget_seconds') is not None:

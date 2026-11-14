@@ -767,7 +767,8 @@ class HttpClient:
                         endpoint=endpoint,
                     ) from exc
                 except MalformedCDXResponse as exc:
-                    if any(isinstance(error, IncompleteRepresentationError) for error in exception_chain(exc)):
+                    if any(isinstance(normalize_transport_error(error), IncompleteRepresentationError)
+                           or getattr(error, 'response_started', False) for error in exception_chain(exc)):
                         self._remember_endpoint_failure(endpoint)
                         exc.endpoint = endpoint
                         raise
@@ -913,7 +914,8 @@ class HttpClient:
                         endpoint=endpoint,
                     ) from exc
                 except MalformedCDXResponse as exc:
-                    if any(isinstance(error, IncompleteRepresentationError) for error in exception_chain(exc)):
+                    if any(isinstance(normalize_transport_error(error), IncompleteRepresentationError)
+                           or getattr(error, 'response_started', False) for error in exception_chain(exc)):
                         self._remember_endpoint_failure(endpoint)
                         exc.endpoint = endpoint
                         raise

@@ -623,7 +623,7 @@ def download_archive(
         with database:
             database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
     queue_started = time.monotonic()
-    if callback:
+    if callback and not capture_ids:
         callback(ProgressEvent("download_prepare", "Preparing disk-backed text acquisition queue; committed progress is retained."))
     total, row_iter = prepare_download_rows(
         database, config, combined_patterns, states=states, capture_ids=capture_ids
@@ -651,11 +651,12 @@ def download_archive(
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
     from .session import acquisition_client
-    diagnostics, _ = acquisition_client(("text_observations", id(database)), lambda: AcquisitionDiagnostics(config.output_dir, callback,
+    diagnostics, owns_diagnostics = acquisition_client(("text_observations", id(database)), lambda: AcquisitionDiagnostics(config.output_dir, callback,
                                          enabled=config.network.diagnostics))
     diagnostics.begin_batch(callback)
-    if callback and config.network.diagnostics:
+    if callback and config.network.diagnostics and not diagnostics.build_announced:
         callback(ProgressEvent('acquisition_health', f'Text acquisition build: {diagnostics.build}'))
+        diagnostics.build_announced = True
 
     def on_retry(attempt: int, total_attempts: int, reason: str, wait_seconds: float) -> None:
         if callback:
@@ -755,7 +756,6 @@ def download_archive(
     completed = matched = failures = saved_this_pass = 0
     held_failures = oversized_failures = 0
     unavailable_failures = 0
-    recent_commits: deque[float] = deque()
     stage_stats = {"network_and_pacing_seconds": 0.0,
                    "file_fsync_publish_seconds": 0.0,
                    "database_commit_seconds": 0.0,
@@ -801,10 +801,13 @@ def download_archive(
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     last_completion = time.monotonic()
-    last_save = time.monotonic()
     last_stall_message = time.monotonic()
+    from contextlib import nullcontext
+    from .session import AcquisitionExecutor
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-scout") as pool:
+        executor, owns_executor = acquisition_client(('text_workers', id(database), config.workers),
+            lambda: AcquisitionExecutor(max_workers=config.workers, thread_name_prefix='archive-scout'))
+        with (executor if owns_executor else nullcontext(executor)) as pool:
             futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
 
             parked: deque[sqlite3.Row] = deque()
@@ -821,11 +824,8 @@ def download_archive(
                 now = time.monotonic()
                 transport_health = (client.transport.snapshot()
                     if isinstance(getattr(client, "transport", None), ResilientTransport) else {})
-                while recent_commits and recent_commits[0] <= now - 30.0:
-                    recent_commits.popleft()
                 return {
-                    'recent_saves_per_second': len(recent_commits) / min(30.0, max(0.001, now-started)),
-                    'seconds_since_last_save': now-last_save,
+                    **diagnostics.save_metrics(),
                     'transport': transport_health,
                     'host_gate': client.host_gate.snapshot(),
                     'dispatch_slots': transport.dispatch_slots(client.host_gate.dispatch_slots(max_inflight)) if streamed else max_inflight,
@@ -999,7 +999,7 @@ def download_archive(
                             f"probe active {status['recovery_probe']}; "
                             f"host pause {status['remaining_pause']:.1f}s; "
                             f"host recovery required {status['probe_required']}; reason {status['reason'] or 'none'}; "
-                            f"last successful save {now-last_save:.0f}s ago; "
+                            f"last successful save {diagnostics.save_age()}; "
                             f"backend waiters {transport_health.get('backend_waiters', '?')}; "
                             f"backend probes {transport_health.get('probe_backends', ())}; "
                             f"oldest backend probe {transport_health.get('oldest_probe_seconds', '?')}s; "
@@ -1043,8 +1043,7 @@ def download_archive(
                         outcome_state = 'downloaded_unscanned'
                         if scanner_thread is not None:
                             scanner_wakeup.set()
-                        last_save = time.monotonic()
-                        recent_commits.append(last_save)
+                        diagnostics.saved()
                         if "analyses" in result:
                             matched += int(any(
                                 int(analysis.get("score") or 0) >= config.minimum_score
@@ -1224,9 +1223,7 @@ def download_archive(
                     # waiting, or older network faults. No database reads.
                     now = time.monotonic()
                     diagnostics.summary(saved_this_pass)
-                    while recent_commits and recent_commits[0] <= now - 30.0:
-                        recent_commits.popleft()
-                    rate = len(recent_commits) / min(30.0, elapsed)
+                    rate = diagnostics.save_metrics()['recent_saves_per_second']
                     invocation_rate = saved_this_pass / elapsed
                     cumulative_completed = max(0, min(cumulative_total, retained + excluded))
                     observe_owner('outcome', time.monotonic() - outcome_started)
@@ -1235,9 +1232,10 @@ def download_archive(
                         callback(
                             ProgressEvent(
                                 "download",
-                                f"Text acquisition satisfied {cumulative_completed:,}/{cumulative_total:,}; "
+                                f"{'Retry batch' if capture_ids else 'Text acquisition'} satisfied {cumulative_completed:,}/{cumulative_total:,}; "
                                 f"retained {retained:,}; excluded/routed {excluded:,}; "
                                 f"attempt outcomes {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
+                                f"operation new saves {diagnostics.phase_saved_base+saved_this_pass:,}; "
                                 f"matches committed asynchronously; errors {failures:,}; recent successful saves {rate:.1f}/s (30s); "
                                 f"unavailable outcomes {unavailable_failures:,}; "
                                 f"acquisition average {invocation_rate:.1f}/s; "
@@ -1251,6 +1249,8 @@ def download_archive(
                                     "rolling_save_rate_30s": rate,
                                     "invocation_save_rate": invocation_rate,
                                     "new_saves": saved_this_pass,
+                                    "operation_new_saves": diagnostics.phase_saved_base+saved_this_pass,
+                                    "retry_batch": bool(capture_ids),
                                     "captures_satisfied": cumulative_completed,
                                     "captures_retained": retained,
                                     "captures_excluded_or_routed": excluded,
@@ -1288,7 +1288,7 @@ def download_archive(
         if scanner_thread is not None and reconciliation_finished:
             mark_reconciled(database, config)
         try:
-            diagnostics.summary(saved_this_pass, force=True)
+            diagnostics.summary(saved_this_pass, force=owns_diagnostics or batch_failure is not None)
         finally:
             diagnostics.watchdog.close()
             diagnostics.batch_metrics = None  # do not retain this batch's owners

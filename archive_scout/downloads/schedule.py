@@ -194,8 +194,9 @@ def next_due(database: sqlite3.Connection, config=None, *, respect_selection=Fal
     if categories:
         selection += " AND s.last_category IN (" + ",".join("?" for _ in categories) + ")"
         params.extend(sorted(categories))
-    row = database.execute("""SELECT MIN(s.next_eligible_at) FROM text_retry_schedule s
-        JOIN captures c ON c.id=s.capture_id WHERE c.state='error' AND EXISTS
+    row = database.execute("""SELECT s.next_eligible_at FROM text_retry_schedule s INDEXED BY text_retry_due_idx
+        CROSS JOIN captures c ON c.id=s.capture_id WHERE c.state='error' AND EXISTS
         (SELECT 1 FROM errors e WHERE e.capture_id=c.id AND e.retryable=1
-         AND e.resolved=0 AND e.ignored=0) AND """ + automatic_retry_allowed() + scope + selection, params).fetchone()
+         AND e.resolved=0 AND e.ignored=0) AND """ + automatic_retry_allowed() + scope + selection +
+         " ORDER BY s.next_eligible_at,s.capture_id LIMIT 1", params).fetchone()
     return float(row[0]) if row and row[0] is not None else None
