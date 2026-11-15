@@ -88,13 +88,12 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
                     record_media_failure(db, int(cid), str(category), status, True, config)
         return bool(outstanding)
 
-    # Bound failed sweeps, rather than elapsed time across unrelated captures
-    # or a persisted cooldown that has not allowed this run a request yet.
-    budget = NoProgressBudget(config, count_only=True)
+    # Tail recovery yields to reports after bounded unsuccessful sweeps or
+    # waits. Persistent schedules survive; a timeout category cannot reset it.
+    budget = NoProgressBudget(config)
     sweep_cursor = (-1.0, 0)
     sweep_started = time.time()
     sweep_progress = False
-    from ..downloads.schedule import PERSISTENT_NETWORK_CATEGORIES
     from ..downloads.rate_limit import shared_host_gate
     gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
     while not stop.is_set():
@@ -104,19 +103,6 @@ def recover_active_media(config: ProjectConfig, db: sqlite3.Connection, stop: th
                     'Server cooldown exceeds the configured wait limit. Media retry checkpoints were retained.',
                     detail={'retain_notice': True}))
             return
-        if budget.exhausted:
-            network_pending = db.execute(
-                "SELECT 1 FROM media_retry_schedule s JOIN media_captures mc ON mc.id=s.media_capture_id "
-                "WHERE mc.query_signature IN (" + placeholders + ") AND mc.state='error' "
-                "AND s.last_category IN (" + ','.join('?' for _ in PERSISTENT_NETWORK_CATEGORIES) + ") "
-                "AND EXISTS(SELECT 1 FROM errors e WHERE e.media_capture_id=mc.id "
-                "AND e.retryable=1 AND e.resolved=0 AND e.ignored=0) LIMIT 1",
-                (*signatures, *sorted(PERSISTENT_NETWORK_CATEGORIES))).fetchone()
-            if network_pending:
-                budget.progress()
-                if callback:
-                    callback(ProgressEvent('media_retry',
-                        'Temporary media network failures remain scheduled; persistent recovery continues automatically.'))
         if budget.exhausted:
             if callback:
                 callback(ProgressEvent('media_incomplete', incomplete_retry_message('Media recovery'),

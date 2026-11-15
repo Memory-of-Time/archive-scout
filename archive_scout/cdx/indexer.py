@@ -19,6 +19,8 @@ from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_site_issue, upsert_captures
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
 from ..events import ProgressEvent, Stopped
+from ..network.transports import (exception_chain, IncompleteRepresentationError, normalize_transport_error,
+                                  is_transport_pool_timeout, is_transport_connection_failure)
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
 from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload, summarize_cdx_error
@@ -853,6 +855,40 @@ def _resolve_strategy(current: PendingWindow, config: ProjectConfig, target: str
         current.page_blocks = 9
     elif current.page_blocks <= 0:
         current.page_blocks = network.page_blocks
+
+
+def _recover_with_numbered_pages(config, database, current, exc, save_checkpoint, *, operation="index") -> bool:
+    if (config.network.normalized().index_strategy != "auto"
+            or current.strategy != "resume" or not current.pagination_supported
+            or current.resume_key or current.page or current.page_count >= 0
+            or current.page_layout or current.retry_pages or current.page_failures
+            or isinstance(exc, RateLimitDeferred) or exc.connection_failed
+            or getattr(exc, "status", None) in {408, 425, 429, 500, 502, 503}):
+        return False
+    chain = list(exception_chain(exc))
+    if any(is_transport_pool_timeout(item) or is_transport_connection_failure(item)
+           or getattr(item, "status", None) in {408, 425, 429, 500, 502, 503} for item in chain):
+        return False
+    if not (getattr(exc, "status", None) == 504 or exc.timed_out
+            or _query_is_oversized(exc) or getattr(exc, "response_started", False)
+            or any(getattr(item, "response_started", False)
+                   or isinstance(normalize_transport_error(item), IncompleteRepresentationError)
+                   for item in chain)):
+        return False
+    previous = (current.strategy, current.page_blocks, current.next_eligible_at)
+    try:
+        with database:
+            current.strategy = "paged"
+            current.page_blocks = 9
+            current.next_eligible_at = 0.0
+            save_checkpoint()
+            record_recovery_event(database, operation, "initial_query_paged_recovery",
+                "Uncommitted resume query moved to numbered pages: " + summarize_cdx_error(exc),
+                details={"start": current.start, "end": current.end, "page_blocks": 9})
+    except BaseException:
+        current.strategy, current.page_blocks, current.next_eligible_at = previous
+        raise
+    return True
 
 
 def _is_adjacent_surt_host(hostname: str, suffix: str) -> bool:
@@ -1780,6 +1816,14 @@ def index_archive(
                         yielded = True
                         break
                 except TransientRequestError as exc:
+                    if _recover_with_numbered_pages(target_config, database, current, exc,
+                            lambda: persist_task_state(encode_plan(plan), False, seen, error_id)):
+                        retry_budget.progress()
+                        emit(callback, ProgressEvent("index",
+                            f"{target} {label}: initial CDX request stalled; saved a numbered-page plan for parallel indexing. "
+                            "Date range and filters retained; no committed cursor changed.",
+                            completed_windows, total_windows, {"retain_notice": True}))
+                        continue
                     if exc.connection_failed:
                         current.gateway_504_failures = 0
                         connection_failure_streak += 1

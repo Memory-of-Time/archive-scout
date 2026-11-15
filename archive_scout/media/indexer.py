@@ -30,6 +30,7 @@ from ..cdx.indexer import (
     uncovered_index_ranges,
     _reconcile_paged_completion,
     _query_is_oversized,
+    _recover_with_numbered_pages,
     split_window,
     window_label,
 )
@@ -1051,6 +1052,16 @@ def index_direct_media(
                     _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
                 raise
             except (RateLimitDeferred, TransientRequestError) as exc:
+                if _recover_with_numbered_pages(target_config, database, current, exc,
+                        lambda: _save_media_state(database, target_id, year, state_signature,
+                                                 encode_plan(plan), False, seen, error_id), operation="media_index"):
+                    retry_budget.progress()
+                    if callback:
+                        callback(ProgressEvent("media_index",
+                            f"{target} {label}: initial media CDX request stalled; saved a numbered-page plan. "
+                            "Date range and filters retained; no committed cursor changed.",
+                            completed, total, {"retain_notice": True}))
+                    continue
                 if isinstance(exc, TransientRequestError) and exc.connection_failed:
                     connection_failure_streak += 1
                     current.failures += 1

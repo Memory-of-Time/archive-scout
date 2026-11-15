@@ -216,7 +216,7 @@ class IsolationTests(unittest.TestCase):
             workers, budget = scan_capacity(1, 64*1024*1024)
             self.assertEqual((workers, budget), (1, 64*1024*1024))
 
-    def test_persistent_outage_recovery_survives_no_progress_sweep_limit(self):
+    def test_persistent_text_tail_preserves_outage_for_later_resume(self):
         cfg = ProjectConfig(self.root, targets=['example.test/*'], keywords=['needle'],
             from_date='2001', to_date='2001', max_attempts=1,
             network=NetworkConfig(retry_base_seconds=1, retry_max_seconds=1)).normalized()
@@ -246,10 +246,12 @@ class IsolationTests(unittest.TestCase):
             with patch('archive_scout.operations.download_archive', side_effect=recover):
                 result = recover_transient_text_errors(cfg, db, 0, [], FastStop(), None,
                                                        continuous=True, acquire_only=True)
-            self.assertEqual(result, 0)
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(result, 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(db.execute('SELECT state FROM captures').fetchone()[0], 'error')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM text_retry_schedule').fetchone()[0], 1)
 
-    def test_persistent_media_outage_survives_failed_sweep_limit(self):
+    def test_persistent_media_tail_preserves_outage_for_later_resume(self):
         from archive_scout.database.repositories import upsert_media_capture
         from archive_scout.media.indexer import media_query_signature
         from archive_scout.media.recovery import recover_active_media, record_media_failure
@@ -280,7 +282,9 @@ class IsolationTests(unittest.TestCase):
 
             with patch('archive_scout.media.downloader.download_media', side_effect=recovered):
                 recover_active_media(cfg, db, FastStop(), allow_partial_inventory=True)
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(db.execute('SELECT state FROM media_captures').fetchone()[0], 'error')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM media_retry_schedule').fetchone()[0], 1)
 
     def test_media_persistent_recovery_respects_explicit_server_wait_limit(self):
         from archive_scout.media.recovery import recover_active_media

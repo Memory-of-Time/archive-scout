@@ -1,6 +1,8 @@
 # Changelog
 
 ## v1.3.0 — large-project sustainability
+- Recover stalled, uncommitted automatic CDX queries through the existing parallel numbered-page pipeline, retaining date/filter/collapse scope, durable page ledgers and committed resume cursors.
+- Bound unsuccessful text/media download-tail recovery without an unlimited network-category exemption; retain retry schedules and incomplete status, and honor Stop before cooldown checks.
 - Prevent a recognized empty-label host anomaly in a mixed CDX page from blocking the selected site's valid captures; keep strict validation, audited exclusions and exact pagination checkpoints.
 - Never discard a committed resume key to split or restart a date range after repeated failures; retain same-cursor retry and page-size reduction for explicit size pressure.
 - Stop CDX transport-truncation failures from multiplying JSON/text and endpoint fallbacks; retain genuine format fallback and the exact index checkpoint.

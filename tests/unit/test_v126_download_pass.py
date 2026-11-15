@@ -223,7 +223,7 @@ class Fairness(Fixture):
         self.assertEqual(set(calls.values()), {2})
         self.assertEqual(len(calls), 40)
 
-    def test_text_inherited_long_cooldown_gets_an_automatic_attempt(self):
+    def test_text_inherited_long_cooldown_keeps_schedule_and_yields_to_reports(self):
         cid = self.capture()
         self.failure(cid, 'connection', True)
         clock = [100.0]
@@ -243,9 +243,10 @@ class Fairness(Fixture):
              patch('archive_scout.operations.download_archive', side_effect=download) as fetch:
             result = recover_transient_text_errors(self.cfg, self.db, 0, [], stop, None,
                 continuous=True, acquire_only=True)
-        self.assertEqual(result, 0)
-        self.assertEqual(fetch.call_count, 1)
-        self.assertGreater(sum(waits), 30)
+        self.assertEqual(result, 1)
+        self.assertEqual(fetch.call_count, 0)
+        self.assertEqual(waits, [])
+        self.assertEqual(self.db.execute('SELECT next_eligible_at FROM text_retry_schedule').fetchone()[0],1000)
 
     def test_long_failed_sweep_cannot_skip_the_next_sweep(self):
         cid = self.capture()
@@ -266,7 +267,7 @@ class Fairness(Fixture):
                 threading.Event(), None, continuous=True, acquire_only=True), 0)
         self.assertEqual(calls, [[cid], [cid]])
 
-    def test_media_inherited_long_cooldown_gets_an_automatic_attempt(self):
+    def test_media_inherited_long_cooldown_keeps_schedule_and_yields_to_reports(self):
         cfg = replace(self.cfg, media=MediaConfig(enabled=True, discover_embedded=False))
         signature = media_query_signature(cfg)
         upsert_media_capture(self.db, {'timestamp': '20080101000000', 'original': 'http://example.org/a.jpg',
@@ -292,8 +293,9 @@ class Fairness(Fixture):
              patch('archive_scout.media.recovery.time.time', side_effect=lambda: clock[0]), \
              patch('archive_scout.media.downloader.download_media', side_effect=download) as fetch:
             recover_active_media(cfg, self.db, stop, None, allow_partial_inventory=True)
-        self.assertEqual(fetch.call_count, 1)
-        self.assertGreater(sum(waits), 30)
+        self.assertEqual(fetch.call_count, 0)
+        self.assertEqual(waits, [])
+        self.assertEqual(self.db.execute('SELECT next_eligible_at FROM media_retry_schedule').fetchone()[0],1000)
 
     def test_stop_interrupts_saved_cooldown(self):
         cid = self.capture()
