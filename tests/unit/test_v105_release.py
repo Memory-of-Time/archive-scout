@@ -82,7 +82,7 @@ class V105ReleaseTests(unittest.TestCase):
             self.assertEqual(config.network.page_blocks, 9)
             self.assertEqual(config.network.index_strategy, 'auto')
 
-    def test_media_paths_are_flat_and_keep_url_filename_spelling(self):
+    def test_media_paths_are_flat_and_identify_the_original_url(self):
         root = Path('/project')
         image = {
             'original_url': 'http://example.com/gallery/photo%20one.jpg',
@@ -92,8 +92,10 @@ class V105ReleaseTests(unittest.TestCase):
             'original_url': 'http://example.com/media/clip.mp4',
             'media_kind': 'video', 'extension': '.mp4',
         }
-        self.assertEqual(media_path(root, image), root / 'media' / 'images' / 'photo%20one.jpg')
-        self.assertEqual(media_path(root, video), root / 'media' / 'videos' / 'clip.mp4')
+        self.assertTrue(media_path(root, image).name.startswith('http%3A%2F%2Fexample.com%2Fgallery%2Fphoto%2520one.jpg__'))
+        self.assertTrue(media_path(root, image).name.endswith('.jpg'))
+        self.assertTrue(media_path(root, video).name.startswith('http%3A%2F%2Fexample.com%2Fmedia%2Fclip.mp4__'))
+        self.assertTrue(media_path(root, video).name.endswith('.mp4'))
         self.assertEqual(len(media_path(root, image).relative_to(root / 'media').parts), 2)
         self.assertEqual(len(media_path(root, video).relative_to(root / 'media').parts), 2)
 

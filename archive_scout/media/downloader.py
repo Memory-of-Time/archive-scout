@@ -24,6 +24,7 @@ from ..downloads.diagnostics import AcquisitionDiagnostics
 from ..downloads.checkpoint import sync_directory
 from ..content import classify_replay_content
 from ..events import ProgressEvent, Stopped
+from ..filenames import url_filename
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..utils import utc_now
 from .indexer import media_query_signature
@@ -55,17 +56,29 @@ def _platform_filename(value: str, fallback: str) -> str:
 
 def media_filename(original_url: str, extension: str = "") -> str:
     parsed = urlsplit(original_url)
-    # Keep the raw URL spelling (including percent escapes) rather than unquoting
-    # it, so photo%20one.jpg remains photo%20one.jpg on disk.
-    raw_name = (parsed.path or "").rsplit("/", 1)[-1]
-    fallback = "media" + (extension or "")
-    return _platform_filename(raw_name, fallback)
+    return url_filename(original_url, extension=extension or Path(parsed.path).suffix)
+
+
+def _legacy_media_path(root: Path, row) -> Path:
+    folder = "images" if str(row["media_kind"]).casefold() == "image" else "videos"
+    original = str(row["original_url"])
+    raw = (urlsplit(original).path or "").rsplit("/", 1)[-1]
+    return root / "media" / folder / _platform_filename(raw, "media" + str(row["extension"] or ""))
 
 
 def media_path(root: Path, row: sqlite3.Row, preserve_paths: bool = False) -> Path:
     del preserve_paths  # v1.0.5 media layout is deliberately fixed and flat.
     folder = "images" if str(row["media_kind"]).casefold() == "image" else "videos"
-    filename = media_filename(str(row["original_url"]), str(row["extension"] or ""))
+    saved = str(_media_row_value(row, "path", ""))
+    if saved:
+        existing = Path(saved)
+        existing = existing if existing.is_absolute() else root / existing
+        if existing.is_file():
+            return existing
+    original = str(row["original_url"])
+    extension = str(row["extension"] or "") or Path(urlsplit(original).path).suffix
+    filename = url_filename(original, str(_media_row_value(row, "timestamp", "")),
+                            extension, _media_row_value(row, "id"))
     return root / "media" / folder / filename
 
 
@@ -209,6 +222,17 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
                 destination: Path | None = None) -> dict:
     path = Path(destination) if destination is not None else media_path(config.output_dir, row)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.is_file() and _media_row_value(row, "media_kind", ""):
+        legacy = _legacy_media_path(config.output_dir, row)
+        for candidate in (legacy, _disambiguate_media_path(legacy, row)):
+            if (candidate == path or len(candidate.name.encode("utf-8", "surrogatepass")) > 255
+                    or not candidate.is_file()):
+                continue
+            verified = _matching_existing_media(candidate, row)
+            if verified is not None:
+                size, digest = verified
+                return {"id": int(row["id"]), "path": candidate, "bytes": size,
+                        "hash": digest, "status": 200, "final_url": media_replay_url(row)}
     # Existing files may belong to a different URL or archived timestamp.
     # The CDX SHA-1 digest (or a previously committed per-capture SHA-256) is
     # required for a zero-request reuse; never use a basename alone as proof.

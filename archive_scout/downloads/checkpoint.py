@@ -108,7 +108,11 @@ def preserve_unverified(path: Path) -> None:
     with path.open('rb') as handle:
         for segment in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(segment)
-    destination = path.with_name(path.name + '.unverified-' + digest.hexdigest())
+    label = path.name
+    if len(label.encode('utf-8', 'surrogatepass')) > 120:
+        identity = hashlib.sha256(label.encode('utf-8', 'surrogatepass')).hexdigest()[:16]
+        label = label[:40] + '__' + identity
+    destination = path.with_name(label + '.unverified-' + digest.hexdigest())
     if destination.exists():
         # Keep an existing version; replacing it could destroy inspection evidence.
         return

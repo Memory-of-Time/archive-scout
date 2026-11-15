@@ -23,6 +23,7 @@ from ..constants import REPLAY_URL
 from ..content import classify_replay_content, decode_bytes, is_text_candidate, looks_textual_bytes, parse_page, parse_text_representation
 from ..database.repositories import record_error, record_site_issue, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
+from ..filenames import url_filename
 from ..parsing.embeds import extract_embed_candidates_fast
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..scanning.jobs import ScanJob
@@ -70,7 +71,12 @@ def replay_url(timestamp: str, original: str, modifier: str = "id_") -> str:
 
 def capture_path(root: Path, capture_id: int, timestamp: str, original: str) -> Path:
     digest = hashlib.sha1(original.encode("utf-8", "surrogatepass")).hexdigest()
-    return root / "captures" / timestamp[:4] / timestamp[4:6] / f"{capture_id}_{digest}.txt"
+    folder = root / "captures" / timestamp[:4] / timestamp[4:6]
+    legacy = folder / f"{capture_id}_{digest}.txt"
+    if (legacy.is_file() or legacy.with_name(legacy.name + ".transfer").is_file()
+            or legacy.with_name(legacy.name + ".validated.json").is_file()):
+        return legacy
+    return folder / url_filename(original, timestamp, ".txt", capture_id)
 
 
 def _populate_download_scopes(database: sqlite3.Connection, config: ProjectConfig) -> None:

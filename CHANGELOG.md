@@ -1,6 +1,7 @@
 # Changelog
 
 ## v1.3.0 — large-project sustainability
+- Name new text and media saves from their original URLs with portable escaping, timestamps, capture IDs and stable hashes; retain legacy file/checkpoint recovery and verified media reuse without bulk renames.
 - Recover stalled, uncommitted automatic CDX queries through the existing parallel numbered-page pipeline, retaining date/filter/collapse scope, durable page ledgers and committed resume cursors.
 - Bound unsuccessful text/media download-tail recovery without an unlimited network-category exemption; retain retry schedules and incomplete status, and honor Stop before cooldown checks.
 - Prevent a recognized empty-label host anomaly in a mixed CDX page from blocking the selected site's valid captures; keep strict validation, audited exclusions and exact pagination checkpoints.
