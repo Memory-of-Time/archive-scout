@@ -69,7 +69,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(calls, ["first.test"])
         self.stop.clear()
         reports, counts = run_fast_discovery(self.source, self.output, "&filter=original:" + self.filter)
-        self.assertEqual(reports["urls"], saved[0])
+        self.assertTrue(reports["urls"].samefile(saved[0]))
         self.assertEqual(calls, ["first.test", "second.test", "third.test", "second.test"])
         self.assertEqual(counts, {"searched": 1, "deferred": 1, "limited": 1, "matches": 2,
                                   "invalid_input_lines": 1, "input_read_to_end": True})
