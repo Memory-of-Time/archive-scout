@@ -1809,7 +1809,8 @@ class ResilientTransport:
                         {'/cdx/search/cdx', '/web/timemap/json', '/web/timemap/cdx'}):
                     options['deadline'] = time.monotonic() + self.cdx_response_seconds
                 response = backend.request(url, headers, max_bytes, stop_event, **options)
-                self._backend_reachable(turn)
+                if _backend_controls.get().on_headers is not None:
+                    self._backend_reachable(turn)
                 return response
             except RedirectPolicyError:
                 self._backend_result(turn, True)  # successful response, policy refused redirect
@@ -1834,11 +1835,12 @@ class ResilientTransport:
             except Exception as exc:
                 failures.append((name, _response_error(exc)))
             finally:
+                had_headers = _backend_controls.get().response_status is not None
                 _backend_controls.reset(context)
             last_error = failures[-1][1]
             # A read/first-byte timeout does not establish a broken backend.
             pool_timeout = is_transport_pool_timeout(last_error)
-            self._backend_result(turn, None if pool_timeout or (is_transport_read_timeout(last_error)
+            self._backend_result(turn, None if had_headers or pool_timeout or (is_transport_read_timeout(last_error)
                 and not getattr(last_error, "response_started", False)) else not is_transport_connection_failure(last_error))
             if pool_timeout or getattr(last_error, "response_started", False) or isinstance(last_error, IncompleteRepresentationError):
                 break
@@ -1893,7 +1895,8 @@ class ResilientTransport:
                     )
                 else:
                     response = backend.download(url, headers, destination, max_bytes, stop_event, **kwargs)
-                self._backend_reachable(turn)
+                if _backend_controls.get().on_headers is not None:
+                    self._backend_reachable(turn)
                 if 200 <= response.status < 300:
                     replay_timeout()
                 return response
@@ -1918,6 +1921,7 @@ class ResilientTransport:
             except Exception as exc:
                 failures.append((name, _response_error(exc)))
             finally:
+                had_headers = _backend_controls.get().response_status is not None
                 _backend_controls.reset(context)
             partial_ready = bool(retain_partial and _partial_metadata_path(destination).is_file()
                                  and destination.is_file())
@@ -1931,7 +1935,7 @@ class ResilientTransport:
                 except ReplayTurnExpired as exc:
                     self._backend_result(turn, None)
                     raise exc from last_error
-            self._backend_result(turn, None if partial_ready or pool_timeout or (is_transport_read_timeout(last_error)
+            self._backend_result(turn, None if had_headers or partial_ready or pool_timeout or (is_transport_read_timeout(last_error)
                                      and not getattr(last_error, "response_started", False))
                                  else not is_transport_connection_failure(last_error))
             if partial_ready or pool_timeout or getattr(last_error, "response_started", False) or isinstance(last_error, IncompleteRepresentationError):

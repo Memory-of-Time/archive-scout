@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.1
+
+- Added standalone Fast URL discovery for large domain lists, with a live list of matching URLs and capture metadata.
+- Prepared main text acquisition queues in bounded windows so replay can start before staging the rest of the project.
+- Used the persisted retry schedule for due failures during acquisition and removed a duplicate backend recovery signal from late response bodies.
+
 ## v1.3.0 — large-project sustainability
 - Name new text and media saves from their original URLs with portable escaping, timestamps, capture IDs and stable hashes; retain legacy file/checkpoint recovery and verified media reuse without bulk renames.
 - Recover stalled, uncommitted automatic CDX queries through the existing parallel numbered-page pipeline, retaining date/filter/collapse scope, durable page ledgers and committed resume cursors.

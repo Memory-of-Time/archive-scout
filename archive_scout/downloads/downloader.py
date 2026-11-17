@@ -165,14 +165,14 @@ def prepare_download_rows(
     patterns,
     states: tuple[str, ...] = ("pending",),
     capture_ids: list[int] | None = None,
-) -> tuple[int, Iterator[sqlite3.Row]]:
-    """Build a disk-backed download queue and stream rows in bounded batches.
+    *, progressive: bool = False, stop_event: threading.Event | None = None,
+) -> tuple[int | None, Iterator[sqlite3.Row] | Iterator[tuple[list[sqlite3.Row], int]]]:
+    """Prepare a disk-backed queue, optionally one capture-ID window at a time.
 
-    Candidate IDs are stored in temporary SQLite tables. This avoids both the
-    project-sized Python lists used by older releases and SQLite's platform-
-    dependent parameter limit when a large retry selection is supplied.
+    The progressive iterator yields (candidate rows, routed count). Callers
+    must remove each claimed ID from the current staging window before refill.
     """
-    if not capture_ids:
+    if not capture_ids and not progressive:
         for signature in {cdx_query_signature(config.for_target(target)) for target in config.targets}:
             classify_indexed_captures(database, signature)
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_download_queue")
@@ -254,17 +254,20 @@ def prepare_download_rows(
             params.append(time.time())
             clauses.append("(c.state!='error' OR " + automatic_retry_allowed() + ")")
 
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    cursor = database.execute(
-        "SELECT c.id,c.original_url,c.mimetype,c.length FROM " + source + where + " ORDER BY c.id",
-        params,
-    )
+    where = " WHERE " + " AND ".join(clauses)
+    columns = "SELECT c.id,c.original_url,c.mimetype,c.length"
+    if progressive:
+        high_water = database.execute("SELECT COALESCE(MAX(id),0) FROM captures").fetchone()[0]
+        source = "captures c NOT INDEXED"
+        columns += ",r.capture_id AS classified"
+        source += " LEFT JOIN capture_routing r ON r.capture_id=c.id"
+    base_query = columns + " FROM " + source + where
     url_prefilter = compile_prefilter(patterns) if patterns else None
-    now = utc_now()
-    while True:
-        chunk = cursor.fetchmany(2000)
-        if not chunk:
-            break
+    def stage_chunk(chunk):
+        now = utc_now()
+        if stop_event is not None and stop_event.is_set():
+            raise Stopped
+        classifications = []
         selected_ids: list[tuple[int, int, int]] = []
         binary_ids: list[tuple[int, str, str]] = []
         keyword_skips: list[tuple[str, int]] = []
@@ -272,14 +275,17 @@ def prepare_download_rows(
         for row in chunk:
             capture_id = int(row["id"])
             if excluded_robots_filename(str(row["original_url"])):
+                if progressive and row["classified"] is None:
+                    decision = classify_indexed_resource(row["original_url"], row["mimetype"] or "")
+                    classifications.append((capture_id, decision.resource_class, decision.reason, int(decision.confident), now))
                 robots_ids.append((now, capture_id))
                 continue
             decision = classify_indexed_resource(row["original_url"], row["mimetype"] or "")
-            if decision.resource_class in {"image","video","audio","other_binary"} and decision.confident:
-                binary_ids.append((capture_id, decision.resource_class, decision.reason))
-                continue
-            if decision.resource_class == "media_descriptor" and decision.confident:
-                binary_ids.append((capture_id, decision.resource_class, decision.reason))
+            kind, evidence, confident = decision.resource_class, decision.reason, decision.confident
+            if progressive and row["classified"] is None:
+                classifications.append((capture_id, kind, evidence, int(confident), now))
+            if kind in {"image", "video", "audio", "other_binary", "media_descriptor"} and confident:
+                binary_ids.append((capture_id, kind, evidence))
                 continue
             if config.download_scope == "keyword_urls" and url_prefilter is not None:
                 original_url = str(row["original_url"])
@@ -293,6 +299,10 @@ def prepare_download_rows(
             length = max(0, int(row["length"] or 0))
             selected_ids.append((capture_id, 1 if length <= 0 else 0, length))
         with database:
+            if classifications:
+                database.executemany("""INSERT OR IGNORE INTO capture_routing
+                    (capture_id,resource_class,evidence,confident,routing,updated_at)
+                    VALUES(?,?,?,?,'pending',?)""", classifications)
             if robots_ids:
                 database.executemany(
                     "UPDATE captures SET state='skipped',updated_at=? WHERE id=?",
@@ -333,6 +343,45 @@ def prepare_download_rows(
                        WHERE capture_id=?""",
                     ((kind, evidence, now, capture_id) for capture_id, kind, evidence in binary_ids),
                 )
+        return len(selected_ids), len(robots_ids) + len(keyword_skips) + len(binary_ids)
+
+    if progressive:
+        database.commit()
+        if config.network.persistent_retries:
+            prepare_retry_queue(database, populate=False)
+            database.commit()
+
+        def windows():
+            cursor = 0
+            while cursor < high_water:
+                upper = min(high_water, cursor + 2000)
+                chunk = database.execute(base_query + " AND c.id>? AND c.id<=? ORDER BY c.id",
+                                         (*params, cursor, upper)).fetchall()
+                from ..scanning.pending import _sqlite_write_busy
+                while True:
+                    try:
+                        selected, skipped = stage_chunk(chunk)
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if not _sqlite_write_busy(exc):
+                            raise
+                        if stop_event is not None and stop_event.wait(0.1):
+                            raise Stopped
+                        if stop_event is None:
+                            raise
+                cursor = upper
+                rows = database.execute("""SELECT c.* FROM archive_scout_download_queue q
+                    CROSS JOIN captures c ON c.id=q.id
+                    ORDER BY CASE WHEN c.state='error' THEN 1 ELSE 0 END,q.priority,q.length,q.id""").fetchall()
+                if len(rows) != selected:
+                    raise RuntimeError("Text acquisition window does not match its staged queue")
+                yield rows, skipped
+
+        return None, windows()
+
+    cursor = database.execute(base_query + " ORDER BY c.id", params)
+    while chunk := cursor.fetchmany(2000):
+        stage_chunk(chunk)
     total = int(database.execute(
         "SELECT COUNT(*) FROM archive_scout_download_queue"
     ).fetchone()[0])
@@ -631,9 +680,19 @@ def download_archive(
     queue_started = time.monotonic()
     if callback and not capture_ids:
         callback(ProgressEvent("download_prepare", "Preparing disk-backed text acquisition queue; committed progress is retained."))
+    progressive = not capture_ids
     total, row_iter = prepare_download_rows(
-        database, config, combined_patterns, states=states, capture_ids=capture_ids
+        database, config, combined_patterns, states=states, capture_ids=capture_ids,
+        progressive=progressive, stop_event=stop_event,
     )
+    fresh_rows = deque()
+    if progressive:
+        total = 0
+        for rows, _skipped in row_iter:
+            if rows:
+                fresh_rows.extend(rows)
+                total = len(rows)
+                break
     progress_counts = _capture_progress_counts(database, config, capture_ids)
     cumulative_total = sum(progress_counts.values())
     retained = sum(progress_counts.get(state, 0) for state in ('downloaded','downloaded_unscanned'))
@@ -817,7 +876,7 @@ def download_archive(
             futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
 
             parked: deque[sqlite3.Row] = deque()
-            fresh_remaining = initial_queue_size
+            fresh_remaining = bool(initial_queue_size) if progressive else initial_queue_size
             dispatch_wait_seconds = 0.0
             dispatch_deferrals = 0
             idle_wait_started = None
@@ -868,9 +927,10 @@ def download_archive(
             diagnostics.watchdog.start()
     
             fresh_admitted = 0
+            retry_poll_at = 0.0
 
             def submit_available() -> None:
-                nonlocal fresh_admitted, fresh_remaining, total
+                nonlocal fresh_admitted, fresh_remaining, total, excluded, retry_poll_at
                 slots = max_inflight - len(futures)
                 if streamed and slots > 0:
                     slots = transport.dispatch_slots(client.host_gate.dispatch_slots(slots))
@@ -886,6 +946,16 @@ def download_archive(
                         try:
                             if stop_event.is_set():
                                 raise Stopped
+                            if progressive and fresh_remaining and not fresh_rows and not parked:
+                                with database_write_lock:
+                                    window = next(row_iter, None)
+                                if window is None:
+                                    fresh_remaining = False
+                                else:
+                                    candidates, skipped = window
+                                    fresh_rows.extend(candidates)
+                                    excluded += skipped
+                                    total += len(candidates)
                             with database_write_lock, database:
                                 database.execute("BEGIN IMMEDIATE")
                                 for _ in range(slots):
@@ -898,9 +968,12 @@ def download_archive(
                                     # Interleave one due retry after each bounded block of
                                     # fresh work. Read only indexed SQLite eligibility; do
                                     # not rebuild the complete acquisition queue or pool.
-                                    if config.network.persistent_retries and fresh_admitted >= 16 and not capture_ids:
-                                        retry_row = select_due_retry(database, time.time())
+                                    if (config.network.persistent_retries and fresh_admitted >= 16
+                                            and not capture_ids and time.monotonic() >= retry_poll_at):
+                                        retry_row = select_due_retry(database, time.time(), persistent=progressive)
                                         fresh_admitted = 0
+                                        if progressive and retry_row is None:
+                                            retry_poll_at = time.monotonic() + 2.0
                                     if retry_row is not None:
                                         if any(item["id"] == retry_row["id"] for item in rows):
                                             continue
@@ -909,12 +982,17 @@ def download_archive(
                                         continue
                                     if not fresh_remaining:
                                         break
-                                    try:
-                                        row = next(row_iter)
-                                    except StopIteration:
-                                        fresh_remaining = 0
-                                        break
-                                    fresh_remaining -= 1
+                                    if progressive:
+                                        if not fresh_rows:
+                                            break
+                                        row = fresh_rows.popleft()
+                                    else:
+                                        try:
+                                            row = next(row_iter)
+                                        except StopIteration:
+                                            fresh_remaining = 0
+                                            break
+                                        fresh_remaining -= 1
                                     fresh_admitted += 1
                                     rows.append(row)
                                 if rows:
@@ -976,6 +1054,10 @@ def download_archive(
                 if not futures and dispatch_suspended:
                     break
                 if not futures and (fresh_remaining or parked):
+                    if progressive and fresh_remaining and not fresh_rows and not parked and (
+                        not streamed or transport.dispatch_slots(client.host_gate.dispatch_slots(1))
+                    ):
+                        continue
                     if idle_wait_started is None:
                         idle_wait_started = time.monotonic()
                     if stop_event.wait(0.25):
@@ -1109,7 +1191,7 @@ def download_archive(
                                 getattr(exc,"status",429), True,
                                 max(config.network.retry_base_seconds, float(getattr(exc,"waited",0) or 0)),
                                 config.network.retry_max_seconds,
-                                not_before=time.time()+float(getattr(exc, "waited", 0) or 0))
+                                not_before=time.time()+float(getattr(exc, "waited", 0) or 0), stage_ready=not progressive)
                         if callback:
                             callback(ProgressEvent("rate_limit",
                                 "Wayback request turn reached its rate-limit wait budget; "
@@ -1198,7 +1280,8 @@ def download_archive(
                             else:
                                 record_failure(database, int(row["id"]), category, status, retryable,
                                                config.network.retry_base_seconds,
-                                               config.network.retry_max_seconds, max_bytes=config.max_file_bytes)
+                                               config.network.retry_max_seconds, max_bytes=config.max_file_bytes,
+                                               stage_ready=not progressive)
                             if should_surface_site_issue(category):
                                 record_site_issue(
                                     database,

@@ -771,7 +771,7 @@ def project_config_from_payload(payload: dict, path: Path) -> ProjectConfig:
     # The 2026 service-oriented default is 2.5 seconds between CDX starts.
     # Migrate only historical untouched 0.75-second defaults; an explicit
     # custom interval other than that historical default is preserved.
-    if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) not in {"1.2.6", "1.2.7", "1.2.8", VERSION}:
+    if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) not in {"1.2.6", "1.2.7", "1.2.8", "1.3.0", VERSION}:
         loaded_cdx_delay = 1.5
     # v1.0.3 shipped conservative replay defaults (4 workers, 0.5 s
     # between request starts). Upgrade only that untouched pair to the v1.0.4

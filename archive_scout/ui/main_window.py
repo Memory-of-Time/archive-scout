@@ -66,6 +66,7 @@ MODE_HELP = {
     "all": "Queries CDX, downloads pending text captures, scans only the keyword set marked Use in next scan, and writes reports.",
     "external_media_after_scan": "Indexes the site, downloads and scans all selected text pages, then indexes only external media URLs found in those saved pages and downloads them after discovery finishes.",
     "index": "Queries CDX and stores capture metadata without downloading pages.",
+    "discover_urls": "Searches Wayback URL metadata from a domain list. Results appear as they arrive. Limited and deferred domains are listed separately.",
     "download_only": "Indexes and saves text captures without scanning, keyword requirements or scan reports; optionally downloads supplemental media.",
     "retry_download_errors": "Retries unresolved text acquisition failures without creating scan jobs or scanning.",
     "download": "Downloads pending text captures and scans them with the keyword set marked Use in next scan.",
@@ -1968,10 +1969,17 @@ class ArchiveScoutApp(tk.Tk):
         try:
             ensure_frozen_bundle_available()
             selected_operation = override_mode or MODE_LABELS[self.mode_var.get()]
-            config = override_config or self.build_config(require_keywords=selected_operation not in {
-                "hitlist", "index", "download_only", "retry_download_errors", "media_all", "media_index", "media_download", "media_retry",
-                "backup", "integrity", "diagnostics", "repair", "report", "import_folder", "merge_project", "analysis", "research_index", "forum_rebuild",
-            })
+            if selected_operation == "discover_urls":
+                discovery = self.discovery_options()
+                if discovery is None:
+                    return
+                config = ProjectConfig(output_dir=discovery[1], targets=[], keywords=[])
+            else:
+                discovery = None
+                config = override_config or self.build_config(require_keywords=selected_operation not in {
+                    "hitlist", "index", "download_only", "retry_download_errors", "media_all", "media_index", "media_download", "media_retry",
+                    "backup", "integrity", "diagnostics", "repair", "report", "import_folder", "merge_project", "analysis", "research_index", "forum_rebuild",
+                })
         except (ValueError, FrozenBundleError) as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -1990,8 +1998,51 @@ class ArchiveScoutApp(tk.Tk):
         self.stop_button.configure(state="normal")
         self.log(f"Starting {mode} in {config.output_dir}")
         self.active_run_config = config
-        self.worker_thread = threading.Thread(target=self.run_worker, args=(config, mode), daemon=True)
+        target = self.run_discovery_worker if discovery else self.run_worker
+        self.worker_thread = threading.Thread(target=target, args=discovery or (config, mode), daemon=True)
         self.worker_thread.start()
+
+    def discovery_options(self):
+        previous = getattr(self, "_discovery_options", None)
+        source = filedialog.askopenfilename(parent=self, title="Select the domain list", filetypes=[("Text files", "*.txt"), ("All files", "*")])
+        if not source:
+            return None
+        pattern = simpledialog.askstring("Fast URL discovery", "Regex for the original URL",
+                                         initialvalue=previous[2] if previous else "", parent=self)
+        if pattern is None:
+            return None
+        dates = simpledialog.askstring("Capture dates", "Capture dates, separated by a comma",
+                                       initialvalue=",".join(previous[3:5]) if previous else "2001,2003", parent=self)
+        if dates is None:
+            return None
+        start, separator, end = dates.partition(",")
+        if not separator:
+            raise ValueError("Enter a start and end capture date separated by a comma.")
+        output = self.output_var.get().strip()
+        if not output:
+            raise ValueError("Select an output folder for discovery.")
+        result = (Path(source), Path(output).expanduser(), pattern, start, end)
+        self._discovery_options = result
+        return result
+
+    def run_discovery_worker(self, source, root, pattern, start, end):
+        from ..cdx.discovery import run_fast_discovery
+        from ..operations import OperationPaths
+        try:
+            paths, counts = run_fast_discovery(source, root / "reports" / "fast-url-discovery", pattern,
+                start, end, stop_event=self.stop_event, callback=self.on_engine_event)
+            message = (f"Discovery pass finished with {counts['matches']:,} matching URLs, "
+                       f"{counts.get('deferred', 0):,} deferred domains and "
+                       f"{counts.get('limited', 0):,} domains at the page limit.\n\n{paths['urls']}")
+            self.events.put(("complete", OperationPaths(paths, message=message)))
+        except Stopped:
+            self.events.put(("stopped", None))
+        except ConnectivityPaused as exc:
+            self.events.put(("deferred", str(exc)))
+        except (OSError, ValueError) as exc:
+            self.events.put(("error", str(exc)))
+        except Exception:
+            self.events.put(("error", traceback.format_exc()))
 
     def run_worker(self, config: ProjectConfig, mode: str) -> None:
         try:

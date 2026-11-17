@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 SCHEMA_VERSION = 12
 APP_NAME = "Archive Scout"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"
@@ -43,6 +43,7 @@ OPERATION_MODES = {
     "Index, download, scan, and report": "all",
     "Index, download, scan, then download external embedded media": "external_media_after_scan",
     "Index URLs only": "index",
+    "Fast URL discovery from a domain list": "discover_urls",
     "Index and download only (no scanning)": "download_only",
     "Retry failed downloads only (no scanning)": "retry_download_errors",
     "Download and scan pending URLs": "download",

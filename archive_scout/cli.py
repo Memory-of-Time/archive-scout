@@ -26,7 +26,7 @@ EXIT_DEFERRED = 3
 EXIT_INCOMPLETE = 4
 EXIT_INTERRUPTED = 130
 FORMATS = ("text", "json", "jsonl")
-COMMANDS = {"run", "status", "search", "results", "errors", "ai-review", "research", "research-index", "init"}
+COMMANDS = {"run", "status", "search", "results", "errors", "ai-review", "research", "research-index", "init", "discover-urls"}
 
 
 def _json_default(value: object):
@@ -187,6 +187,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project(run)
     run.add_argument("--mode", choices=sorted(SUPPORTED_MODES), default="all")
 
+    discover = sub.add_parser("discover-urls", help="Search the first filtered CDX page per domain")
+    discover.add_argument("domains", type=Path, help="UTF-8 text file with one domain per line")
+    discover.add_argument("--output-dir", type=Path, required=True)
+    discover.add_argument("--url-filter", required=True, help="Java regex on the original URL")
+    discover.add_argument("--from", dest="from_date", default="2001")
+    discover.add_argument("--to", dest="to_date", default="2003")
+    discover.add_argument("--requests-per-second", type=float, default=1.0)
+    discover.add_argument("--format", choices=FORMATS, default="text")
+
     status = sub.add_parser("status", help="Read project/queue status without modifying it")
     _add_project(status)
 
@@ -237,7 +246,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    config = _load(args.project)
+    discovery = getattr(args, "command", "run") == "discover-urls"
+    config = None if discovery else _load(args.project)
     stop_event = threading.Event()
     interrupted = False
     previous_handler = None
@@ -261,10 +271,25 @@ def _run_command(args: argparse.Namespace) -> int:
         # intentionally silent there; bots wanting streaming progress use jsonl.
 
     try:
-        paths = run_project(config, args.mode, stop_event, progress)
-        outcome = getattr(paths, "status", "complete")
-        result = {"status": outcome, "mode": args.mode,
+        if discovery:
+            from .cdx.discovery import run_fast_discovery
+            paths, counts = run_fast_discovery(
+                args.domains, args.output_dir, args.url_filter, args.from_date, args.to_date,
+                requests_per_second=args.requests_per_second, stop_event=stop_event, callback=progress,
+            )
+            outcome = "complete"
+            mode = "discover-urls"
+        else:
+            paths = run_project(config, args.mode, stop_event, progress)
+            outcome = getattr(paths, "status", "complete")
+            mode = args.mode
+        result = {"status": outcome, "mode": mode,
                   "paths": {key: str(value) for key, value in paths.items()}}
+        if discovery:
+            result["coverage"] = counts
+            result["message"] = (f"Discovery pass finished with {counts['matches']:,} matching URLs, "
+                                 f"{counts.get('deferred', 0):,} deferred domains and "
+                                 f"{counts.get('limited', 0):,} domains at the page limit.")
         if getattr(paths, 'message', '') or outcome != "complete":
             result["message"] = getattr(paths, "message", "Unfinished work retained")
         if args.format == "jsonl":
@@ -348,7 +373,7 @@ def cli_main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-        if args.command == "run":
+        if args.command in {"run", "discover-urls"}:
             return _run_command(args)
         if args.command == "init":
             project_path = args.project.expanduser().absolute()

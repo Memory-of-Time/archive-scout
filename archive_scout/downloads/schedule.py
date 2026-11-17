@@ -54,7 +54,7 @@ def restore_increased_size_limit(database, config):
 def record_failure(database: sqlite3.Connection, capture_id: int, category: str,
                    status: int | None, retryable: bool, base_seconds: float,
                    max_seconds: float, *, max_bytes: int | None = None,
-                   not_before: float = 0.0) -> None:
+                   not_before: float = 0.0, stage_ready: bool = True) -> None:
     routing = ('failed' if retryable else
                f'failed_size_limit:{int(max_bytes)}' if category=='oversized_response' and max_bytes is not None
                else f'failed_nonretryable:{category}')
@@ -83,7 +83,7 @@ def record_failure(database: sqlite3.Connection, capture_id: int, category: str,
         failure_count=excluded.failure_count,last_category=excluded.last_category,
         last_status=excluded.last_status,updated_at=excluded.updated_at""",
         (capture_id, max(time.time()+delay, not_before), count, category, status, utc_now()))
-    if _retry_queue_exists(database):
+    if stage_ready and _retry_queue_exists(database):
         database.execute('''INSERT OR REPLACE INTO archive_scout_ready_retries
             SELECT capture_id,next_eligible_at FROM text_retry_schedule WHERE capture_id=?''', (capture_id,))
 
@@ -109,7 +109,7 @@ _ACTIVE_RETRY = automatic_retry_allowed() + ''' AND EXISTS (SELECT 1 FROM errors
         WHERE m.capture_id=c.id AND m.target_id=t.id))'''
 
 
-def prepare_retry_queue(database):
+def prepare_retry_queue(database, *, populate=True):
     """Materialize active, nonqueued retry identities once per acquisition batch.
 
     Persistent schedules are authoritative and never deleted to filter a scope.
@@ -120,6 +120,8 @@ def prepare_retry_queue(database):
     database.execute('''CREATE INDEX IF NOT EXISTS archive_scout_ready_retries_due
         ON archive_scout_ready_retries(next_eligible_at,capture_id)''')
     database.execute('DELETE FROM archive_scout_ready_retries')
+    if not populate:
+        return
     database.execute('''INSERT INTO archive_scout_ready_retries
         SELECT sched.capture_id,sched.next_eligible_at FROM text_retry_schedule sched
         CROSS JOIN captures c ON c.id=sched.capture_id
@@ -127,7 +129,13 @@ def prepare_retry_queue(database):
           (SELECT 1 FROM archive_scout_download_queue q WHERE q.id=c.id) AND ''' + _ACTIVE_RETRY)
 
 
-def select_due_retry(database, now):
+def select_due_retry(database, now, *, persistent=False):
+    if persistent:
+        return database.execute("""SELECT c.* FROM text_retry_schedule s INDEXED BY text_retry_due_idx
+            CROSS JOIN captures c ON c.id=s.capture_id WHERE s.next_eligible_at<=?
+            AND c.state='error' AND NOT EXISTS (
+                SELECT 1 FROM archive_scout_download_queue q WHERE q.id=c.id)
+            AND """ + _ACTIVE_RETRY + " ORDER BY s.next_eligible_at,s.capture_id LIMIT 1", (now,)).fetchone()
     if not _retry_queue_exists(database):
         prepare_retry_queue(database)
     while True:

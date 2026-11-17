@@ -849,6 +849,7 @@ def run_project(
         # raw bodies after an interrupted SQLite/FTS commit before network work.
         if mode in {"all", "resume", "download", "external_media_after_scan", "rescan"}:
             from .scanning.pending import adopt_orphaned_bodies
+            emit(callback, ProgressEvent("resume_local", "Checking interrupted saves for recoverable local files."))
             for target in config.targets:
                 adopt_orphaned_bodies(database, config.for_target(target), stop_event, callback, target=target)
 
@@ -859,6 +860,7 @@ def run_project(
             "SELECT 1 FROM captures WHERE state IN ('downloaded','downloaded_unscanned') LIMIT 1"
         ).fetchone():
             jobs = prepare_scan_jobs(database, config, mode)
+            emit(callback, ProgressEvent("resume_local", "Checking saved files for outstanding local scans."))
             scan_prior_documents_once(database, jobs, config, stop_event, callback)
             from .scanning.pending import scan_pending_saved
             for target in config.targets:
