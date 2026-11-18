@@ -1322,9 +1322,13 @@ def index_archive(
     transient_failure_streak = 0
     # A target gets bounded work turns. Stalled queries retain their exact
     # durable state, but may no longer monopolize the operation for hours.
-    max_page = max((int(item.get("page_size") or config.page_size)
-                    for item in config.target_settings.values()), default=config.page_size)
-    body_budget = cdx_response_budget(max(config.page_size, max_page))
+    max_page = config.page_size
+    if config.target_settings:
+        for target in config.targets:
+            override = config.target_settings.get(target, {}).get("page_size")
+            if override is not None:
+                max_page = max(max_page, min(150000, int(override)))
+    body_budget = cdx_response_budget(max_page)
     workers = memory_limited_page_workers(min(4, len(config.targets), config.network.cdx_workers),
         body_budget + body_budget // 2, config.network.cdx_memory_budget_mb)
     if config.skip_slow_index_targets or config.text_collapse_scope == "year":
@@ -1674,7 +1678,7 @@ def index_archive(
                                        ON CONFLICT(query_signature,target_id,window_start,window_end,layout_signature,page) DO UPDATE SET
                                        row_count=excluded.row_count,status='complete',layout_signature=excluded.layout_signature,updated_at=excluded.updated_at""",
                                     (signature, target_id, current.start, current.end, int(result.page), page_received,
-                                     cdx_layout_signature(target_config, current.start, current.end, 'paged', current.page_blocks), utc_now()),
+                                     ledger_key[-1], utc_now()),
                                 )
                                 database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE index_scope=? AND resolved=0",
                                     (utc_now(), page_error_prefix + str(result.page)))

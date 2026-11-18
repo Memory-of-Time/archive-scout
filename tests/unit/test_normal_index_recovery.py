@@ -309,3 +309,10 @@ class NormalInventoryTests(unittest.TestCase):
             self.assertFalse(index_archive(self.cfg, self.db, threading.Event()))
         self.assertEqual(calls, [("20020101000000", "saved"), (self.cfg.from_date, None)])
         self.assertEqual(self.db.execute("SELECT complete FROM index_coverage").fetchone()[0], 1)
+
+
+    def test_unselected_target_override_does_not_affect_selected_workers(self):
+        cfg = replace(self.cfg, target_settings={"unused.test/*": {"page_size": "not-a-number"}})
+        with patch.object(HttpClient, "get_cdx_any", return_value=CDXRows([])) as request:
+            self.assertFalse(index_archive(cfg, self.db, threading.Event()))
+        self.assertEqual(request.call_count, 1)
