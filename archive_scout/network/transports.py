@@ -978,8 +978,15 @@ class _TimedSocketFile(io.RawIOBase):
         return True
 
     def readinto(self, buffer):
-        self.socket.settimeout(replay_timeout(self.timeout))
-        return self.raw.readinto(buffer)
+        remaining = replay_timeout()
+        deadline_limited = remaining is not None and (self.timeout is None or remaining <= self.timeout)
+        self.socket.settimeout(remaining if deadline_limited else self.timeout)
+        try:
+            return self.raw.readinto(buffer)
+        except TimeoutError as exc:
+            if deadline_limited:
+                raise ReplayTurnExpired("text replay exceeded its active deadline; capture remains retryable") from exc
+            raise
 
     def close(self):
         try:

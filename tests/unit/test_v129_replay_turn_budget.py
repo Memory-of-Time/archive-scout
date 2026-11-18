@@ -29,7 +29,7 @@ from archive_scout.downloads.rate_limit import (
 from archive_scout.downloads.validation import classify_exception
 from archive_scout.events import Stopped
 from archive_scout.network.replay_turn import ReplayTurn, ReplayTurnExpired, replay_turn
-from archive_scout.network.transports import _TimedNetworkStream
+from archive_scout.network.transports import _TimedNetworkStream, _TimedSocketFile
 from archive_scout.operations import run_project
 
 
@@ -144,6 +144,22 @@ class ReplayTurnBudgetTests(unittest.TestCase):
     def redirect_fixture(self):
         return patch("archive_scout.downloads.downloader.replay_url",
                      side_effect=lambda _time, original: self.url(original.split("example.test", 1)[1]))
+
+    def test_urllib3_socket_timeout_preserves_the_limiting_deadline(self):
+        for socket_timeout, expected in ((30, ReplayTurnExpired), (1, TimeoutError)):
+            with self.subTest(socket_timeout=socket_timeout):
+                sock = Mock()
+                sock.gettimeout.return_value = socket_timeout
+                failure = TimeoutError("socket timer fired before the replay clock expired")
+                sock.makefile.return_value.readinto.side_effect = failure
+                turn = ReplayTurn(10)
+                turn.start()
+                token = replay_turn.set(turn)
+                try:
+                    with _TimedSocketFile(sock) as reader, self.assertRaises(expected):
+                        reader.readinto(bytearray(16))
+                finally:
+                    replay_turn.reset(token)
 
     def test_active_budget_interrupts_header_and_body_trickle(self):
         backends = ["httpx", "urllib3"]
