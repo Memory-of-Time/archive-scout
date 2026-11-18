@@ -39,15 +39,10 @@ def media_unavailable_count(database, config):
 def text_outcome_counts(database, config):
     from .downloader import _populate_download_scopes
     _populate_download_scopes(database, config)
-    row = database.execute("""SELECT
+    from ..database.scope import scope_membership_predicate
+    scope = scope_membership_predicate("archive_scout_download_scopes")
+    row = database.execute(f"""SELECT
         COALESCE(SUM(c.state IN ('pending','downloading','error')),0),
-        COALESCE(SUM(CASE WHEN c.state='error' THEN """ + text_unavailable() + """ ELSE 0 END),0)
-        FROM captures c WHERE EXISTS(
-            SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-              ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-            WHERE t.id=c.target_id)
-        OR EXISTS(SELECT 1 FROM capture_target_membership m JOIN targets t ON t.id=m.target_id
-            JOIN archive_scout_download_scopes s
-              ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-            WHERE m.capture_id=c.id)""").fetchone()
+        COALESCE(SUM(CASE WHEN c.state='error' THEN {text_unavailable()} ELSE 0 END),0)
+        FROM captures c WHERE {scope}""").fetchone()
     return {'unfinished': int(row[0]) - int(row[1]), 'unavailable': int(row[1])}

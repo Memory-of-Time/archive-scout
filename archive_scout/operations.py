@@ -408,7 +408,8 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
 
 
 def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000,
-                           include_exhausted_pending: bool = False, respect_selection: bool = False, automatic: bool = False):
+                           include_exhausted_pending: bool = False, respect_selection: bool = False,
+                           automatic: bool = False, categories=()):
     """Yield each eligible capture at most once per pass, without an ID-sized list."""
     # Reuse a bounded, disk-backed scope table so target-specific CDX overrides
     # are not silently filtered out by the global signature on retry.
@@ -418,11 +419,18 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
     database.execute("DELETE FROM archive_scout_retry_scopes")
     database.executemany(
         "INSERT OR IGNORE INTO archive_scout_retry_scopes VALUES(?,?,?,?)",
-        ((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
-         for target in config.targets for scoped in [config.for_target(target)]),
+        ((target, signature, scoped.from_date, scoped.to_date)
+         for target, scoped, signature in index_scopes(config)),
     )
+    from .database.scope import scope_membership_predicate
     from .downloads.schedule import retry_selection, explicit_error_predicate, automatic_retry_allowed, explicit_recheck_requested, selected_retry_allowed
     selection, selected_params = retry_selection(database, config) if respect_selection else ("", [])
+    if categories:
+        fields = ",".join("?" for _ in categories)
+        selection += f""" AND EXISTS(SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=c.id
+            AND s.last_category IN ({fields}))"""
+        selected_params.extend(sorted(categories))
+    scope = scope_membership_predicate("archive_scout_retry_scopes")
     manual = not automatic and respect_selection and explicit_recheck_requested(config)
     error_predicate = explicit_error_predicate(config) if manual else 'e.retryable=1'
     latest_decision = ' AND '+(selected_retry_allowed() if manual else automatic_retry_allowed())
@@ -430,7 +438,7 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
     source = ("""(
         SELECT capture_id FROM text_retry_schedule WHERE next_eligible_at<=?
         UNION SELECT e.capture_id FROM errors e WHERE e.resolved=0 AND e.ignored=0
-          AND e.retryable=1 AND e.capture_id IS NOT NULL
+          AND e.operation='download' AND e.retryable=1 AND e.capture_id IS NOT NULL
           AND NOT EXISTS(SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=e.capture_id))
         candidates CROSS JOIN captures c ON c.id=candidates.capture_id"""
         if automatic else 'captures c')
@@ -441,14 +449,10 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         exhausted = " OR (c.state='pending' AND c.download_attempts>=?)" if include_exhausted_pending else ""
         rows = database.execute(
             "SELECT c.id FROM " + source + """
-               WHERE c.id>? AND EXISTS (SELECT 1 FROM targets t
-                  JOIN archive_scout_retry_scopes s ON s.pattern=t.pattern
-                   AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-                   WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-                     WHERE m.capture_id=c.id AND m.target_id=t.id))
+               WHERE c.id>? AND """ + scope + """
                AND ((c.state='error' AND EXISTS (
                    SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                   AND e.resolved=0 AND e.ignored=0 AND """ + error_predicate + """)
+                   AND e.operation='download' AND e.resolved=0 AND e.ignored=0 AND """ + error_predicate + """)
                    AND (NOT EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id)
                         OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
                                    AND sched.next_eligible_at<=?)))"""
@@ -484,15 +488,17 @@ def recover_transient_text_errors(
     acquire_only: bool = False,
     respect_selection: bool = False,
 ) -> int:
-    """Fair recovery sweeps with a per-operation no-progress limit.
+    """Run fair retry sweeps, then slow automatic recovery for network and service outages.
 
-    Retry eligibility and all evidence remain durable after the limit. A long
-    productive run resets the budget; an unresponsive tail yields to reports.
+    Repeated integrity failures retain their original schedule for a later Resume.
     """
     # Every selected failure receives a complete fair sweep. Project size and
     # saved eligibility delays must not exhaust a URL's attempts before it runs.
     budget = NoProgressBudget(config)
+    network_failures = ("connection", "connect_timeout", "rate_limit", "http_server_error")
+    slow_recovery = False
     from .downloads.rate_limit import shared_host_gate
+    from .downloads.schedule import next_due
     host_gate = (shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
                  if config.rate_limit_max_wait > 0 else None)
     while True:
@@ -505,7 +511,9 @@ def recover_transient_text_errors(
             return 1
         attempted = 0
         made_progress = False
-        for ids in _retryable_text_batches(config, database, respect_selection=respect_selection, automatic=True):
+        categories = network_failures if slow_recovery else ()
+        for ids in _retryable_text_batches(config, database, respect_selection=respect_selection,
+                                           automatic=True, categories=categories):
             if stop_event.is_set():
                 raise Stopped
             attempted += len(ids)
@@ -520,11 +528,11 @@ def recover_transient_text_errors(
                 made_progress = True
         if made_progress:
             budget.progress()
+            slow_recovery = False
         elif attempted:
             budget.attempted()
         remaining = next(_retryable_text_batches(config, database, batch_size=1,
                                                 respect_selection=respect_selection, automatic=True), [])
-        from .downloads.schedule import next_due
         earliest = next_due(database, config, respect_selection=respect_selection)
         if not remaining and earliest is None:
             return 0
@@ -535,22 +543,25 @@ def recover_transient_text_errors(
             for target in config.targets:
                 scan_pending_saved(database, config.for_target(target), jobs,
                                    stop_event, callback, workers=config.workers)
-        # Waiting on a previously saved long cooldown is bounded too, without
-        # consuming an attempt or overriding its persistent due time.
         budget.waiting()
-        if budget.exhausted:
-            emit(callback, ProgressEvent("download_incomplete", incomplete_retry_message("Text recovery"),
-                                         detail={"retain_notice": True}))
-            return 1
-        requested = max(0.05, earliest-time.time()) if earliest is not None else config.network.retry_base_seconds
-        if requested > budget.wait_seconds(requested):
-            emit(callback, ProgressEvent('download_incomplete', incomplete_retry_message('Text cooldown'),
-                                         detail={'retain_notice':True}))
-            return 1
-        pause = budget.wait_seconds(min(config.network.retry_max_seconds, requested))
-        emit(callback, ProgressEvent("download_retry",
-            f"Transient errors remain checkpointed; next recovery turn in {pause:.1f}s. "
-            f"No-progress budget {budget.attempts}/{budget.limit}; local scanning remains independent."))
+        requested = max(0.05, earliest - time.time()) if earliest is not None else config.network.retry_base_seconds
+        if slow_recovery or budget.exhausted or requested > budget.wait_seconds(requested):
+            service_due = next_due(database, config, respect_selection=respect_selection, categories=network_failures)
+            if service_due is None or (config.rate_limit_max_wait > 0 and
+                    service_due - time.time() > config.rate_limit_max_wait):
+                emit(callback, ProgressEvent("download_incomplete", incomplete_retry_message("Text recovery"),
+                                             detail={"retain_notice": True}))
+                return 1
+            slow_recovery = True
+            minimum = min(30.0, config.network.retry_max_seconds)
+            pause = min(config.network.retry_max_seconds, max(minimum, service_due - time.time()))
+            emit(callback, ProgressEvent("download_retry",
+                f"Network failures remain checkpointed. The next automatic recovery check is in {pause:.1f}s."))
+        else:
+            pause = budget.wait_seconds(min(config.network.retry_max_seconds, requested))
+            emit(callback, ProgressEvent("download_retry",
+                f"Transient errors remain checkpointed. Next recovery turn in {pause:.1f}s. "
+                f"No-progress budget {budget.attempts}/{budget.limit}. Local scanning can continue."))
         if stop_event.wait(pause):
             raise Stopped
 

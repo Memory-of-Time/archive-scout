@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 from collections import deque
+from contextlib import nullcontext
+from functools import lru_cache
 import json
 import hashlib
 import errno
@@ -17,6 +19,7 @@ from typing import Callable, Iterator
 from ..cdx.client import HttpClient, RateLimitDeferred
 from ..cdx.parameters import cdx_query_signature, index_scopes
 from ..database.classification import classify_indexed_captures
+from ..database.scope import scope_membership_predicate
 from ..classification import classify_indexed_resource, classify_payload_kind
 from ..config import ProjectConfig
 from ..constants import REPLAY_URL
@@ -133,9 +136,10 @@ def _restore_changed_url_filter_skips(database: sqlite3.Connection, config: Proj
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES(?,?)", (key,digest))
 
 
-def _capture_progress_counts(database, config, capture_ids=None) -> dict[str, int]:
+def _capture_progress_counts(database, config, capture_ids=None, *, prepared_scope=False) -> dict[str, int]:
     """One inventory aggregation per batch, never a history scan per save."""
-    _populate_download_scopes(database, config)
+    if not prepared_scope:
+        _populate_download_scopes(database, config)
     source = "captures c"
     if capture_ids:
         database.execute("CREATE TEMP TABLE IF NOT EXISTS archive_scout_progress_selection(id INTEGER PRIMARY KEY) WITHOUT ROWID")
@@ -144,11 +148,8 @@ def _capture_progress_counts(database, config, capture_ids=None) -> dict[str, in
                              ((int(value),) for value in capture_ids))
         # Drive explicit retries from selected IDs, not the entire history.
         source = "archive_scout_progress_selection p CROSS JOIN captures c ON c.id=p.id"
-    rows = database.execute("SELECT c.state,COUNT(*) FROM " + source + """ WHERE EXISTS (
-        SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-        ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-        WHERE t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
-            WHERE m.capture_id=c.id AND m.target_id=t.id)) GROUP BY c.state""")
+    scope = scope_membership_predicate("archive_scout_download_scopes")
+    rows = database.execute(f"SELECT c.state,COUNT(*) FROM {source} WHERE {scope} GROUP BY c.state")
     return {str(row[0]): int(row[1]) for row in rows}
 
 
@@ -165,7 +166,7 @@ def prepare_download_rows(
     patterns,
     states: tuple[str, ...] = ("pending",),
     capture_ids: list[int] | None = None,
-    *, progressive: bool = False, stop_event: threading.Event | None = None,
+    *, progressive: bool = False, stop_event: threading.Event | None = None, write_lock=None,
 ) -> tuple[int | None, Iterator[sqlite3.Row] | Iterator[tuple[list[sqlite3.Row], int]]]:
     """Prepare a disk-backed queue, optionally one capture-ID window at a time.
 
@@ -190,7 +191,7 @@ def prepare_download_rows(
     _populate_download_scopes(database, config)
     if not capture_ids:
         _restore_changed_url_filter_skips(database, config)
-        restore_increased_size_limit(database, config)
+        restore_increased_size_limit(database, config, prepared_scope=True)
     if not capture_ids:
         # Earlier releases stored redirect-policy refusals as nonretryable errors.
         # Recheck only exclusions whose meaning changed under the current policy;
@@ -233,11 +234,7 @@ def prepare_download_rows(
             ((int(value),) for value in capture_ids),
         )
         source = "archive_scout_capture_selection selected CROSS JOIN captures c ON c.id=selected.id"
-    clauses.extend(["""EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-            ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-            WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-                WHERE m.capture_id=c.id AND m.target_id=t.id))""",
-            "1=1"])
+    clauses.append(scope_membership_predicate("archive_scout_download_scopes"))
     # Explicit selections obey the same active scope as normal acquisition.
     if states:
         clauses.append("c.state IN (" + ",".join("?" for _ in states) + ")")
@@ -263,6 +260,22 @@ def prepare_download_rows(
         source += " LEFT JOIN capture_routing r ON r.capture_id=c.id"
     base_query = columns + " FROM " + source + where
     url_prefilter = compile_prefilter(patterns) if patterns else None
+    active_url_filter = config.download_scope == "keyword_urls" and url_prefilter is not None
+
+    def routing(url, mimetype):
+        robots = excluded_robots_filename(url)
+        decision = classify_indexed_resource(url, mimetype)
+        binary = decision.confident and decision.resource_class in {
+            "image", "video", "audio", "other_binary", "media_descriptor",
+        }
+        eligible = True
+        if active_url_filter and not robots and not binary:
+            eligible = url_prefilter.has_positive_rules and url_prefilter.matches(
+                {"url": url}, {"url": normalize_search(url)})
+        return robots, decision, binary, eligible
+
+    cached_routing = lru_cache(maxsize=1024)(routing)
+
     def stage_chunk(chunk):
         now = utc_now()
         if stop_event is not None and stop_event.is_set():
@@ -274,31 +287,24 @@ def prepare_download_rows(
         robots_ids: list[tuple[str, int]] = []
         for row in chunk:
             capture_id = int(row["id"])
-            if excluded_robots_filename(str(row["original_url"])):
-                if progressive and row["classified"] is None:
-                    decision = classify_indexed_resource(row["original_url"], row["mimetype"] or "")
-                    classifications.append((capture_id, decision.resource_class, decision.reason, int(decision.confident), now))
-                robots_ids.append((now, capture_id))
-                continue
-            decision = classify_indexed_resource(row["original_url"], row["mimetype"] or "")
+            url, mimetype = row["original_url"], row["mimetype"] or ""
+            plan_route = cached_routing if len(url) <= 2048 and len(mimetype) <= 128 else routing
+            robots, decision, binary, eligible = plan_route(url, mimetype)
             kind, evidence, confident = decision.resource_class, decision.reason, decision.confident
             if progressive and row["classified"] is None:
                 classifications.append((capture_id, kind, evidence, int(confident), now))
-            if kind in {"image", "video", "audio", "other_binary", "media_descriptor"} and confident:
+            if robots:
+                robots_ids.append((now, capture_id))
+                continue
+            if binary:
                 binary_ids.append((capture_id, kind, evidence))
                 continue
-            if config.download_scope == "keyword_urls" and url_prefilter is not None:
-                original_url = str(row["original_url"])
-                normalized_url = normalize_search(original_url)
-                if (
-                    not url_prefilter.has_positive_rules
-                    or not url_prefilter.matches({"url": original_url}, {"url": normalized_url})
-                ):
-                    keyword_skips.append((now, capture_id))
-                    continue
+            if not eligible:
+                keyword_skips.append((now, capture_id))
+                continue
             length = max(0, int(row["length"] or 0))
             selected_ids.append((capture_id, 1 if length <= 0 else 0, length))
-        with database:
+        with (write_lock if write_lock is not None else nullcontext()), database:
             if classifications:
                 database.executemany("""INSERT OR IGNORE INTO capture_routing
                     (capture_id,resource_class,evidence,confident,routing,updated_at)
@@ -680,10 +686,11 @@ def download_archive(
     queue_started = time.monotonic()
     if callback and not capture_ids:
         callback(ProgressEvent("download_prepare", "Preparing disk-backed text acquisition queue; committed progress is retained."))
+    database_write_lock = threading.Lock()
     progressive = not capture_ids
     total, row_iter = prepare_download_rows(
         database, config, combined_patterns, states=states, capture_ids=capture_ids,
-        progressive=progressive, stop_event=stop_event,
+        progressive=progressive, stop_event=stop_event, write_lock=database_write_lock,
     )
     fresh_rows = deque()
     if progressive:
@@ -693,7 +700,7 @@ def download_archive(
                 fresh_rows.extend(rows)
                 total = len(rows)
                 break
-    progress_counts = _capture_progress_counts(database, config, capture_ids)
+    progress_counts = _capture_progress_counts(database, config, capture_ids, prepared_scope=True)
     cumulative_total = sum(progress_counts.values())
     retained = sum(progress_counts.get(state, 0) for state in ('downloaded','downloaded_unscanned'))
     excluded = progress_counts.get('skipped', 0)
@@ -770,7 +777,6 @@ def download_archive(
     # SQLite WAL allows concurrent readers, but only one writer.  Guard the
     # two owner threads' short write transactions; a busy scanner must not
     # abort a multi-day acquisition or force another network retrieval.
-    database_write_lock = threading.Lock()
     scanner_wakeup = threading.Event()
     scanner_finish = threading.Event()
     scanner_failures: list[BaseException] = []
@@ -867,7 +873,6 @@ def download_archive(
     max_inflight = max(config.workers, config.workers * 2)
     last_completion = time.monotonic()
     last_stall_message = time.monotonic()
-    from contextlib import nullcontext
     from .session import AcquisitionExecutor
     try:
         executor, owns_executor = acquisition_client(('text_workers', id(database), config.workers),
@@ -947,8 +952,7 @@ def download_archive(
                             if stop_event.is_set():
                                 raise Stopped
                             if progressive and fresh_remaining and not fresh_rows and not parked:
-                                with database_write_lock:
-                                    window = next(row_iter, None)
+                                window = next(row_iter, None)
                                 if window is None:
                                     fresh_remaining = False
                                 else:

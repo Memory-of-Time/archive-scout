@@ -291,6 +291,8 @@ class HttpClient:
         return True
 
     def _received_headers(self, permit, status):
+        if replay_turn.get() is not None and isinstance(self.host_gate, SharedHostGate):
+            self.host_gate.note_service_response(permit, status)
         if status in {429, 503} or 300 <= status < 400:
             return
         self.host_gate.finish_request(permit, recovered=True)
@@ -543,11 +545,17 @@ class HttpClient:
                         )
                 status = int(response.status)
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
-                if status in {429, 503}:
-                    self._discard_untracked_partial(destination)
-                    retry_after = parse_retry_after(retry_after_header)
-                    rate_attempt += 1
+                retry_after = parse_retry_after(retry_after_header)
+                if turn is not None and isinstance(self.host_gate, SharedHostGate) and not isinstance(self.transport, ResilientTransport):
+                    self.host_gate.note_service_response(permit, status)
+                wait_seconds = 0.0
+                if status == 429 or (status == 503 and (retry_after is not None or turn is None)):
                     wait_seconds = self.host_gate.pause_for_rate_limit(retry_after, f"HTTP {status}")
+                elif status == 503 and isinstance(self.host_gate, SharedHostGate):
+                    wait_seconds = self.host_gate.replay_service_unavailable(permit, url)
+                if wait_seconds > 0:
+                    self._discard_untracked_partial(destination)
+                    rate_attempt += 1
                     self._observe_response(response, url, turn_started-gate_started,
                                            time.monotonic()-turn_started, wait_seconds)
                     total_rate_wait += wait_seconds
@@ -580,7 +588,7 @@ class HttpClient:
                             f"HTTP {status} after {self.retries} attempts: {url}",
                             status=status, splittable=False,
                         )
-                    self.retry_wait(generic_attempt - 1, f"HTTP {status}", parse_retry_after(retry_after_header))
+                    self.retry_wait(generic_attempt - 1, f"HTTP {status}", retry_after)
                     continue
 
                 return {

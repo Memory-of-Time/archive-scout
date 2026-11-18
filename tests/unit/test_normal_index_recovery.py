@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -271,7 +272,7 @@ class NormalInventoryTests(unittest.TestCase):
         self.db = open_database(self.root)
         backups = list((self.root / "backups").glob("*before_schema_13*.sqlite3"))
         self.assertEqual(len(backups), 1)
-        with sqlite3.connect(backups[0]) as saved:
+        with closing(sqlite3.connect(backups[0])) as saved:
             self.assertEqual(saved.execute("SELECT version FROM schema_info").fetchone()[0], 12)
             self.assertEqual(saved.execute("SELECT SUM(complete) FROM index_coverage").fetchone()[0], 3)
         self.assertEqual(self.db.execute("SELECT SUM(complete) FROM index_coverage").fetchone()[0], 1)

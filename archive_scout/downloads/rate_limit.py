@@ -108,6 +108,7 @@ class SharedHostGate:
         self.probe_inflight = False
         self.waiting_workers = 0
         self.connection_failures: dict[str, float] = {}
+        self.replay_unavailable: dict[str, float] = {}
         self.last_reachable = time.monotonic()
 
     def connection_success(self) -> None:
@@ -131,6 +132,27 @@ class SharedHostGate:
             self.connection_failures.clear()
         self.pause_for_rate_limit(retry_after=pause_seconds, reason="host connection failure")
         return True
+
+    def note_service_response(self, permit: HostPermit, status: int) -> None:
+        if not 200 <= status < 300:
+            return
+        with self.condition:
+            if permit.generation == self.generation:
+                self.replay_unavailable.clear()
+
+    def replay_service_unavailable(self, permit: HostPermit, url: str) -> float:
+        """Escalate clustered bare 503s only when distinct captures fail together."""
+        now = time.monotonic()
+        with self.condition:
+            if permit.generation != self.generation:
+                return 0.0
+            self.replay_unavailable = {key: seen for key, seen in self.replay_unavailable.items()
+                                       if now - seen <= 10.0}
+            self.replay_unavailable[url] = now
+            if not permit.probe and len(self.replay_unavailable) < 3:
+                return 0.0
+            self.replay_unavailable.clear()
+            return self.pause_for_rate_limit(reason="HTTP 503 across replay requests")
 
     def snapshot(self) -> dict[str, object]:
         """Cheap in-memory stall diagnostics; called only during a stall."""

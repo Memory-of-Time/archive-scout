@@ -1816,7 +1816,7 @@ class ResilientTransport:
                         {'/cdx/search/cdx', '/web/timemap/json', '/web/timemap/cdx'}):
                     options['deadline'] = time.monotonic() + self.cdx_response_seconds
                 response = backend.request(url, headers, max_bytes, stop_event, **options)
-                if _backend_controls.get().on_headers is not None:
+                if _backend_controls.get().response_status is None:
                     self._backend_reachable(turn)
                 return response
             except RedirectPolicyError:
@@ -1902,7 +1902,7 @@ class ResilientTransport:
                     )
                 else:
                     response = backend.download(url, headers, destination, max_bytes, stop_event, **kwargs)
-                if _backend_controls.get().on_headers is not None:
+                if _backend_controls.get().response_status is None:
                     self._backend_reachable(turn)
                 if 200 <= response.status < 300:
                     replay_timeout()
