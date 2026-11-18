@@ -1241,7 +1241,7 @@ class ArchiveScoutApp(tk.Tk):
             ttk.Entry(recovery, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
         ttk.Checkbutton(recovery, text="Experimental: coordinate recovery after confirmed host connection failures", variable=self.network_connection_gate_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 2))
-        ttk.Label(recovery, text="Recovery retries automatically within a bounded no-progress budget. If no progress is possible, reports are saved with an incomplete result; Resume retries retained work. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(recovery, text="Scout keeps retrying connection and service failures while automatic recovery is on. Repeated validation failures stay incomplete for Resume. Scout honors server Retry-After within the configured wait policy.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         redirects = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
         redirects.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=8)

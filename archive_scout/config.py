@@ -607,12 +607,21 @@ class ProjectConfig:
 
     def for_target(self, target: str) -> "ProjectConfig":
         settings = self.settings_for_target(target)
-        allowed = {
-            "from_date", "to_date", "cdx_filters", "cdx_collapses", "cdx_match_type",
-            "cdx_extra_params", "page_size", "cdx_delay", "download_delay", "workers",
-        }
-        overrides = {key: value for key, value in settings.items() if key in allowed}
-        return replace(self, targets=[normalize_target(target)], **overrides).normalized()
+        return replace(self, targets=[normalize_target(target)], **self._index_overrides(settings)).normalized()
+
+    @staticmethod
+    def _index_overrides(settings: dict) -> dict:
+        allowed = {"from_date", "to_date", "cdx_filters", "cdx_collapses", "cdx_match_type",
+                   "cdx_extra_params", "page_size", "cdx_delay", "download_delay", "workers"}
+        return {key: value for key, value in settings.items() if key in allowed}
+
+    def index_settings(self, target: str) -> "ProjectConfig":
+        """Effective query settings for a normalized selection with an explicit target."""
+        settings = self.target_settings.get(target)
+        if not settings:
+            return self
+        return replace(self, targets=[target], target_settings={target: settings},
+                       **self._index_overrides(settings)).normalized()
 
     @property
     def max_file_bytes(self) -> int:

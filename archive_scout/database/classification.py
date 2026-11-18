@@ -14,34 +14,36 @@ def classify_indexed_captures(database: sqlite3.Connection, signature: str, stop
     Read by bounded keyset (not OFFSET), and write in batches. Unchanged indexed
     rows are not needlessly reclassified when another operation resumes.
     """
-    cursor = 0
-    updated = 0
+    updated = refresh_suffix_policy_for_existing_rows(database, signature, stop_event, batch_size)
+    key = "classification_cursor:" + signature
     while True:
         if stop_event is not None and stop_event.is_set():
             from ..events import Stopped
             raise Stopped
-        rows = database.execute(
-            """SELECT c.id,c.original_url,c.mimetype FROM captures c
-               LEFT JOIN capture_routing r ON r.capture_id=c.id
-               WHERE c.query_signature=? AND c.id>? AND r.capture_id IS NULL
-               ORDER BY c.id LIMIT ?""",
-            (signature,cursor,max(1,batch_size)),
-        ).fetchall()
-        if not rows:
-            updated += refresh_suffix_policy_for_existing_rows(database, signature, stop_event, batch_size)
-            return updated
-        now=utc_now()
-        values=[]
-        for row in rows:
-            cursor=int(row["id"])
-            decision=classify_indexed_resource(str(row["original_url"]),str(row["mimetype"] or ""))
-            values.append((cursor,decision.resource_class,decision.reason,int(decision.confident),"pending",now))
         with database:
-            database.executemany(
-                """INSERT OR IGNORE INTO capture_routing
-                   (capture_id,resource_class,evidence,confident,routing,updated_at)
-                   VALUES (?,?,?,?,?,?)""",values)
-        updated+=len(values)
+            if not database.in_transaction:
+                database.execute("BEGIN IMMEDIATE")
+            mark = database.execute("SELECT value FROM project_meta WHERE key=?", (key,)).fetchone()
+            cursor = int(mark[0]) if mark else 0
+            rows = database.execute("""SELECT c.id,c.original_url,c.mimetype,r.capture_id FROM captures c
+                LEFT JOIN capture_routing r ON r.capture_id=c.id
+                WHERE c.query_signature=? AND c.id>? ORDER BY c.id LIMIT ?""",
+                (signature, cursor, max(1, batch_size))).fetchall()
+            if not rows:
+                return updated
+            now = utc_now()
+            values = []
+            for row in rows:
+                if row["capture_id"] is None:
+                    decision = classify_indexed_resource(row["original_url"], row["mimetype"])
+                    values.append((row["id"], decision.resource_class, decision.reason,
+                                   int(decision.confident), "pending", now))
+            database.executemany("""INSERT INTO capture_routing
+                (capture_id,resource_class,evidence,confident,routing,updated_at) VALUES (?,?,?,?,?,?)""", values)
+            database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES(?,?)",
+                             (key, str(rows[-1]["id"])))
+            updated += len(values)
+
 
 def refresh_suffix_policy_for_existing_rows(
     database: sqlite3.Connection, signature: str, stop_event=None, batch_size: int = 5000,

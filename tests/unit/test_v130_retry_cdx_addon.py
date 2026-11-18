@@ -87,9 +87,9 @@ class CdxTransferTests(unittest.TestCase):
             calls = []
             def request(*args, **kwargs):
                 params = dict(args[2]); target = params['url']; calls.append((target, params.get('resumeKey')))
-                if len(calls) == 1:
+                if target == 'example.org/*' and 'resumeKey' not in params:
                     return CDXRows([('20080101000000', 'http://example.org/a', 'text/html', '200', '', '4')], 'saved-cursor')
-                if len(calls) == 2:
+                if target == 'example.org/*' and calls.count((target, 'saved-cursor')) == 1:
                     error = MalformedCDXResponse('incomplete transfer', splittable=True)
                     error.__cause__ = httpx.RemoteProtocolError('incomplete chunked read')
                     raise error
@@ -97,8 +97,10 @@ class CdxTransferTests(unittest.TestCase):
             with patch.object(HttpClient, 'get_cdx_any', request), \
                  patch('archive_scout.cdx.indexer.transient_backoff', return_value=0):
                 self.assertFalse(index_archive(cfg, fixture.db, FastStop()))
-            self.assertEqual(calls[:3], [('example.org/*', None), ('example.org/*', 'saved-cursor'), ('other.org/*', None)])
-            self.assertEqual(calls[3], ('example.org/*', 'saved-cursor'))
+            self.assertEqual([cursor for target, cursor in calls if target == 'example.org/*'],
+                             [None, 'saved-cursor', 'saved-cursor'])
+            self.assertEqual(calls.count(('other.org/*', None)), 1)
+            self.assertLess(calls.index(('other.org/*', None)), len(calls) - 1)
             self.assertEqual(fixture.db.execute('SELECT COUNT(*) FROM captures').fetchone()[0], 1)
         finally:
             fixture.tearDown()

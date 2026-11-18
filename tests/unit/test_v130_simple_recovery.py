@@ -50,6 +50,8 @@ class PlanningTests(unittest.TestCase):
                 if 'showNumPages' in p:
                     return [['pages'], [3]]
                 if 'page' not in p:
+                    if int(p['limit']) == 5000:
+                        return CDXRows([row(3)])
                     raise TransientRequestError('HTTP 504', status=504)
                 page = int(p['page'])
                 with lock:
@@ -65,10 +67,10 @@ class PlanningTests(unittest.TestCase):
                 with patch.object(HttpClient, 'get_cdx_any', fetch):
                     self.assertFalse(index_archive(cfg, db, threading.Event()))
                 self.assertEqual(page_calls, {0: 1, 1: 2, 2: 1})
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM captures').fetchone()[0], 3)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM captures').fetchone()[0], 4)
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM index_pages').fetchone()[0], 3)
                 self.assertEqual(db.execute('SELECT complete FROM index_coverage').fetchone()[0], 1)
-                self.assertEqual(sum('showResumeKey' in dict(p) for p in calls), 1)
+                self.assertEqual(sum('showResumeKey' in dict(p) for p in calls), 2)
                 for p in calls:
                     self.assertEqual([v for k,v in p if k == 'filter'], cfg.cdx_filters)
                     self.assertEqual([v for k,v in p if k == 'collapse'], cfg.cdx_collapses)
@@ -133,11 +135,14 @@ class PlanningTests(unittest.TestCase):
                 db.close();db=open_database(cfg.output_dir);calls=[]
                 def finish(_client,endpoints,params,**kwargs):
                     p=dict(params);calls.append(p)
-                    self.assertNotIn('showResumeKey',p)
+                    if 'showResumeKey' in p:
+                        self.assertEqual(int(p['limit']), 5000)
                     return [['pages'],[1]] if 'showNumPages' in p else CDXRows([row()])
                 with patch.object(HttpClient,'get_cdx_any',finish):
                     self.assertFalse(index_archive(cfg,db,threading.Event()))
-                self.assertEqual(len(calls),2)
+                self.assertEqual(len(calls),3)
+                self.assertIn('showNumPages', calls[0])
+                self.assertIn('showResumeKey', calls[-1])
             finally:db.close()
 
     def test_partial_response_can_replan_but_scope_corruption_cannot(self):

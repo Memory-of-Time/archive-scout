@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import replace
 
-from ..cdx.parameters import cdx_query_signature
+from ..cdx.parameters import index_scopes
 from ..config import ProjectConfig
 
 
@@ -14,8 +14,8 @@ def discovery_scope_config(config: ProjectConfig) -> ProjectConfig:
 
 
 def scope_rows(config: ProjectConfig) -> list[tuple[str, str, str, str]]:
-    return sorted((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
-                  for target in config.targets for scoped in [config.for_target(target)])
+    return sorted((target, signature, scoped.from_date, scoped.to_date)
+                  for target, scoped, signature in index_scopes(config))
 
 
 def prepare_saved_scope(database: sqlite3.Connection, config: ProjectConfig) -> None:
@@ -26,11 +26,19 @@ def prepare_saved_scope(database: sqlite3.Connection, config: ProjectConfig) -> 
     database.executemany("INSERT OR IGNORE INTO archive_scout_saved_scope VALUES(?,?,?,?)", scope_rows(config))
 
 
+def scope_membership_predicate(table: str, alias: str = "c") -> str:
+    if alias not in {"c", "captures"} or table not in {
+        "archive_scout_saved_scope", "archive_scout_download_scopes", "archive_scout_retry_scopes",
+    }:
+        raise ValueError("unsupported capture scope")
+    return f"""(EXISTS(SELECT 1 FROM targets t JOIN {table} s
+        ON s.pattern=t.pattern AND s.signature={alias}.query_signature AND {alias}.timestamp BETWEEN s.start AND s.end
+        WHERE t.id={alias}.target_id)
+        OR EXISTS(SELECT 1 FROM capture_target_membership m JOIN targets t ON t.id=m.target_id
+            JOIN {table} s ON s.pattern=t.pattern AND s.signature={alias}.query_signature
+              AND {alias}.timestamp BETWEEN s.start AND s.end
+            WHERE m.capture_id={alias}.id))"""
+
+
 def saved_scope_predicate(alias: str = "c") -> str:
-    # Alias is an internal identifier, never user input.
-    if alias not in {"c", "captures"}:
-        raise ValueError("unsupported capture alias")
-    return f"""EXISTS(SELECT 1 FROM archive_scout_saved_scope s JOIN targets t ON t.pattern=s.pattern
-        WHERE s.signature={alias}.query_signature AND {alias}.timestamp BETWEEN s.start AND s.end
-        AND (t.id={alias}.target_id OR EXISTS(SELECT 1 FROM capture_target_membership membership
-            WHERE membership.capture_id={alias}.id AND membership.target_id=t.id)))"""
+    return scope_membership_predicate("archive_scout_saved_scope", alias)

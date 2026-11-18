@@ -103,7 +103,7 @@ class DashboardSummaryTests(unittest.TestCase):
         self.db.execute('UPDATE schema_info SET version=11');self.db.commit();self.db.close()
         self.db=open_database(self.root)
         self.compare()
-        self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],12)
+        self.assertEqual(self.db.execute('SELECT version FROM schema_info').fetchone()[0],13)
         backups=list((self.root/'backups').glob('*.sqlite3'))
         self.assertTrue(backups)
         # SQLite's transaction context manager does not close its file handle.
