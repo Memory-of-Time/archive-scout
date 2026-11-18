@@ -6,13 +6,12 @@ import calendar
 import re
 import fnmatch
 from urllib.parse import urlsplit
-from collections import Counter, deque
 import json
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from ..config import ProjectConfig
@@ -24,6 +23,7 @@ from ..network.transports import (exception_chain, IncompleteRepresentationError
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
 from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload, summarize_cdx_error
+from .scheduler import TargetQueue
 from .parallel import PageFetchResult, effective_page_workers, memory_limited_page_workers, iter_cdx_pages
 from .parameters import (
     build_cdx_params,
@@ -68,6 +68,8 @@ class PendingWindow:
     retry_pages: list[int] = field(default_factory=list)
     page_failures: dict[int, int] = field(default_factory=dict)
     gateway_504_failures: int = 0
+    verifying_pages: bool = False
+    transport_retry: bool = False
 
 
 @dataclass(slots=True)
@@ -158,6 +160,8 @@ def encode_plan(plan: IndexPlan) -> str | None:
                 "resume_key": item.resume_key,
                 "failures": int(item.failures),
                 "gateway_504_failures": int(item.gateway_504_failures),
+                "verifying_pages": item.verifying_pages,
+                "transport_retry": item.transport_retry,
                 "page_size": int(item.page_size),
                 "strategy": item.strategy,
                 "page": int(item.page),
@@ -206,6 +210,8 @@ def decode_plan(value: str | None, default_windows: list[tuple[str, str]]) -> In
                             resume_key=str(resume) if resume else None,
                             failures=max(0, int(raw.get("failures", 0))),
                             gateway_504_failures=max(0, int(raw.get("gateway_504_failures", 0))),
+                            verifying_pages=bool(raw.get("verifying_pages")),
+                            transport_retry=bool(raw.get("transport_retry")),
                             page_size=max(0, int(raw.get("page_size", 0))),
                             strategy=str(raw.get("strategy") or "auto"),
                             page=max(0, int(raw.get("page", 0))),
@@ -306,7 +312,7 @@ def coalesce_unstarted_micro_windows(
         return 0
 
     def eligible(window: PendingWindow) -> bool:
-        if (window.resume_key is not None or window.page or window.page_count >= 0
+        if (window.verifying_pages or window.resume_key is not None or window.page or window.page_count >= 0
                 or window.retry_pages or window.page_failures or window.failures
                 or window.gateway_504_failures):
             return False
@@ -370,7 +376,7 @@ def _bisect_persistent_gateway_504(window: PendingWindow) -> list[PendingWindow]
     contiguous halves. Never discard a live resume key or numbered-page ledger.
     This helper is only reached from the failure path.
     """
-    if window.resume_key or window.page or window.page_count >= 0:
+    if window.verifying_pages or window.resume_key or window.page or window.page_count >= 0:
         return []
     try:
         start = datetime.strptime(window.start, "%Y%m%d%H%M%S")
@@ -583,7 +589,7 @@ def _adopt_compatible_index_state(
         if candidate == signature:
             continue
         state = database.execute(
-            "SELECT resume_key,complete,seen,error_id,updated_at FROM index_state "
+            "SELECT resume_key,complete,seen,error_id,updated_at,terminal_method FROM index_state "
             "WHERE target_id=? AND year=? AND query_signature=?",
             (target_id, year, candidate),
         ).fetchone()
@@ -598,9 +604,9 @@ def _adopt_compatible_index_state(
             (signature, target_id, candidate, start, end),
         )
         database.execute(
-            "INSERT INTO index_state(target_id,year,query_signature,resume_key,complete,seen,error_id,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (target_id, year, signature, state["resume_key"], state["complete"], state["seen"], state["error_id"], state["updated_at"]),
+            "INSERT INTO index_state(target_id,year,query_signature,resume_key,complete,seen,error_id,updated_at,terminal_method) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (target_id, year, signature, state["resume_key"], state["complete"], state["seen"], state["error_id"], state["updated_at"], state["terminal_method"]),
         )
         database.execute(
             "DELETE FROM index_state WHERE target_id=? AND year=? AND query_signature=?",
@@ -619,12 +625,16 @@ def _adopt_compatible_range_coverage(
     partial plans. Only page-layout-identical checkpoints are transferred.
     Repeated calls do nothing once the canonical range is already present.
     """
+    if not database.execute("""SELECT 1 FROM index_coverage WHERE target_id=?
+            AND query_signature<>? AND range_start>=? AND range_end<=? LIMIT 1""",
+            (target_id, signature, config.from_date, config.to_date)).fetchone():
+        return
     for old in cdx_query_signatures(config):
         if old == signature:
             continue
         rows = database.execute(
             """SELECT range_start,range_end,plan_json,strategy,layout_signature,
-                      complete,seen,error_id,updated_at
+                      complete,seen,error_id,updated_at,terminal_method
                  FROM index_coverage WHERE target_id=? AND query_signature=?
                  AND range_start>=? AND range_end<=?""",
             (target_id, old, config.from_date, config.to_date),
@@ -643,11 +653,11 @@ def _adopt_compatible_range_coverage(
             database.execute(
                 """INSERT OR IGNORE INTO index_coverage
                    (target_id,query_signature,range_start,range_end,plan_json,
-                    strategy,layout_signature,complete,seen,error_id,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    strategy,layout_signature,complete,seen,error_id,updated_at,terminal_method)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (target_id, signature, left, right, item["plan_json"],
                  item["strategy"], item["layout_signature"], item["complete"],
-                 item["seen"], item["error_id"], item["updated_at"]),
+                 item["seen"], item["error_id"], item["updated_at"], item["terminal_method"]),
             )
             database.execute(
                 """INSERT OR IGNORE INTO index_pages
@@ -696,6 +706,14 @@ def _record_network_event(database: sqlite3.Connection, stage: str, message: str
         pass
 
 
+def _temporary_index_failure(exc: BaseException) -> bool:
+    return isinstance(exc, TransientRequestError) and (
+        exc.connection_failed or exc.timed_out or exc.status in {408, 425, 429, 500, 502, 503, 504}
+        or any(isinstance(normalize_transport_error(item), IncompleteRepresentationError)
+               for item in exception_chain(exc))
+    )
+
+
 def _defer_transient_window(
     config: ProjectConfig,
     database: sqlite3.Connection,
@@ -710,7 +728,10 @@ def _defer_transient_window(
     total_windows: int,
     stop_event: threading.Event,
     yield_to_other_tasks: bool = False,
+    index_scope: str | None = None,
+    index_target: str = "",
 ) -> int:
+    current.transport_retry = _temporary_index_failure(exc)
     current.failures += 1
     # Durable eligibility survives Stop, process exit, and project relocation.
     current.next_eligible_at = time.time() + transient_backoff(config,current.failures)
@@ -728,9 +749,9 @@ def _defer_transient_window(
             database,
             "index",
             "invalid_index_response" if isinstance(exc, MalformedCDXResponse) else "transient_index_delay",
-            f"{window_label(current.start, current.end)}: {message}",
+            f"{index_target} {window_label(current.start, current.end)}: {message}".lstrip(),
             http_status=getattr(exc, 'status', None),
-            retryable=True,
+            retryable=True, index_scope=index_scope,
         )
         _record_network_event(
             database,
@@ -1040,6 +1061,20 @@ def _reconcile_paged_completion(current: PendingWindow, completed_pages: set[int
     return True
 
 
+def _ledger_complete(database, current, ledger_key):
+    expected = 0
+    for row in database.execute("""SELECT page FROM index_pages WHERE query_signature=? AND
+            target_id=? AND window_start=? AND window_end=? AND layout_signature=?
+            AND status='complete' AND page>=0 AND page<? ORDER BY page""", (*ledger_key, current.page_count)):
+        if row[0] != expected:
+            break
+        expected += 1
+    if expected == current.page_count:
+        return True
+    current.page = expected
+    return False
+
+
 def _select_page_batch(current: PendingWindow, workers: int) -> tuple[list[int], int]:
     workers = max(1, int(workers))
     retry_pages = sorted({page for page in current.retry_pages if 0 <= page < current.page_count})
@@ -1068,7 +1103,7 @@ def _request_paged_batch(
     current: PendingWindow,
     stop_event: threading.Event,
     consume_success: Callable[[PageFetchResult], None] | None = None,
-    completed_pages: set[int] | None = None,
+    completed_pages: set[int] | Callable[[list[int]], set[int]] | None = None,
     deadline: float | None = None,
 ) -> PagedBatch:
     endpoints = cdx_paged_endpoints(config)
@@ -1105,7 +1140,7 @@ def _request_paged_batch(
     # worker pool remains saturated, but target time budgets and fairness
     # cannot be trapped behind 1,000 unrelated pages.
     pages, next_page = _select_page_batch(current, min(PAGED_PIPELINE_PAGES, max(page_workers, page_workers * 2)))
-    completed_pages = completed_pages or set()
+    completed_pages = completed_pages(pages) if callable(completed_pages) else completed_pages or set()
     requested_pages = [page for page in pages if page not in completed_pages]
     if not requested_pages:
         current.page = next_page
@@ -1220,7 +1255,7 @@ def coalesce_untouched_range_plan(plan: IndexPlan, start: str, end: str, seen: i
     if windows[0].start != start or windows[-1].end != end:
         return False
     for i, window in enumerate(windows):
-        if (window.resume_key or window.page or window.page_count >= 0 or window.page_layout
+        if (window.verifying_pages or window.resume_key or window.page or window.page_count >= 0 or window.page_layout
                 or window.retry_pages or window.strategy not in {"auto", "resume"}):
             return False
         if i and _shift_timestamp(windows[i - 1].end, 1) != window.start:
@@ -1246,93 +1281,133 @@ def index_archive(
     # state_kind is either the legacy per-year checkpoint model or Audit3's
     # explicit range coverage model. Older projects retain year scope so their
     # server-side collapse boundaries do not silently change.
-    tasks: list[tuple[str, ProjectConfig, int, str, int | None, str, str, list[tuple[str, str]], str]] = []
-    for target in config.targets:
-        target_config = config.for_target(target)
-        signature = cdx_query_signature(target_config)
-        target_id = get_or_create_target(database, target, target_config.settings_for_target(target))
-        if target_config.text_collapse_scope == "range":
-            with database:
-                _adopt_compatible_range_coverage(database, target_id, target_config, signature)
-        if target_config.text_collapse_scope == "year":
-            emit(callback, ProgressEvent("index", f"Legacy yearly scope is active for {target}; existing selection/checkpoints are preserved. "
-                "Settings → Connection and indexing → Index date scope controls range versus year."))
-            for year in range(target_config.from_year, target_config.to_year + 1):
-                windows = index_windows(target_config, target, year)
-                if windows:
-                    tasks.append((target, target_config, target_id, "year", year, windows[0][0], windows[-1][1], windows, signature))
-        else:
-            for gap_start, gap_end in uncovered_index_ranges(
-                database, target_id, signature, target_config.from_date, target_config.to_date
-            ):
-                tasks.append((target, target_config, target_id, "range", None, gap_start, gap_end, [(gap_start, gap_end)], signature))
+    total_windows = len(config.targets)
+    untouched_targets = len(config.targets)
+    unfinished_targets = len(config.targets)
+    remaining_tasks = {}
+    default_signature = cdx_query_signature(config)
 
-    total_windows = sum(len(windows) for *_prefix, windows, _signature in tasks)
+    def new_tasks():
+        nonlocal total_windows, untouched_targets, unfinished_targets
+        for target in config.targets:
+            if stop_event.is_set():
+                raise Stopped
+            scoped = config.index_settings(target)
+            signature = default_signature if scoped is config else cdx_query_signature(scoped)
+            with database:
+                target_id = get_or_create_target(database, target, config.target_settings.get(target, {}))
+                if scoped.text_collapse_scope == "range":
+                    _adopt_compatible_range_coverage(database, target_id, scoped, signature)
+            if scoped.text_collapse_scope == "year":
+                emit(callback, ProgressEvent("index", f"Legacy yearly scope is active for {target}; preserving annual checkpoints."))
+                intervals = [(year, *bounds) for year in range(scoped.from_year, scoped.to_year + 1)
+                             if (bounds := cdx_year_window(scoped, year))]
+            else:
+                intervals = [(None, left, right) for left, right in uncovered_index_ranges(
+                    database, target_id, signature, scoped.from_date, scoped.to_date)]
+            untouched_targets -= 1
+            total_windows += len(intervals) - 1
+            if not intervals:
+                unfinished_targets -= 1
+            elif len(intervals) > 1:
+                remaining_tasks[target] = len(intervals)
+            for position, (year, left, right) in enumerate(intervals, 1):
+                if not untouched_targets and position == len(intervals):
+                    task_queue.source_open = False
+                yield (target, scoped, target_id, scoped.text_collapse_scope, year, left, right,
+                       [(left, right)], signature)
+
     completed_windows = 0
     connection_failure_streak = 0
     transient_failure_streak = 0
     # A target gets bounded work turns. Stalled queries retain their exact
     # durable state, but may no longer monopolize the operation for hours.
-    task_queue = deque(tasks)
-    due: dict[tuple[str, str, int | None, str, str], float] = {}
-    spent: dict[str, float] = {}
-    retry_budgets = {}
-    cursor_histories = {}
-    retry_deferred = set()
-    blocked_tasks = set()
-    budget_deferred: set[str] = set()
-    accounted: dict[tuple, tuple[int, int]] = {}
-    remaining_tasks = Counter(task[0] for task in tasks)
+    max_page = max((int(item.get("page_size") or config.page_size)
+                    for item in config.target_settings.values()), default=config.page_size)
+    body_budget = cdx_response_budget(max(config.page_size, max_page))
+    workers = memory_limited_page_workers(min(4, len(config.targets), config.network.cdx_workers),
+        body_budget + body_budget // 2, config.network.cdx_memory_budget_mb)
+    if config.skip_slow_index_targets or config.text_collapse_scope == "year":
+        workers = 1
+    def waiting_for_retry(seconds):
+        when = datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat(timespec="seconds")
+        emit(callback, ProgressEvent("index_retry", f"Waiting for the next eligible domain at {when}.",
+                                     detail={"next_retry_utc": when}))
+    task_queue = TargetQueue(database, config, new_tasks(), workers, stop_event, waiting_for_retry)
+    last_status = float("-inf")
 
     def queue_status():
-        deferred_targets = budget_deferred | {key[0] for key in retry_deferred | blocked_tasks}
-        cooling_targets = {key[0] for key, ready_at in due.items()
-                           if ready_at > time.monotonic() and key[0] in remaining_tasks}
-        retrying_targets = {key[0] for key, budget in retry_budgets.items()
-                            if budget.attempts and key[0] in remaining_tasks} - deferred_targets
+        nonlocal last_status
+        now = time.monotonic()
+        if now - last_status < 0.75:
+            return
+        last_status = now
+        left = unfinished_targets
+        deferred_count = task_queue.deferred_targets
+        cooling = task_queue.cooling
+        retrying = task_queue.retrying
         emit(callback, ProgressEvent('index_status',
-            f"Indexing queue: {len(remaining_tasks):,} target(s) remain for completion checks; "
-            f"{len(retrying_targets):,} retrying, {len(cooling_targets):,} cooling, "
-            f"{len(deferred_targets):,} deferred with checkpoints retained. "
+            f"Indexing queue: {left:,} target(s) remain for completion checks; "
+            f"{retrying:,} retrying, {cooling:,} cooling, "
+            f"{deferred_count:,} deferred with checkpoints retained. "
             "Capture downloads are a separate phase.",
-            detail={'unfinished_targets': len(remaining_tasks), 'retrying_targets': len(retrying_targets),
-                    'cooling_targets': len(cooling_targets), 'deferred_targets': len(deferred_targets)}))
+            detail={'unfinished_targets': left, 'retrying_targets': retrying,
+                    'cooling_targets': cooling, 'deferred_targets': deferred_count}))
 
     def task_complete(target):
-        remaining_tasks[target] -= 1
-        if remaining_tasks[target] <= 0:
-            del remaining_tasks[target]
+        nonlocal unfinished_targets
+        remaining = remaining_tasks.get(target, 1) - 1
+        if remaining:
+            remaining_tasks[target] = remaining
+        else:
+            remaining_tasks.pop(target, None)
+            if not task_queue.was_deferred(target):
+                unfinished_targets -= 1
 
     queue_status()
     try:
         while task_queue:
-            if stop_event.is_set():
-                raise Stopped
-            task = task_queue.popleft()
+            task, response = task_queue.take()
+            if task is None:
+                break
             target, target_config, target_id, state_kind, year, task_start, task_end, default_windows, signature = task
-            task_key = (target, state_kind, year, task_start, task_end)
-            if target in budget_deferred or task_key in retry_deferred or task_key in blocked_tasks:
-                continue
-            ready = due.get(task_key, 0.0)
-            now = time.monotonic()
-            if ready > now:
-                task_queue.append(task)
-                # Never spin through an all-cooling queue; the Stop event
-                # interrupts this small bounded wait immediately.
-                future_times = [due.get((t[0], t[3], t[4], t[5], t[6]), 0.0)
-                                for t in task_queue]
-                if future_times and min(future_times) > now:
-                    # Remain almost idle during shared outages, but permit
-                    # immediate user Stop and prompt recovery at eligibility.
-                    stop_event.wait(min(5.0, max(0.05, min(future_times) - now)))
-                continue
-            due.pop(task_key, None)
+            scoped_time = 0.0
+            if target_config.skip_slow_index_targets:
+                budget_row = database.execute("SELECT seconds,expired FROM normal_index_spent WHERE target=?", (target,)).fetchone()
+                if budget_row:
+                    scoped_time = budget_row[0]
+                    if budget_row[1]:
+                        task_complete(target)
+                        continue
             turn_started = time.monotonic()
             requests_this_turn = 0
-            yielded = False
+            deferred = False
             budget_limit = target_config.index_target_minutes * 60.0 if target_config.skip_slow_index_targets else None
 
+            error_prefix = f"{target_id}/{signature}/{state_kind}/{task_start}/{task_end}/"
+
+            def active_error_scope():
+                window = plan.pending[0] if plan.pending else None
+                return error_prefix + (f"{window.start}/{window.end}/{window.strategy}" if window else "")
+
+            def scope_error(db, operation, category, message, **kwargs):
+                return record_error(db, operation, category, message,
+                                    index_scope=active_error_scope(), **kwargs)
+
+            def resolve_previous_error():
+                if error_id is None:
+                    return
+                database.execute("""UPDATE errors SET resolved=1,last_seen=? WHERE id=?
+                    AND (index_scope=? OR (index_scope IS NULL
+                      AND NOT EXISTS(SELECT 1 FROM index_state WHERE error_id=? AND complete=0)
+                      AND NOT EXISTS(SELECT 1 FROM index_coverage WHERE error_id=? AND complete=0)))""",
+                    (utc_now(), error_id, active_error_scope(), error_id, error_id))
+
             def persist_task_state(plan_json: str | None, complete: bool, seen_value: int, error_value: int | None) -> None:
+                if complete:
+                    database.execute("""UPDATE errors SET resolved=1,last_seen=?
+                        WHERE index_scope>=? AND index_scope<? AND resolved=0""",
+                        (utc_now(), error_prefix, error_prefix+"~"))
                 if state_kind == "year":
                     assert year is not None
                     save_state(database, target_id, year, signature, plan_json, complete, seen_value, error_value)
@@ -1341,12 +1416,25 @@ def index_archive(
                         active = plan.pending[0] if plan.pending else None
                     except (NameError, UnboundLocalError):
                         active = None
-                    strategy = active.strategy if active is not None else "resume"
+                    strategy = active.strategy if active is not None else terminal_method
                     layout = cdx_layout_signature(
                         target_config, task_start, task_end, strategy, active.page_blocks if active is not None else 0
                     )
                     save_coverage_state(database, target_id, signature, task_start, task_end, plan_json, complete,
                                         seen_value, error_value, strategy, layout)
+                if complete:
+                    save_terminal_method(terminal_method)
+
+            terminal_method = "resume"
+            def save_terminal_method(method):
+                if state_kind == "year":
+                    database.execute("""UPDATE index_state SET terminal_method=?
+                        WHERE target_id=? AND query_signature=? AND year=?""",
+                        (method, target_id, signature, year))
+                else:
+                    database.execute("""UPDATE index_coverage SET terminal_method=? WHERE target_id=?
+                        AND query_signature=? AND range_start=? AND range_end=?""",
+                        (method, target_id, signature, task_start, task_end))
 
             scope_label = str(year) if state_kind == "year" else window_label(task_start, task_end)
             if state_kind == "year":
@@ -1354,13 +1442,13 @@ def index_archive(
                 with database:
                     _adopt_compatible_index_state(database, target_id, year, target_config, signature)
                 state = database.execute(
-                    "SELECT resume_key,complete,seen,error_id FROM index_state WHERE target_id=? AND year=? AND query_signature=?",
+                    "SELECT resume_key,complete,seen,error_id,terminal_method FROM index_state WHERE target_id=? AND year=? AND query_signature=?",
                     (target_id, year, signature),
                 ).fetchone()
                 state_plan = state["resume_key"] if state else None
             else:
                 state = database.execute(
-                    """SELECT plan_json,complete,seen,error_id FROM index_coverage
+                    """SELECT plan_json,complete,seen,error_id,terminal_method FROM index_coverage
                        WHERE target_id=? AND query_signature=? AND range_start=? AND range_end=?""",
                     (target_id, signature, task_start, task_end),
                 ).fetchone()
@@ -1374,6 +1462,18 @@ def index_archive(
             seen = int(state["seen"] or 0) if state else 0
             error_id = int(state["error_id"]) if state and state["error_id"] else None
             plan = decode_plan(state_plan, default_windows)
+            if state and state["terminal_method"] == "legacy_review" and not state_plan:
+                for inherited in plan.pending:
+                    inherited.strategy = "resume"
+                    inherited.pagination_supported = False
+                    inherited.verifying_pages = True
+            if state and state["terminal_method"] == "legacy_tail_review" and not any(
+                    w.verifying_pages and (w.start, w.end) == (task_start, task_end) for w in plan.pending):
+                plan.pending.append(PendingWindow(task_start, task_end, strategy="resume",
+                    verifying_pages=True, pagination_supported=False, page_size=min(5000, target_config.page_size)))
+                plan.planned += 1
+                with database:
+                    persist_task_state(encode_plan(plan), False, seen, error_id)
             if state_kind == "range" and not seen and not plan.completed:
                 durable = database.execute(
                     "SELECT 1 FROM captures WHERE target_id=? AND query_signature=? LIMIT 1",
@@ -1403,39 +1503,56 @@ def index_archive(
             elif target_config.cdx_collapses and seen and len(plan.pending) >= 8:
                 emit(callback, ProgressEvent("index", "Existing fragmented collapsed CDX checkpoint retained: "
                     "automatic reassembly could change which timestamp represents a URL."))
-            counted_complete, counted_extra = accounted.get(task_key, (0, 0))
+            counted_complete, counted_extra, attempts, active_seconds, saved_cursors = task_queue.recall(error_prefix)
+            cursor_histories = {}
+            for left, right, tokens in saved_cursors:
+                history = CursorHistory()
+                history.recent.extend(bytes.fromhex(token) for token in tokens)
+                cursor_histories[left, right] = history
             completed_windows += plan.completed - counted_complete
             extra = plan.planned - len(default_windows)
             total_windows += extra - counted_extra
-            accounted[task_key] = (plan.completed, extra)
-
-            retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config, count_only=True))
-            retry_budget.resume()
+            retry_budget = NoProgressBudget(target_config, count_only=True)
+            retry_budget.attempts = attempts
+            retry_budget.elapsed = active_seconds
+            retry_budget.active = bool(attempts)
+            expired = False
             while plan.pending:
+                if (retry_budget.exhausted and plan.pending[0].transport_retry
+                        and target_config.network.persistent_retries and not target_config.skip_slow_index_targets):
+                    waiting = plan.pending[0]
+                    delay = transient_backoff(target_config, waiting.failures)
+                    waiting.next_eligible_at = max(waiting.next_eligible_at, time.time() + delay)
+                    with database:
+                        persist_task_state(encode_plan(plan), False, seen, error_id)
+                    retry_budget.progress()
+                    emit(callback, ProgressEvent("index_retry", f"{target} remains unfinished. "
+                        f"Automatic retry in {delay:.1f}s at its saved checkpoint."))
                 if retry_budget.exhausted:
                     with database:
                         previous_error = database.execute('SELECT http_status,message FROM errors WHERE id=?',
                                                           (error_id,)).fetchone() if error_id else None
                         detail = retry_budget.details()
-                        error_id = record_error(database, 'index', 'retry_budget_exhausted',
+                        error_id = scope_error(database, 'index', 'retry_budget_exhausted',
                             f"{target}: {detail['attempts_without_progress']}/{detail['attempt_limit']} attempts "
                             f"without progress; {detail['active_no_progress_seconds']:.1f}s active recovery time "
                             "(time queued behind other targets excluded). Last failure: "
                             + (str(previous_error[1])[:1200] if previous_error else 'no verified response'),
                             http_status=previous_error[0] if previous_error else None, retryable=True)
                         persist_task_state(encode_plan(plan), False, seen, error_id)
-                    retry_deferred.add(task_key)
+                    deferred = True
                     emit(callback, ProgressEvent("index_deferred", incomplete_retry_message(target),
                          completed_windows, total_windows, {**detail, "retain_notice": True}))
                     break
-                active = spent.get(target, 0.0) + (time.monotonic() - turn_started)
+                active = scoped_time + (time.monotonic() - turn_started)
                 if budget_limit is not None and active >= budget_limit:
                     with database:
-                        error_id = record_error(database, "index", "deferred_time_budget",
+                        error_id = scope_error(database, "index", "deferred_time_budget",
                             f"{target}: indexing time budget {target_config.index_target_minutes:g} minutes reached; unfinished cursor retained",
                             retryable=True)
                         persist_task_state(encode_plan(plan), False, seen, error_id)
-                    budget_deferred.add(target)
+                    expired = True
+                    deferred = True
                     emit(callback, ProgressEvent("index_deferred", f"Deferred {target}: indexing budget reached; saved unfinished work for a later Resume."))
                     break
                 # Keep healthy large inventories moving without paying the
@@ -1444,18 +1561,18 @@ def index_archive(
                     with database:
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     task_queue.append(task)
-                    yielded = True
                     break
-                if stop_event.is_set():
+                if stop_event.is_set() and response is None:
                     with database:
                         persist_task_state(encode_plan(plan), False, seen, error_id)
+                    if task_queue.pending:
+                        break
                     raise Stopped
                 current = plan.pending[0]
                 remaining = current.next_eligible_at - time.time()
                 if remaining > 0:
                     if task_queue:
-                        due[task_key] = time.monotonic() + remaining
-                        task_queue.append(task)
+                        task_queue.append(task, time.monotonic() + remaining)
                         break
                     stop_event.wait(min(1.0,remaining))
                     if stop_event.is_set():
@@ -1488,7 +1605,22 @@ def index_archive(
                         "work_unit": completed_windows, "work_units": total_windows,
                     },
                 ))
-                request_started = time.monotonic()
+                if task_queue.pending and current.strategy == "paged":
+                    if task_queue.barrier is None:
+                        task_queue.barrier = task
+                    else:
+                        task_queue.append(task)
+                    break
+                if current.strategy == "resume" and workers > 1 and response is None:
+                    if task_queue.barrier is not None or any(entry[0][0] == target for entry in task_queue.pending.values()):
+                        if task_queue.barrier is None:
+                            task_queue.barrier = task
+                        else:
+                            task_queue.append(task)
+                    else:
+                        task_queue.submit(task, client, _request_resume, current)
+                    break
+                request_started = response[1] if response else time.monotonic()
                 retry_budget.attempted()
                 try:
                     if current.strategy == "paged":
@@ -1498,15 +1630,17 @@ def index_archive(
                         batch_pages_done = 0
                         last_page_progress = time.monotonic()
 
-                        completed_pages = {
-                            int(row[0]) for row in database.execute(
-                                """SELECT page FROM index_pages WHERE query_signature=? AND target_id=?
-                                   AND window_start=? AND window_end=? AND status='complete'
-                                   AND layout_signature=?""",
-                                (signature, target_id, current.start, current.end,
-                                 cdx_layout_signature(target_config, current.start, current.end, 'paged', current.page_blocks)),
-                            )
-                        }
+                        ledger_key = (signature, target_id, current.start, current.end,
+                            cdx_layout_signature(target_config, current.start, current.end, "paged", current.page_blocks))
+
+                        page_error_prefix = active_error_scope() + "/" + ledger_key[-1] + "/page/"
+
+                        def committed_candidates(pages):
+                            placeholders = ",".join("?" for _ in pages)
+                            return {row[0] for row in database.execute(f"""SELECT page FROM index_pages
+                                WHERE query_signature=? AND target_id=? AND window_start=? AND window_end=?
+                                  AND layout_signature=? AND status='complete' AND page IN ({placeholders})""",
+                                (*ledger_key, *pages))}
 
                         def store_completed_page(result: PageFetchResult) -> None:
                             nonlocal received, changed, write_seconds, batch_pages_done, last_page_progress, seen
@@ -1542,8 +1676,9 @@ def index_archive(
                                     (signature, target_id, current.start, current.end, int(result.page), page_received,
                                      cdx_layout_signature(target_config, current.start, current.end, 'paged', current.page_blocks), utc_now()),
                                 )
+                                database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE index_scope=? AND resolved=0",
+                                    (utc_now(), page_error_prefix + str(result.page)))
                             retry_budget.progress()
-                            completed_pages.add(int(result.page))
                             write_seconds += time.monotonic() - write_started
                             received += page_received
                             seen += page_received
@@ -1551,13 +1686,13 @@ def index_archive(
                             now = time.monotonic()
                             if (
                                 now - last_page_progress >= 1.0
-                                or len(completed_pages) >= current.page_count
+                                or batch_pages_done >= current.page_count
                             ):
                                 emit(
                                     callback,
                                     ProgressEvent(
                                         "index",
-                                        f"{target} {label}: completed {len(completed_pages):,}/{current.page_count:,} Timemap pages; "
+                                        f"{target} {label}: committed {batch_pages_done:,} Timemap pages in this batch of a {current.page_count:,}-page scope; "
                                         f"this block finished {batch_pages_done:,} pages and received {received:,} captures",
                                         completed_windows,
                                         total_windows,
@@ -1570,15 +1705,22 @@ def index_archive(
                             result.rows.clear()
 
                         batch = _request_paged_batch(
-                            client, target_config, target, current, stop_event, store_completed_page, completed_pages,
-                            deadline=(turn_started + budget_limit - spent.get(target, 0.0))
+                            client, target_config, target, current, stop_event, store_completed_page, committed_candidates,
+                            deadline=(turn_started + budget_limit - scoped_time)
                                 if budget_limit is not None else None,
                         )
                         request_seconds = max(0.0, time.monotonic() - request_started - write_seconds)
                         successes = batch.successful
                         failures = batch.failed
                         with database:
-                            if successes:
+                            for failure in failures:
+                                record_error(database, "index", "timemap_page_failure",
+                                    f"{target} {label}, page {failure.page}: {failure.error}",
+                                    http_status=getattr(failure.error, "status", None),
+                                    retryable=not _is_permanent_page_error(failure.error),
+                                    index_scope=page_error_prefix + str(failure.page))
+                            if successes or (batch.requested_pages and not failures):
+                                retry_budget.progress()
                                 current.failures = 0
                                 connection_failure_streak = 0
                                 transient_failure_streak = 0
@@ -1587,17 +1729,23 @@ def index_archive(
                                 # leave the plan cursor behind its page ledger.
                                 # Never mark a window complete on a cursor
                                 # alone: every numbered page must be durable.
-                                if not _reconcile_paged_completion(current, completed_pages):
+                                if not _ledger_complete(database, current, ledger_key):
                                     batch.finished = False
+                                elif target_config.network.index_strategy == "auto" or current.page_count == 0:
+                                    retry_budget.progress()
+                                    plan.pending[0] = PendingWindow(
+                                        current.start, current.end, strategy="resume", pagination_supported=False,
+                                        verifying_pages=True, page_size=min(5000, current.page_size or target_config.page_size))
                                 else:
                                     retry_budget.progress()
+                                    terminal_method = "paged"
                                     plan.pending.pop(0)
                                     plan.completed += 1
                                     completed_windows += 1
                             complete = not plan.pending
                             persist_task_state(encode_plan(plan), complete, seen, None if complete else error_id)
                             if error_id and not failures:
-                                database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
+                                resolve_previous_error()
                                 error_id = None
                         pages_done = len(successes)
                         emit(
@@ -1654,7 +1802,7 @@ def index_archive(
                             # windows repeated successful work and was the main
                             # source of earlier development-build indexing stalls.
                             with database:
-                                error_id = record_error(
+                                error_id = scope_error(
                                     database,
                                     "index",
                                     "timemap_pages_unavailable",
@@ -1670,7 +1818,7 @@ def index_archive(
                                     details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                                 )
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            retry_deferred.add(task_key)
+                            deferred = True
                             emit(callback, ProgressEvent('index_deferred', incomplete_retry_message(target),
                                  completed_windows,total_windows,{'retain_notice':True}))
                             break
@@ -1690,31 +1838,26 @@ def index_archive(
                         if successes:
                             emit(callback, ProgressEvent("index", f"Requeued {len(failures)} slow page(s) while continuing with untouched pages.", completed_windows, total_windows))
                             continue
-                        if completed_pages and not new_pages_remain:
-                            emit(
-                                callback,
-                                ProgressEvent(
-                                    "index",
-                                    f"Retrying {len(current.retry_pages)} isolated Timemap page(s); all successful pages remain checkpointed.",
-                                    completed_windows,
-                                    total_windows,
-                                ),
-                            )
+                        if not new_pages_remain and not _temporary_index_failure(failure_exc):
                             continue
                         error_id = _defer_transient_window(
                             target_config, database, plan, current, persist_task_state, seen, error_id,
                             failure_exc, callback, completed_windows, total_windows, stop_event,
-                            yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
+                            yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted, index_scope=active_error_scope(), index_target=target,
                         )
                         if task_queue:
-                            due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
-                            task_queue.append(task)
-                            yielded = True
+                            task_queue.append(task, time.monotonic() + transient_backoff(target_config, current.failures))
                             break
                         continue
 
-                    rows, finished, next_cursor = _request_resume(client, target_config, target, current)
-                    history_key = (task_key,current.start,current.end)
+                    if response is None:
+                        rows, finished, next_cursor = _request_resume(client, target_config, target, current)
+                    else:
+                        future, _ = response
+                        response = None
+                        rows, finished, next_cursor = future.result()
+                        del future
+                    history_key = (current.start, current.end)
                     history = cursor_histories.setdefault(history_key, CursorHistory())
                     history.check(next_cursor)
                     raw_received = len(rows)
@@ -1745,11 +1888,13 @@ def index_archive(
                             checkpoint_started = time.monotonic()
                             seen += received
                             current.failures = 0
+                            current.transport_retry = False
                             current.gateway_504_failures = 0
                             plan.gateway_splits_without_response = 0
                             if next_cursor is not None:
                                 current.resume_key = next_cursor
                             if finished:
+                                terminal_method = "paged_then_resume" if current.verifying_pages else "resume"
                                 plan.pending.pop(0)
                                 plan.completed += 1
                                 completed_windows += 1
@@ -1760,7 +1905,7 @@ def index_archive(
                                     f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from CDX continuation",
                                     details={"excluded": excluded_hosts, "raw_rows": received})
                             if error_id:
-                                database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
+                                resolve_previous_error()
                                 error_id = None
                             checkpoint_seconds = time.monotonic() - checkpoint_started
                         commit_seconds = time.monotonic() - write_started - upsert_seconds - checkpoint_seconds
@@ -1803,19 +1948,29 @@ def index_archive(
                 except Stopped:
                     with database:
                         persist_task_state(encode_plan(plan), False, seen, error_id)
+                    if stop_event.is_set() and task_queue.pending:
+                        break
                     raise
                 except RateLimitDeferred as exc:
                     error_id = _defer_transient_window(
                         target_config, database, plan, current, persist_task_state, seen, error_id,
                         exc, callback, completed_windows, total_windows, stop_event,
-                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
+                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted, index_scope=active_error_scope(), index_target=target,
                     )
                     if task_queue:
-                        due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
-                        task_queue.append(task)
-                        yielded = True
+                        task_queue.append(task, time.monotonic() + transient_backoff(target_config, current.failures))
                         break
                 except TransientRequestError as exc:
+                    if isinstance(exc, InvalidPageCount) and current.strategy == "paged":
+                        current.strategy = "resume"
+                        current.verifying_pages = True
+                        current.pagination_supported = False
+                        current.page_size = min(5000, current.page_size or target_config.page_size)
+                        with database:
+                            persist_task_state(encode_plan(plan), False, seen, error_id)
+                            record_recovery_event(database, "index", "invalid_page_count", str(exc),
+                                                  details={"target": target, "start": current.start, "end": current.end})
+                        continue
                     if _recover_with_numbered_pages(target_config, database, current, exc,
                             lambda: persist_task_state(encode_plan(plan), False, seen, error_id)):
                         retry_budget.progress()
@@ -1826,13 +1981,14 @@ def index_archive(
                         continue
                     if exc.connection_failed:
                         current.gateway_504_failures = 0
+                        current.transport_retry = True
                         connection_failure_streak += 1
                         current.failures += 1
                         network = target_config.network.normalized()
                         current.next_eligible_at = time.time() + min(60.0,max(2.0,network.connection_retry_seconds)
                             * (2 ** min(5,max(0,connection_failure_streak-1))))
                         with database:
-                            error_id = record_error(
+                            error_id = scope_error(
                                 database,
                                 "index",
                                 "wayback_connection_unavailable",
@@ -1861,9 +2017,7 @@ def index_archive(
                             ),
                         )
                         if task_queue:
-                            due[task_key] = time.monotonic() + min(60.0, wait_seconds)
-                            task_queue.append(task)
-                            yielded = True
+                            task_queue.append(task, time.monotonic() + min(60.0, wait_seconds))
                             break
                         stop_event.wait(retry_budget.wait_seconds(wait_seconds) if not retry_budget.exhausted else 0)
                         if stop_event.is_set():
@@ -1888,7 +2042,7 @@ def index_archive(
                         # _defer_transient_window counts this failed turn once.
                         # The threshold notice must not escalate its cooldown.
                         with database:
-                            error_id = record_error(database, "index", "transient_index_delay",
+                            error_id = scope_error(database, "index", "transient_index_delay",
                                 f"{target} {label}: {transient_failure_streak} temporary failures: {exc}", retryable=True)
                             persist_task_state(encode_plan(plan), False, seen, error_id)
                         transient_failure_streak = 0
@@ -1901,12 +2055,10 @@ def index_archive(
                         error_id = _defer_transient_window(
                             target_config, database, plan, current, persist_task_state,
                             seen, error_id, exc, callback, completed_windows,
-                            total_windows, stop_event, yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
+                            total_windows, stop_event, yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted, index_scope=active_error_scope(), index_target=target,
                         )
                         if task_queue:
-                            due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
-                            task_queue.append(task)
-                            yielded = True
+                            task_queue.append(task, time.monotonic() + transient_backoff(target_config, current.failures))
                             break
                         continue
                     if current.strategy == "resume" and current.pagination_supported:
@@ -1934,29 +2086,31 @@ def index_archive(
                     error_id = _defer_transient_window(
                         target_config, database, plan, current, persist_task_state, seen, error_id,
                         exc, callback, completed_windows, total_windows, stop_event,
-                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
+                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted, index_scope=active_error_scope(), index_target=target,
                     )
                     if task_queue:
-                        due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
-                        task_queue.append(task)
-                        yielded = True
+                        task_queue.append(task, time.monotonic() + transient_backoff(target_config, current.failures))
                         break
                 except RuntimeError as exc:
-                    if isinstance(exc, PermanentRequestError) and exc.status == 403:
-                        category = exc.category
-                        message = site_issue_message(category, target, "CDX indexing", exc.status)
+                    target_bad_request = (isinstance(exc, PermanentRequestError) and exc.status == 400
+                        and (exc.category == "invalid_index_target" or (exc.category == "http_client_error"
+                        and any(term in str(exc).casefold() for term in ("invalid target", "invalid host", "invalid domain")))))
+                    if isinstance(exc, PermanentRequestError) and (exc.status == 403 or target_bad_request):
+                        category = "index_request_rejected" if target_bad_request else exc.category
+                        message = (f"CDX rejected the request for {target} (HTTP 400)" if target_bad_request
+                                   else site_issue_message(category, target, "CDX indexing", exc.status))
                         # A 403 is not evidence that every capture was indexed.
                         # Keep the exact window pending and report the blocking
                         # condition instead of inventing an empty complete year.
                         with database:
-                            error_id = record_error(
+                            error_id = scope_error(
                                 database, "index", category, f"{target} {label}: {exc}",
                                 http_status=exc.status, retryable=False,
                             )
                             record_site_issue(database, host_from_url(target), "cdx_index",
                                               category, message, target=target, http_status=exc.status)
                             persist_task_state(encode_plan(plan), False, seen, error_id)
-                        blocked_tasks.add(task_key)
+                        deferred = True
                         emit(callback, ProgressEvent("site_issue", message +
                             "; this scope remains unfinished; continuing other indexing scopes.",
                             completed_windows, total_windows,
@@ -1975,7 +2129,7 @@ def index_archive(
                         continue
                     message = f"{target} {label}: {type(exc).__name__}: {exc}"
                     with database:
-                        error_id = record_error(database, "index", "index_failure", message, retryable=False)
+                        error_id = scope_error(database, "index", "index_failure", message, retryable=False)
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     emit(callback, ProgressEvent("index", f"Indexing stopped on a permanent configuration or local-data error for {target} {label}. Progress was saved.", completed_windows, total_windows))
                     raise
@@ -1984,7 +2138,7 @@ def index_archive(
                     # are not network retries. Requeueing them forever hides the
                     # real defect and can make the interface appear stuck.
                     with database:
-                        error_id = record_error(
+                        error_id = scope_error(
                             database,
                             "index",
                             "unexpected_index_error",
@@ -1993,22 +2147,36 @@ def index_archive(
                         )
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     raise
-            accounted[task_key] = (plan.completed, plan.planned - len(default_windows))
             retry_budget.pause()
-            spent[target] = spent.get(target, 0.0) + (time.monotonic() - turn_started)
-            if not plan.pending:
+            if budget_limit is not None:
+                with database:
+                    database.execute("INSERT OR REPLACE INTO normal_index_spent VALUES(?,?,?)",
+                        (target, scoped_time + time.monotonic() - turn_started, int(expired)))
+            if deferred:
+                task_queue.defer_target(target)
+            if deferred or not plan.pending:
                 task_complete(target)
-                retry_budgets.pop(task_key, None)
+            else:
+                task_queue.remember(error_prefix, plan.completed, plan.planned - len(default_windows),
+                                    retry_budget, cursor_histories)
+            if not plan.pending:
                 emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} • {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))
             queue_status()
+        if stop_event.is_set():
+            raise Stopped
     finally:
+        task_queue.close()
         client.close()
     from .status import text_index_status, format_index_status
-    status = text_index_status(database, config)
+    status = text_index_status(database, config, collect=False)
     emit(callback, ProgressEvent('index_status', format_index_status(status),
          status['complete_targets'], status['selected_targets'],
          {**{key: value for key, value in status.items() if key != 'targets'}, 'retain_notice': True}))
-    return bool(status['unfinished_targets'] or budget_deferred or retry_deferred or blocked_tasks)
+    return bool(status['unfinished_targets'])
+
+class InvalidPageCount(MalformedCDXResponse):
+    pass
+
 
 def _request_paged_count(
     client: HttpClient,
@@ -2035,8 +2203,11 @@ def _request_paged_count(
                 params,
                 max_bytes=1024 * 1024,
             )
-            return parse_num_pages(payload)
-        except (RateLimitDeferred, PermanentRequestError, Stopped):
+            try:
+                return parse_num_pages(payload)
+            except ValueError as exc:
+                raise InvalidPageCount(str(exc), splittable=False) from exc
+        except (InvalidPageCount, RateLimitDeferred, PermanentRequestError, Stopped):
             raise
         except TransientRequestError as exc:
             last_error = exc

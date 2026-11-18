@@ -99,6 +99,12 @@ def _permanent_http_rejection(status, url, headers, preview=b""):
         category = 'wayback_excluded'
     elif status == 403:
         category = 'wayback_forbidden'
+    elif status == 400 and any(word in combined for word in
+            ("patternsyntaxexception", "invalid filter", "invalid regex", "unknown field", "invalid parameter")):
+        category = 'invalid_index_parameters'
+    elif status == 400 and any(word in combined for word in
+            ("invalid url", "invalid host", "invalid domain", "invalid target", "malformed url")):
+        category = 'invalid_index_target'
     elif status == 404:
         category = 'missing_capture'
     else:

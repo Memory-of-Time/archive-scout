@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS captures(
     statuscode TEXT,
     digest TEXT,
     length INTEGER NOT NULL DEFAULT 0,
+    cdx_length_raw TEXT,
     state TEXT NOT NULL DEFAULT 'pending',
     download_attempts INTEGER NOT NULL DEFAULT 0,
     document_id INTEGER,
@@ -154,6 +155,16 @@ CREATE TABLE IF NOT EXISTS capture_routing(
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS capture_routing_kind_idx ON capture_routing(resource_class,routing);
+CREATE TABLE IF NOT EXISTS capture_cdx_observations(
+    capture_id INTEGER NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+    target_pattern TEXT NOT NULL,
+    mimetype TEXT NOT NULL,
+    statuscode TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    length TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY(capture_id,target_pattern,mimetype,statuscode,digest,length)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS documents(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     capture_id INTEGER NOT NULL UNIQUE,
@@ -909,12 +920,50 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v7_to_v8(database)
         elif version == 7:
             migrate_v7_to_v8(database)
-        elif version in (8, 9, 10, 11):
+        elif version in (8, 9, 10, 11, 12):
             database.executescript(BASE_SCHEMA_SQL)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
         else:
             database.executescript(BASE_SCHEMA_SQL)
+    if "cdx_length_raw" not in {row[1] for row in database.execute("PRAGMA table_info(captures)")}:
+        database.execute("ALTER TABLE captures ADD COLUMN cdx_length_raw TEXT")
+    database.execute("""CREATE TRIGGER IF NOT EXISTS captures_cdx_conflict AFTER UPDATE OF target_id,mimetype,statuscode,digest,length,cdx_length_raw ON captures
+WHEN OLD.target_id IS NOT NEW.target_id OR OLD.cdx_length_raw IS NOT NEW.cdx_length_raw OR OLD.mimetype IS NOT NEW.mimetype OR OLD.statuscode IS NOT NEW.statuscode
+  OR OLD.digest IS NOT NEW.digest OR OLD.length IS NOT NEW.length
+BEGIN
+    INSERT INTO capture_cdx_observations VALUES(
+        OLD.id,COALESCE((SELECT pattern FROM targets WHERE id=OLD.target_id),''),
+        COALESCE(OLD.mimetype,''),COALESCE(OLD.statuscode,''),COALESCE(OLD.digest,''),
+        COALESCE(OLD.cdx_length_raw,CAST(OLD.length AS TEXT)),OLD.updated_at) ON CONFLICT DO NOTHING;
+    INSERT INTO capture_cdx_observations VALUES(
+        NEW.id,COALESCE((SELECT pattern FROM targets WHERE id=NEW.target_id),''),
+        COALESCE(NEW.mimetype,''),COALESCE(NEW.statuscode,''),COALESCE(NEW.digest,''),
+        COALESCE(NEW.cdx_length_raw,CAST(NEW.length AS TEXT)),NEW.updated_at) ON CONFLICT DO NOTHING;
+END;""")
+    for table in ("index_coverage", "index_state"):
+        if "terminal_method" not in {row[1] for row in database.execute(f"PRAGMA table_info({table})")}:
+            database.execute(f"ALTER TABLE {table} ADD COLUMN terminal_method TEXT NOT NULL DEFAULT ''")
+    if has_schema and 2 <= version < 13:
+        database.execute("""UPDATE index_coverage AS c SET complete=0,terminal_method='legacy_review'
+            WHERE complete=1 AND (seen=0 OR strategy='paged' OR EXISTS(
+                SELECT 1 FROM index_pages p WHERE p.target_id=c.target_id AND p.query_signature=c.query_signature
+                AND p.window_start>=c.range_start AND p.window_end<=c.range_end))""")
+        database.execute("""UPDATE index_state AS c SET complete=0,terminal_method='legacy_review'
+            WHERE complete=1 AND (seen=0 OR EXISTS(
+                SELECT 1 FROM index_pages p WHERE p.target_id=c.target_id AND p.query_signature=c.query_signature
+                AND p.window_start>=printf('%04d0101000000',c.year)
+                AND p.window_end<=printf('%04d1231235959',c.year)))""")
+        for table, column in (("index_coverage", "plan_json"), ("index_state", "resume_key")):
+            database.execute(f"""UPDATE {table} SET terminal_method='legacy_tail_review'
+                WHERE complete=0 AND terminal_method='' AND {column} IS NOT NULL AND
+                CASE WHEN json_valid({column}) THEN COALESCE(json_extract({column}, '$.completed'), 0)>0 ELSE 0 END""")
+    if "index_scope" not in {row[1] for row in database.execute("PRAGMA table_info(errors)")}:
+        database.execute("ALTER TABLE errors ADD COLUMN index_scope TEXT")
+    database.execute("""CREATE INDEX IF NOT EXISTS errors_index_scope_idx
+        ON errors(index_scope,category,id) WHERE index_scope IS NOT NULL AND resolved=0""")
+    database.execute("CREATE INDEX IF NOT EXISTS index_state_open_error ON index_state(error_id) WHERE complete=0 AND error_id IS NOT NULL")
+    database.execute("CREATE INDEX IF NOT EXISTS index_coverage_open_error ON index_coverage(error_id) WHERE complete=0 AND error_id IS NOT NULL")
     database.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
 
     # Changes to parsed content invalidate local consumers without body-wide reads.
@@ -933,6 +982,15 @@ def initialize_schema(database: sqlite3.Connection) -> None:
       INSERT INTO project_meta VALUES('documents_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
     END;
     """)
+    for table, fields in (("captures", ("original_url","timestamp","mimetype","state","final_url")),
+                          ("capture_routing", ("resource_class","evidence","routing"))):
+        changed = " OR ".join(f"OLD.{field} IS NOT NEW.{field}" for field in fields)
+        for event, clause in (("insert", "INSERT"), ("delete", "DELETE"),
+                ("update", f"UPDATE OF {','.join(fields)}")):
+            condition = f" WHEN {changed}" if event == "update" else ""
+            database.execute(f"""CREATE TRIGGER IF NOT EXISTS inventory_report_{table}_{event}
+                AFTER {clause} ON {table}{condition}
+                BEGIN DELETE FROM project_meta WHERE key='index_inventory_publication'; END""")
     for table in ('duplicate_groups','duplicate_members','provenance_edges','forum_posts'):
         for action in ('INSERT','UPDATE','DELETE'):
             database.execute(f"""CREATE TRIGGER IF NOT EXISTS scout_{table}_{action.lower()} AFTER {action} ON {table}
@@ -945,6 +1003,21 @@ def initialize_schema(database: sqlite3.Connection) -> None:
     except Exception:
         database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('fts5','0')")
     database.executescript("""
+        CREATE INDEX IF NOT EXISTS captures_classification_idx ON captures(query_signature,id);
+        CREATE TRIGGER IF NOT EXISTS capture_routing_removed AFTER DELETE ON capture_routing BEGIN
+          UPDATE project_meta SET value=OLD.capture_id-1 WHERE key='classification_cursor:' ||
+            (SELECT query_signature FROM captures WHERE id=OLD.capture_id) AND CAST(value AS INTEGER)>=OLD.capture_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS capture_class_input_updated AFTER UPDATE OF original_url,mimetype,query_signature ON captures
+        WHEN OLD.original_url IS NOT NEW.original_url OR OLD.mimetype IS NOT NEW.mimetype OR OLD.query_signature IS NOT NEW.query_signature BEGIN
+          DELETE FROM capture_routing WHERE capture_id=NEW.id AND routing='pending' AND NEW.state='pending';
+          UPDATE project_meta SET value=NEW.id-1 WHERE key='classification_cursor:' || NEW.query_signature
+            AND CAST(value AS INTEGER)>=NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS capture_class_input_inserted AFTER INSERT ON captures BEGIN
+          UPDATE project_meta SET value=NEW.id-1 WHERE key='classification_cursor:' || NEW.query_signature
+            AND CAST(value AS INTEGER)>=NEW.id;
+        END;
         CREATE INDEX IF NOT EXISTS captures_pending_scan_idx ON captures(query_signature,timestamp,id)
             WHERE state='downloaded_unscanned';
         CREATE INDEX IF NOT EXISTS errors_document_lookup_idx ON errors(document_id,operation,resolved);

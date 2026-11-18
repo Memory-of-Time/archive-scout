@@ -13,7 +13,7 @@ from typing import Callable
 from .retry_budget import NoProgressBudget, incomplete_retry_message
 from .cdx.client import RateLimitDeferred
 from .cdx.indexer import index_archive
-from .cdx.parameters import cdx_query_signature
+from .cdx.parameters import cdx_query_signature, index_scopes
 from .cdx.status import text_index_status, format_index_status
 from .database.classification import classify_indexed_captures
 from .analysis.workflow import run_analysis
@@ -782,9 +782,9 @@ def run_project(
             return {"merge_summary": merge_report}
         if mode == "index":
             index_deferred = index_archive(config, database, stop_event, callback)
-            for signature in {cdx_query_signature(config.for_target(target)) for target in config.targets}:
+            for signature in {signature for _, _, signature in index_scopes(config)}:
                 classify_indexed_captures(database, signature, stop_event)
-            paths = generate_index_reports(config, database,
+            paths = generate_index_reports(config, database, reuse_inventory=True,
                 progress=report_progress, stop_event=stop_event)
             paths["project"] = config.output_dir / "project.json"
             finish_operation_run(database, operation_run_id,

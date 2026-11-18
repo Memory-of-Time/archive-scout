@@ -42,8 +42,12 @@ def text_outcome_counts(database, config):
     row = database.execute("""SELECT
         COALESCE(SUM(c.state IN ('pending','downloading','error')),0),
         COALESCE(SUM(CASE WHEN c.state='error' THEN """ + text_unavailable() + """ ELSE 0 END),0)
-        FROM captures c WHERE EXISTS(SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
-            ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
-            WHERE t.id=c.target_id OR EXISTS(SELECT 1 FROM capture_target_membership m
-                WHERE m.capture_id=c.id AND m.target_id=t.id))""").fetchone()
+        FROM captures c WHERE EXISTS(
+            SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+              ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
+            WHERE t.id=c.target_id)
+        OR EXISTS(SELECT 1 FROM capture_target_membership m JOIN targets t ON t.id=m.target_id
+            JOIN archive_scout_download_scopes s
+              ON s.pattern=t.pattern AND s.signature=c.query_signature AND c.timestamp BETWEEN s.start AND s.end
+            WHERE m.capture_id=c.id)""").fetchone()
     return {'unfinished': int(row[0]) - int(row[1]), 'unavailable': int(row[1])}

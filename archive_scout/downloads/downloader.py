@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from ..cdx.client import HttpClient, RateLimitDeferred
-from ..cdx.parameters import cdx_query_signature
+from ..cdx.parameters import cdx_query_signature, index_scopes
 from ..database.classification import classify_indexed_captures
 from ..classification import classify_indexed_resource, classify_payload_kind
 from ..config import ProjectConfig
@@ -87,8 +87,8 @@ def _populate_download_scopes(database: sqlite3.Connection, config: ProjectConfi
     database.execute("DELETE FROM archive_scout_download_scopes")
     database.executemany(
         "INSERT OR IGNORE INTO archive_scout_download_scopes VALUES(?,?,?,?)",
-        ((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
-         for target in config.targets for scoped in [config.for_target(target)]),
+        ((target, signature, scoped.from_date, scoped.to_date)
+         for target, scoped, signature in index_scopes(config)),
     )
 
 
@@ -173,7 +173,7 @@ def prepare_download_rows(
     must remove each claimed ID from the current staging window before refill.
     """
     if not capture_ids and not progressive:
-        for signature in {cdx_query_signature(config.for_target(target)) for target in config.targets}:
+        for signature in {signature for _, _, signature in index_scopes(config)}:
             classify_indexed_captures(database, signature)
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_download_queue")
     database.execute(

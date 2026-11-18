@@ -106,7 +106,10 @@ def _extension_class(ext: str) -> str | None:
 
 def suffix_non_text_decision(url: str) -> ResourceDecision | None:
     """Explicit suffix policy, independent of misleading CDX/replay MIME."""
-    ext = path_extension(url)
+    return _suffix_decision(path_extension(url))
+
+
+def _suffix_decision(ext: str) -> ResourceDecision | None:
     if ext not in SUFFIX_NON_TEXT:
         return None
     if ext in MEDIA_DESCRIPTOR_EXTENSIONS:
@@ -129,11 +132,11 @@ def classify_indexed_resource(url: str, mimetype: str | None) -> ResourceDecisio
     confident when the URL has no contradictory known suffix. Conflicts and weak
     metadata intentionally remain unknown so the replay prefix validator can decide.
     """
-    policy = suffix_non_text_decision(url)
+    ext = path_extension(url)
+    policy = _suffix_decision(ext)
     if policy is not None:
         return policy
     mime = normalized_mime(mimetype)
-    ext = path_extension(url)
     mime_kind = _mime_class(mime)
     ext_kind = _extension_class(ext)
 

@@ -469,7 +469,10 @@ def _request_media_paged_batch(
             max_bytes=1024 * 1024,
             prefer_text=False,
         )
-        current.page_count = parse_num_pages(payload)
+        try:
+            current.page_count = parse_num_pages(payload)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid Timemap page-count response: {exc}") from exc
         current.page_layout = layout
         current.page = min(current.page, current.page_count)
         current.retry_pages = [page for page in current.retry_pages if page < current.page_count]

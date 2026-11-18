@@ -162,33 +162,55 @@ def merge_projects(
                 target_map[int(row["id"])] = get_or_create_target(database, str(row["pattern"]))
 
             capture_total = int(source.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+            capture_columns = _columns(source, "captures")
             capture_rows = source.execute("SELECT * FROM captures ORDER BY id")
             for index, row in enumerate(capture_rows, 1):
                 if stop_event.is_set(): raise Stopped
                 if stop_event.is_set():
                     raise Stopped
                 target_id = target_map.get(int(row["target_id"])) if row["target_id"] is not None else None
-                database.execute(
+                inserted = database.execute(
                     """
                     INSERT OR IGNORE INTO captures(
-                        original_url,timestamp,target_id,query_signature,mimetype,statuscode,digest,length,state,
+                        original_url,timestamp,target_id,query_signature,mimetype,statuscode,digest,length,cdx_length_raw,state,
                         download_attempts,http_status,final_url,bytes_saved,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         row["original_url"], row["timestamp"], target_id, row["query_signature"], row["mimetype"],
-                        row["statuscode"], row["digest"], row["length"], row["state"], row["download_attempts"],
+                        row["statuscode"], row["digest"], row["length"], _value(row, capture_columns, "cdx_length_raw"), row["state"], row["download_attempts"],
                         row["http_status"], row["final_url"], row["bytes_saved"], row["created_at"], row["updated_at"],
                     ),
                 )
                 merged = database.execute(
-                    "SELECT id FROM captures WHERE original_url=? AND timestamp=? AND query_signature=?",
+                    "SELECT * FROM captures WHERE original_url=? AND timestamp=? AND query_signature=?",
                     (row["original_url"], row["timestamp"], row["query_signature"]),
                 ).fetchone()
+                if not inserted.rowcount:
+                    def evidence(item, raw_length, owner):
+                        fields = tuple(item[k] or "" for k in ("mimetype", "statuscode", "digest"))
+                        return (owner, *fields, raw_length if raw_length is not None else str(item["length"]))
+                    previous = evidence(merged, merged["cdx_length_raw"], merged["target_id"])
+                    incoming = evidence(row, _value(row, capture_columns, "cdx_length_raw"), target_id)
+                    if previous != incoming:
+                        for observation, when in ((previous, merged["updated_at"]), (incoming, row["updated_at"])):
+                            database.execute("""INSERT OR IGNORE INTO capture_cdx_observations VALUES(?,
+                                COALESCE((SELECT pattern FROM targets WHERE id=?),''),?,?,?,?,?)""",
+                                (merged["id"], *observation, when))
                 capture_map[int(row["id"])] = int(merged["id"])
                 summary["captures"] += 1
                 if index % 1000 == 0:
                     emit(f"Merged {index:,}/{capture_total:,} captures", index, capture_total)
+
+            if _table_exists(source, "capture_cdx_observations"):
+                for observation in source.execute("SELECT * FROM capture_cdx_observations"):
+                    if stop_event.is_set():
+                        raise Stopped
+                    database.execute("""INSERT OR IGNORE INTO capture_cdx_observations
+                        (capture_id,target_pattern,mimetype,statuscode,digest,length,recorded_at)
+                        VALUES(?,?,?,?,?,?,?)""", (capture_map[int(observation["capture_id"])],
+                        *(observation[key] for key in ("target_pattern","mimetype","statuscode",
+                                                      "digest","length","recorded_at"))))
 
             for row in source.execute("SELECT * FROM documents ORDER BY id"):
                 if stop_event.is_set(): raise Stopped

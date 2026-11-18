@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import replace
 
-from ..cdx.parameters import cdx_query_signature
+from ..cdx.parameters import index_scopes
 from ..config import ProjectConfig
 
 
@@ -14,8 +14,8 @@ def discovery_scope_config(config: ProjectConfig) -> ProjectConfig:
 
 
 def scope_rows(config: ProjectConfig) -> list[tuple[str, str, str, str]]:
-    return sorted((target, cdx_query_signature(scoped), scoped.from_date, scoped.to_date)
-                  for target in config.targets for scoped in [config.for_target(target)])
+    return sorted((target, signature, scoped.from_date, scoped.to_date)
+                  for target, scoped, signature in index_scopes(config))
 
 
 def prepare_saved_scope(database: sqlite3.Connection, config: ProjectConfig) -> None:
