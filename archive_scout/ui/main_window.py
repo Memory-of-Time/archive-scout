@@ -2021,16 +2021,23 @@ class ArchiveScoutApp(tk.Tk):
         output = self.output_var.get().strip()
         if not output:
             raise ValueError("Select an output folder for discovery.")
-        result = (Path(source), Path(output).expanduser(), pattern, start, end)
+        rate = simpledialog.askfloat("Fast URL discovery", "Maximum Wayback CDX requests per second (up to 8)",
+                                     initialvalue=previous[5] if previous else 1.0,
+                                     minvalue=0.0, maxvalue=8.0, parent=self)
+        if rate is None:
+            return None
+        if not 0.0 < rate <= 8.0:
+            raise ValueError("Enter a request rate above zero and at most 8.")
+        result = (Path(source), Path(output).expanduser(), pattern, start, end, rate)
         self._discovery_options = result
         return result
 
-    def run_discovery_worker(self, source, root, pattern, start, end):
+    def run_discovery_worker(self, source, root, pattern, start, end, rate):
         from ..cdx.discovery import run_fast_discovery
         from ..operations import OperationPaths
         try:
             paths, counts = run_fast_discovery(source, root / "reports" / "fast-url-discovery", pattern,
-                start, end, stop_event=self.stop_event, callback=self.on_engine_event)
+                start, end, requests_per_second=rate, stop_event=self.stop_event, callback=self.on_engine_event)
             message = (f"Discovery pass finished with {counts['matches']:,} matching URLs, "
                        f"{counts.get('deferred', 0):,} deferred domains and "
                        f"{counts.get('limited', 0):,} domains at the page limit.\n\n{paths['urls']}")

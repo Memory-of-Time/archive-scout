@@ -68,7 +68,8 @@ class DiscoveryTests(unittest.TestCase):
                 run_fast_discovery(self.source, self.output, self.filter, stop_event=self.stop)
         self.assertEqual(calls, ["first.test"])
         self.stop.clear()
-        reports, counts = run_fast_discovery(self.source, self.output, "&filter=original:" + self.filter)
+        reports, counts = run_fast_discovery(self.source, self.output, "&filter=original:" + self.filter,
+                                              requests_per_second=8)
         self.assertTrue(reports["urls"].samefile(saved[0]))
         self.assertEqual(calls, ["first.test", "second.test", "third.test", "second.test"])
         self.assertEqual(counts, {"searched": 1, "deferred": 1, "limited": 1, "matches": 2,
@@ -100,17 +101,35 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(json.loads(stdout.getvalue())["coverage"]["matches"], 3)
             self.assertEqual(run.call_args.args[3:5], ("2001", "2003"))
 
-    def test_gui_starts_discovery_without_requiring_project_keywords(self):
-        from archive_scout.ui.main_window import ArchiveScoutApp
+    def test_gui_passes_selected_request_rate_without_requiring_project_keywords(self):
+        from archive_scout.ui import main_window
+
+        ArchiveScoutApp = main_window.ArchiveScoutApp
         app = MagicMock()
         app.worker_thread = None
-        app.discovery_options.return_value = (self.source, self.output, self.filter, "2001", "2003")
-        with patch("archive_scout.ui.main_window.ensure_frozen_bundle_available"), \
-             patch("archive_scout.ui.main_window.threading.Thread") as worker:
+        app._discovery_options = None
+        app.output_var.get.return_value = str(self.output)
+        app.discovery_options.side_effect = lambda: ArchiveScoutApp.discovery_options(app)
+        with (
+            patch.object(main_window.filedialog, "askopenfilename", return_value=str(self.source)),
+            patch.object(main_window.simpledialog, "askstring", side_effect=[self.filter, "2001,2003"]),
+            patch.object(main_window.simpledialog, "askfloat", return_value=8.0) as ask_rate,
+            patch.object(main_window, "ensure_frozen_bundle_available"),
+            patch.object(main_window.threading, "Thread") as worker,
+        ):
             ArchiveScoutApp.start(app, override_mode="discover_urls")
         app.build_config.assert_not_called()
+        self.assertEqual(ask_rate.call_args.kwargs["maxvalue"], 8.0)
         self.assertEqual(worker.call_args.kwargs["target"], app.run_discovery_worker)
-        self.assertEqual(worker.call_args.kwargs["args"], app.discovery_options.return_value)
+        args = worker.call_args.kwargs["args"]
+        report = self.output / "matching_urls.txt"
+        with patch("archive_scout.cdx.discovery.run_fast_discovery",
+                   return_value=({"urls": report}, {"matches": 0})) as discover:
+            ArchiveScoutApp.run_discovery_worker(app, *args)
+        discover.assert_called_once_with(
+            self.source, self.output / "reports" / "fast-url-discovery", self.filter, "2001", "2003",
+            requests_per_second=8.0, stop_event=app.stop_event, callback=app.on_engine_event,
+        )
 
 
 class AcquisitionTests(unittest.TestCase):
