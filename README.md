@@ -56,7 +56,7 @@ See [v1.3.0 validation and limits](docs/V130_SUSTAINABILITY.md). Local fixture m
 
 ## Projects and compatibility
 
-Archive Scout v1.3.1 uses **SQLite schema 12**. Opening a supported older project first creates a required pre-upgrade database backup. The upgrade adds transaction-maintained dashboard summaries and scan/error lookup indexes. Existing inventory, saved bodies, matches, reviews, retry history and checkpoints remain in place; no reindex is required. Summary construction is a one-time database pass and may take time on a large project. If a safety backup fails, the upgrade is refused. Keep an independent project backup and **do not reopen a schema-12 project with an older Scout version**. Never edit `schema_info` to force a downgrade.
+This normal-indexing update uses **SQLite schema 13**. Scout backs up supported older databases before upgrading. Existing captures, downloads, project settings and saved cursors stay available. On the next indexing run, Scout checks older completed empty queries and numbered-page scopes whose ordinary CDX coverage was uncertain. The database records the method that established completion and retains conflicting CDX observations. Use this build or a later compatible build to reopen an upgraded project.
 
 Before replacing an installation, stop any active run and back up its project folder. Reopen the same `project.json`; there is no required project reindex. Old `Scout` CLI commands remain supported, and existing GUI preferences stored under the legacy `Scout` settings directory are recognized. See [Project migration](docs/MIGRATION.md), [Project recovery](docs/PROJECT_RECOVERY.md) and the [operations and report snapshot guide](docs/OPERATIONS.md).
 
@@ -77,4 +77,4 @@ MIT-licensed. Not affiliated with the Internet Archive.
 
 Current-selection Rescan and media discovery, full-read evidence checks, earliest-media admission, current retry decisions, corrected scoring and hostname search, generation-safe analysis, verified merge/import identities, bounded maintenance state, and independent optional full-hostname domain extraction. See `docs/V126_AUDIT_IMPLEMENTATION.md` for changes, costs and remaining limits.
 
-Projects migrate additively to schema 12 after a required backup. Keep an independent copy of project data and use Archive Scout v1.3.0 or later for the upgraded project.
+Projects migrate to schema 13 after a required backup. Keep an independent copy of project data.

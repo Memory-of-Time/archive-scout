@@ -39,6 +39,14 @@ def cdx_query_signature(config: ProjectConfig, page_size: int | None = None) -> 
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
+def index_scopes(config: ProjectConfig):
+    config = config.normalized()
+    default = cdx_query_signature(config)
+    for target in config.targets:
+        scoped = config.index_settings(target)
+        yield target, scoped, default if scoped is config else cdx_query_signature(scoped)
+
+
 def _legacy_cdx_query_signature(config: ProjectConfig, page_size: int | None) -> str:
     """Pre-v1.2.4 identity, retained strictly for existing checkpoint adoption."""
     payload = {
@@ -216,31 +224,26 @@ def build_paged_cdx_params(
 
 
 def parse_num_pages(payload: object) -> int:
-    if isinstance(payload, int):
-        return max(0, payload)
-    if isinstance(payload, str) and payload.strip().isdigit():
-        return max(0, int(payload.strip()))
-    if isinstance(payload, list):
-        # Timemap JSON's showNumPages response is normally a tiny two-row table
-        # and the reference downloader reads payload[1][0].  Accept that shape
-        # explicitly, while retaining the older scalar/nested compatibility.
-        if len(payload) >= 2 and isinstance(payload[1], list) and payload[1]:
-            value = payload[1][0]
-            if str(value).strip().isdigit():
-                return max(0, int(str(value).strip()))
-        candidates = payload
-        while isinstance(candidates, list) and len(candidates) == 1:
-            candidates = candidates[0]
-        if isinstance(candidates, int):
-            return max(0, candidates)
-        if isinstance(candidates, str) and candidates.strip().isdigit():
-            return max(0, int(candidates.strip()))
-    if isinstance(payload, dict):
-        for key in ("pages", "numPages", "num_pages"):
-            value = payload.get(key)
-            if str(value).strip().isdigit():
-                return max(0, int(str(value).strip()))
-    raise RuntimeError(f"unexpected CDX page-count response: {payload!r}")
+    value = payload
+    count_names = {"pages", "numpages", "num_pages"}
+    if isinstance(value, dict):
+        counts = [count for key, count in value.items() if str(key).casefold() in count_names]
+        value = counts[0] if len(counts) == 1 else None
+    if isinstance(value, list) and len(value) == 2:
+        header, row = value
+        if (isinstance(header, list) and len(header) == 1
+                and str(header[0]).casefold() in count_names):
+            value = row
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isascii() and value.isdecimal() and len(value) <= 19:
+            value = int(value)
+    if type(value) is int and 0 <= value <= 2**63 - 1:
+        return value
+    raise ValueError(f"invalid CDX page count: {str(payload)[:160]}")
+
 
 def cdx_layout_signature(config: ProjectConfig, start: str, end: str, strategy: str, page_blocks: int = 0) -> str:
     payload = {

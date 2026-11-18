@@ -225,7 +225,7 @@ class Fairness(Fixture):
 
     def test_text_inherited_long_cooldown_keeps_schedule_and_yields_to_reports(self):
         cid = self.capture()
-        self.failure(cid, 'connection', True)
+        self.failure(cid, 'rate_limit', True)
         clock = [100.0]
         self.db.execute('UPDATE text_retry_schedule SET next_eligible_at=1000')
         self.db.commit()
@@ -241,7 +241,7 @@ class Fairness(Fixture):
         with patch.object(stop, 'wait', side_effect=wait), \
              patch('archive_scout.operations.time.time', side_effect=lambda: clock[0]), \
              patch('archive_scout.operations.download_archive', side_effect=download) as fetch:
-            result = recover_transient_text_errors(self.cfg, self.db, 0, [], stop, None,
+            result = recover_transient_text_errors(replace(self.cfg, rate_limit_max_wait=30), self.db, 0, [], stop, None,
                 continuous=True, acquire_only=True)
         self.assertEqual(result, 1)
         self.assertEqual(fetch.call_count, 0)

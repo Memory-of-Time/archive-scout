@@ -12,10 +12,10 @@ from ..utils import utc_now
 
 
 def get_or_create_target(database: sqlite3.Connection, pattern: str, settings: dict | None = None) -> int:
-    row = database.execute("SELECT id FROM targets WHERE pattern=?", (pattern,)).fetchone()
+    row = database.execute("SELECT id,settings_json FROM targets WHERE pattern=?", (pattern,)).fetchone()
     settings_json = json.dumps(settings or {}, ensure_ascii=False, sort_keys=True)
     if row:
-        if settings is not None:
+        if settings is not None and row["settings_json"] != settings_json:
             database.execute("UPDATE targets SET settings_json=? WHERE id=?", (settings_json, row["id"]))
         return int(row["id"])
     cursor = database.execute(
@@ -59,7 +59,8 @@ def cdx_row_to_dict(row: Mapping[str, object] | Sequence[object]) -> dict[str, s
 
 def _safe_length(value: str) -> int:
     try:
-        return max(0, int(value or 0))
+        value = int(value or 0)
+        return value if 0 <= value <= 2**63 - 1 else 0
     except (TypeError, ValueError, OverflowError):
         return 0
 
@@ -71,6 +72,7 @@ def _capture_values(
     now: str,
 ) -> tuple:
     timestamp, original, mimetype, statuscode, digest, length = _cdx_fields(row)
+    numeric_length = _safe_length(length)
     return (
         original,
         timestamp,
@@ -79,7 +81,8 @@ def _capture_values(
         mimetype,
         statuscode,
         digest,
-        _safe_length(length),
+        numeric_length,
+        None if length == str(numeric_length) else length,
         "pending",
         now,
         now,
@@ -99,20 +102,22 @@ def upsert_captures(
     changed_captures = 0
     statement = """
         INSERT INTO captures(
-            original_url,timestamp,target_id,query_signature,mimetype,statuscode,digest,length,state,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            original_url,timestamp,target_id,query_signature,mimetype,statuscode,digest,length,cdx_length_raw,state,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(original_url,timestamp,query_signature) DO UPDATE SET
             target_id=excluded.target_id,
             mimetype=excluded.mimetype,
             statuscode=excluded.statuscode,
             digest=excluded.digest,
             length=excluded.length,
+            cdx_length_raw=excluded.cdx_length_raw,
             updated_at=excluded.updated_at
         WHERE captures.target_id IS NOT excluded.target_id
            OR captures.mimetype IS NOT excluded.mimetype
            OR captures.statuscode IS NOT excluded.statuscode
            OR captures.digest IS NOT excluded.digest
            OR captures.length IS NOT excluded.length
+           OR captures.cdx_length_raw IS NOT excluded.cdx_length_raw
         """
     batch: list[tuple] = []
     for row in rows:
@@ -389,6 +394,7 @@ def record_error(
     media_capture_id: int | None = None,
     http_status: int | None = None,
     retryable: bool = True,
+    index_scope: str | None = None,
 ) -> int:
     now = utc_now()
     # Keep nullable identity columns sargable. Older code wrapped every identity
@@ -396,6 +402,8 @@ def record_error(
     # lookup indexes precisely when a failing large project needed them most.
     clauses = ["resolved=0", "ignored=0", "operation=?", "category=?"]
     params: list[object] = [operation, category]
+    clauses.append("index_scope IS ?")
+    params.append(index_scope)
     for column, value in (
         ("capture_id", capture_id),
         ("document_id", document_id),
@@ -422,10 +430,10 @@ def record_error(
         """
         INSERT INTO errors(
             capture_id,document_id,media_capture_id,operation,category,message,http_status,
-            attempt_count,retryable,resolved,ignored,first_seen,last_seen
-        ) VALUES(?,?,?,?,?,?,?,1,?,0,0,?,?)
+            attempt_count,retryable,resolved,ignored,first_seen,last_seen,index_scope
+        ) VALUES(?,?,?,?,?,?,?,1,?,0,0,?,?,?)
         """,
-        (capture_id, document_id, media_capture_id, operation, category, message, http_status, int(retryable), now, now),
+        (capture_id, document_id, media_capture_id, operation, category, message, http_status, int(retryable), now, now, index_scope),
     )
     return int(cursor.lastrowid)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import uuid
 import os
 import shutil
 import sqlite3
@@ -12,7 +14,7 @@ import tempfile
 
 from ..config import ProjectConfig
 from ..downloads.downloader import replay_url
-from ..utils import atomic_write_lines, atomic_write_text, json_value, utc_now
+from ..utils import atomic_text_writer, atomic_write_lines, atomic_write_text, json_value, utc_now
 
 REPORT_NAMES = (
     "matches_ranked.txt",
@@ -173,22 +175,59 @@ def _index_coverage_status(database: sqlite3.Connection) -> str:
 
 def _write_indexing_status(config, database, root, stop_event=None):
     from ..cdx.status import text_index_status
-    status = text_index_status(database, config)
-    def lines():
-        yield 'target\tstatus\tunfinished_scopes\treason\tlast_error'
-        for row in status['targets']:
+    path = root / "indexing_status.tsv"
+    with atomic_text_writer(path) as handle:
+        handle.write("target\tstatus\tunfinished_scopes\treason\tlast_error\tnext_retry_utc\n")
+        def write(row):
             if stop_event is not None and stop_event.is_set():
                 from ..events import Stopped
                 raise Stopped
-            yield '\t'.join(str(row[key]).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
-                            for key in ('target', 'status', 'unfinished_scopes', 'reason', 'last_error'))
-    path = root / 'indexing_status.tsv'
-    atomic_write_lines(path, lines())
-    return path
+            handle.write("\t".join(str(row[key]).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+                for key in ("target", "status", "unfinished_scopes", "reason", "last_error", "next_retry_utc")) + "\n")
+        status = text_index_status(database, config, collect=False, on_row=write)
+    return path, status
+
+
+def _publish_inventory(database, root, fields, paths, progress, stop_event):
+    key = "index_inventory_publication"
+    name = "all_indexed_urls"
+    path = root / (name + ".txt")
+    def check_stop():
+        if stop_event is not None and stop_event.is_set():
+            from ..events import Stopped
+            raise Stopped
+    row = database.execute("SELECT value FROM project_meta WHERE key=?", (key,)).fetchone()
+    cache = json_value(row[0], {}) if row else {}
+    if isinstance(cache, dict) and cache.get("fields") == fields and path.is_file():
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                check_stop()
+                digest.update(chunk)
+        if digest.hexdigest() == cache.get("sha256"):
+            paths[name] = path
+            if progress:
+                progress(name, cache["rows"], True)
+            return
+    token = json.dumps(uuid.uuid4().hex)
+    with database:
+        database.execute("INSERT OR REPLACE INTO project_meta VALUES(?,?)", (key, token))
+    digest = hashlib.sha256()
+    count = 0
+    def inventory():
+        nonlocal count
+        for line in _indexed_inventory_lines(database, fields):
+            digest.update((line + ("\n" if line and not line.endswith("\n") else "")).encode("utf-8", "replace"))
+            count += 1
+            yield line
+    _write_selected(root, None, name, inventory(), paths, progress, stop_event)
+    with database:
+        database.execute("UPDATE project_meta SET value=? WHERE key=? AND value=?",
+                         (json.dumps(dict(fields=fields, sha256=digest.hexdigest(), rows=count)), key, token))
 
 
 def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
-                           *, operation: str = "index",
+                           *, operation: str = "index", reuse_inventory: bool = False,
                            progress: Callable[[str, int, bool], None] | None = None,
                            stop_event: threading.Event | None = None) -> dict[str, Path]:
     """Index/acquisition reports, with safe cancellation and explicit semantics."""
@@ -201,13 +240,19 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
     paths: dict[str, Path] = {}
     paths["unfinished_over_attempts"] = _write_over_attempt_inventory(config, database, root, stop_event)
     if opts.output_enabled("all_indexed_urls"):
-        _write_selected(root,None,"all_indexed_urls",
-                        _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths,progress,stop_event)
+        fields = opts.fields_for("all_indexed_urls")
+        if reuse_inventory:
+            _publish_inventory(database, root, fields, paths, progress, stop_event)
+        else:
+            _write_selected(root, None, "all_indexed_urls", _indexed_inventory_lines(database, fields),
+                            paths, progress, stop_event)
     if opts.output_enabled("summary"):
-        from ..cdx.status import text_index_status, format_index_status
+        from ..cdx.status import format_index_status
         from ..downloads.outcomes import text_outcome_counts
+        coverage_text = ''
         if 'index_coverage' in opts.summary_fields:
-            paths['indexing_status'] = _write_indexing_status(config, database, root, stop_event)
+            paths['indexing_status'], status = _write_indexing_status(config, database, root, stop_event)
+            coverage_text = _index_coverage_status(database) + '\n' + format_index_status(status)
         outcomes = text_outcome_counts(database, config) if 'states' in opts.summary_fields else {'unfinished': 0, 'unavailable': 0}
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         values = {
@@ -218,7 +263,7 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
-            "index_coverage": _index_coverage_status(database) + '\n' + format_index_status(text_index_status(database, config)),
+            "index_coverage": coverage_text,
             "unresolved_errors": f"Unresolved errors: {int(database.execute('SELECT COUNT(*) FROM errors WHERE resolved=0').fetchone()[0]):,}",
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items()))
@@ -406,10 +451,12 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
     if opts.output_enabled("site_issues"):
         _write_selected(root, run_dir, "site_issues", _site_issue_rows(database, opts.fields_for("site_issues")), paths, progress, stop_event)
     if opts.output_enabled("summary"):
-        from ..cdx.status import text_index_status, format_index_status
+        from ..cdx.status import format_index_status
         from ..downloads.outcomes import text_outcome_counts
+        coverage_text = ''
         if 'index_coverage' in opts.summary_fields:
-            paths['indexing_status'] = _write_indexing_status(config, database, root, stop_event)
+            paths['indexing_status'], status = _write_indexing_status(config, database, root, stop_event)
+            coverage_text = _index_coverage_status(database) + '\n' + format_index_status(status)
         outcomes = text_outcome_counts(database, config) if 'states' in opts.summary_fields else {'unfinished': 0, 'unavailable': 0}
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         keywords = json.loads(run["keywords_json"])
@@ -437,7 +484,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             "targets": f"Targets: {', '.join(config.targets) or '(project database only)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
-            "index_coverage": _index_coverage_status(database) + '\n' + format_index_status(text_index_status(database, config)),
+            "index_coverage": coverage_text,
             "ranked_matches": ranked_summary,
             "scan_diagnostic": (
                 "Scan status: " +

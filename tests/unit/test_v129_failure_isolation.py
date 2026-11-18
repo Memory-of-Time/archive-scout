@@ -52,13 +52,14 @@ class IsolationTests(unittest.TestCase):
 
             def do_GET(self):
                 body = BAD if self.path == '/bad' else BODY
-                status = int(self.path[1:]) if self.path in ('/429', '/503') else 200
+                status = (int(self.path[1:]) if self.path in ('/429', '/503')
+                          else 503 if self.path.startswith('/bare') else 200)
                 self.send_response(status)
                 self.send_header('Content-Length', str(len(body)))
                 self.send_header('Content-Type', 'text/html')
                 if self.path == '/bad':
                     self.send_header('Content-Encoding', 'gzip')
-                if status in (429, 503):
+                if self.path in ("/429", "/503"):
                     self.send_header('Retry-After', '2')
                 self.end_headers()
                 if self.path == '/held':
@@ -146,6 +147,78 @@ class IsolationTests(unittest.TestCase):
             self.assertTrue(gate.snapshot()['probe_required'])
             self.assertGreater(gate.remaining(), 1)
 
+    def test_text_replay_isolates_bare_503_and_pauses_only_on_cluster(self):
+        from archive_scout.network.replay_turn import ReplayTurn, replay_turn
+        gate = SharedHostGate(5)
+        client = self.client(gate=gate)
+        destination = self.root / "replay"
+
+        def replay(path):
+            token = replay_turn.set(ReplayTurn(6.0))
+            try:
+                return client.download_to_path(self.url(path), destination, 10000, retain_partial=False)
+            finally:
+                replay_turn.reset(token)
+
+        for _ in range(3):
+            with self.assertRaises(Exception) as failed:
+                replay("/bare-one")
+            self.assertNotIsInstance(failed.exception, RateLimitDeferred)
+            self.assertEqual(classify_exception(failed.exception), ("http_server_error", 503, True))
+            self.assertFalse(gate.snapshot()["probe_required"])
+            self.assertFalse(destination.exists())
+        self.assertEqual(replay("/good")["status"], 200)
+        self.assertEqual(destination.read_bytes(), BODY)
+        for path in ("/bare-two", "/bare-three"):
+            with self.assertRaises(Exception) as failed:
+                replay(path)
+            self.assertNotIsInstance(failed.exception, RateLimitDeferred)
+        with self.assertRaises(RateLimitDeferred):
+            replay("/bare-four")
+        self.assertEqual(gate.dispatch_slots(20), 0)
+        self.assertIn("across replay requests", gate.snapshot()["reason"])
+        gate.blocked_until = time.monotonic() - 1
+        with self.assertRaises(RateLimitDeferred):
+            replay("/bare-four")
+        self.assertEqual(gate.dispatch_slots(20), 0)
+        gate.blocked_until = time.monotonic() - 1
+        self.assertEqual(replay("/good")["status"], 200)
+        self.assertEqual(gate.dispatch_slots(20), 20)
+        with self.assertRaises(RateLimitDeferred):
+            replay("/503")
+        self.assertGreater(gate.remaining(), 1)
+        self.assertEqual(gate.dispatch_slots(20), 0)
+
+    def test_late_body_completion_cannot_reopen_backend_cooled_after_headers(self):
+        from archive_scout.network.transports import ResilientTransport
+        transport = ResilientTransport(pool_size=2, connect_timeout=2, read_timeout=2, mode="httpx", trust_env=False)
+        self.addCleanup(transport.close)
+        headers_seen = threading.Event()
+        held = threading.Event()
+
+        def stream(*args, **kwargs):
+            from archive_scout.network.transports import TransportFileResponse
+            _backend_received_headers(200)
+            headers_seen.set()
+            self.assertTrue(held.wait(5))
+            return TransportFileResponse(200, {}, self.url("/held"), self.root / "body",
+                                         0, "", b"", "httpx", 0.0)
+
+        with patch.object(transport.backends["httpx"], "download", side_effect=stream):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(transport.download, self.url("/held"), {},
+                                      self.root / "body", 1000, threading.Event())
+                try:
+                    self.assertTrue(headers_seen.wait(4))
+                    for _ in range(transport.CONNECTION_FAILURE_THRESHOLD):
+                        failed = transport._await_backend("httpx", threading.Event())
+                        transport._backend_result(failed, False)
+                    self.assertEqual(transport.dispatch_slots(10), 0)
+                finally:
+                    held.set()
+                self.assertEqual(pending.result(timeout=5).status, 200)
+        self.assertEqual(transport.dispatch_slots(10), 0)
+
     def test_body_reset_does_not_cool_backend_or_repeat_other_stacks(self):
         client = self.client()
         transport = client.transport
@@ -216,7 +289,7 @@ class IsolationTests(unittest.TestCase):
             workers, budget = scan_capacity(1, 64*1024*1024)
             self.assertEqual((workers, budget), (1, 64*1024*1024))
 
-    def test_persistent_text_tail_preserves_outage_for_later_resume(self):
+    def test_persistent_text_tail_recovers_a_connection_outage_without_manual_resume(self):
         cfg = ProjectConfig(self.root, targets=['example.test/*'], keywords=['needle'],
             from_date='2001', to_date='2001', max_attempts=1,
             network=NetworkConfig(retry_base_seconds=1, retry_max_seconds=1)).normalized()
@@ -246,10 +319,10 @@ class IsolationTests(unittest.TestCase):
             with patch('archive_scout.operations.download_archive', side_effect=recover):
                 result = recover_transient_text_errors(cfg, db, 0, [], FastStop(), None,
                                                        continuous=True, acquire_only=True)
-            self.assertEqual(result, 1)
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(db.execute('SELECT state FROM captures').fetchone()[0], 'error')
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM text_retry_schedule').fetchone()[0], 1)
+            self.assertEqual(result, 0)
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(db.execute('SELECT state FROM captures').fetchone()[0], 'downloaded')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM text_retry_schedule').fetchone()[0], 0)
 
     def test_persistent_media_tail_preserves_outage_for_later_resume(self):
         from archive_scout.database.repositories import upsert_media_capture

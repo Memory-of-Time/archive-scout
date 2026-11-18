@@ -27,13 +27,12 @@ def selected_retry_allowed(capture_id='c.id'):
              OR selected.routing GLOB 'failed_size_limit:*')))"""
 
 
-def restore_increased_size_limit(database, config):
+def restore_increased_size_limit(database, config, *, prepared_scope=False):
     from .downloader import _populate_download_scopes
-    _populate_download_scopes(database, config)
-    scope = """EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes sc
-        ON sc.pattern=t.pattern AND sc.signature=c.query_signature AND c.timestamp BETWEEN sc.start AND sc.end
-        WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-            WHERE m.capture_id=c.id AND m.target_id=t.id))"""
+    from ..database.scope import scope_membership_predicate
+    if not prepared_scope:
+        _populate_download_scopes(database, config)
+    scope = scope_membership_predicate("archive_scout_download_scopes")
     eligible = """r.routing GLOB 'failed_size_limit:*'
         AND CAST(SUBSTR(r.routing,LENGTH('failed_size_limit:')+1) AS INTEGER) < ?"""
     database.execute("""CREATE TEMP TABLE IF NOT EXISTS archive_scout_size_rechecks(
@@ -191,11 +190,8 @@ def next_due(database: sqlite3.Connection, config=None, *, respect_selection=Fal
     if config is not None:
         from .downloader import _populate_download_scopes
         _populate_download_scopes(database, config)
-        scope = """ AND EXISTS(SELECT 1 FROM targets t
-            JOIN archive_scout_download_scopes sc ON sc.pattern=t.pattern
-            WHERE sc.signature=c.query_signature AND c.timestamp BETWEEN sc.start AND sc.end AND (t.id=c.target_id OR EXISTS
-             (SELECT 1 FROM capture_target_membership m
-              WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
+        from ..database.scope import scope_membership_predicate
+        scope = " AND " + scope_membership_predicate("archive_scout_download_scopes")
     else:
         scope = ""
     selection, params = retry_selection(database, config) if respect_selection and config else ("", [])

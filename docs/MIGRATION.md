@@ -1,4 +1,8 @@
-# v1.3.0: schema 11 → 12
+# Normal indexing update, schema 12 to 13
+
+Scout creates a database backup before upgrading. Existing capture IDs, downloaded files, memberships and saved cursors stay available. Older completed empty queries and scopes with numbered-page evidence become eligible for a one-time ordinary CDX check. Previously stored metadata can be verified against future responses. Conflicting observations and their target patterns are recorded from this upgrade onward. Use the pre-upgrade backup with the earlier build.
+
+## v1.3.0, schema 11 to 12
 
 The current release preserves project identities, files, configuration and processing history. Opening a writable supported older database creates a required backup before adding schema-12 summaries and lookup indexes. A failed backup prevents the upgrade. Keep your independent backup and use v1.3.0 for the upgraded project; older applications cannot safely maintain the new summaries.
 

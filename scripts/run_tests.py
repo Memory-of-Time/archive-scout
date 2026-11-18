@@ -33,7 +33,9 @@ def main() -> int:
     (args.output / "summary.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(payload, indent=2))
     if not result.wasSuccessful():
-        print("Tests failed; consult " + str(args.output / "tests.log"), file=sys.stderr)
+        for case, traceback in result.failures + result.errors:
+            print(f"Failed: {case.id()}\n{traceback}", file=sys.stderr)
+        print("Full test log is at " + str(args.output / "tests.log"), file=sys.stderr)
     return 0 if result.wasSuccessful() else 1
 
 
