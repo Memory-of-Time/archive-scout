@@ -191,17 +191,14 @@ class TransportRecoveryTests(unittest.TestCase):
         url, _held = self.server()
         transport = self.transport("auto")
         transport.BACKEND_RECOVERY_SECONDS = .12
-        outage_ends = None
+        expected_backends = set(transport.backend_names)
         failed = set()
         attempts = threading.Lock()
 
         def intermittent(name, download):
             def call(*args, **kwargs):
-                nonlocal outage_ends
                 with attempts:
-                    if outage_ends is None:
-                        outage_ends = time.monotonic() + .85
-                    offline = time.monotonic() < outage_ends
+                    offline = failed != expected_backends
                     if offline:
                         failed.add(name)
                 if offline:
@@ -240,11 +237,17 @@ class TransportRecoveryTests(unittest.TestCase):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, transport=transport, **kwargs)
 
-            with patch("archive_scout.downloads.downloader.HttpClient", FaultingClient), \
-                    patch("archive_scout.downloads.downloader.replay_url", return_value=url + "/fast"):
-                run_project(cfg, "download")
+            stop_event = threading.Event()
+            deadline = threading.Timer(30, stop_event.set)
+            deadline.start()
+            try:
+                with patch("archive_scout.downloads.downloader.HttpClient", FaultingClient), \
+                        patch("archive_scout.downloads.downloader.replay_url", return_value=url + "/fast"):
+                    run_project(cfg, "download", stop_event)
+            finally:
+                deadline.cancel()
 
-            self.assertEqual(failed, set(transport.backend_names))
+            self.assertEqual(failed, expected_backends)
             files = list((root / "captures").rglob("*.txt"))
             self.assertEqual(len(files), count)
             self.assertTrue(all(hashlib.sha256(file.read_bytes()).digest() == hashlib.sha256(BODY).digest()
