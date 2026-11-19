@@ -258,19 +258,57 @@ class MigrationRestorationTests(unittest.TestCase):
 
 
 class GuiRestorationTests(unittest.TestCase):
+    def _desktop_test_in_child(self):
+        if os.environ.get('ARCHIVE_SCOUT_GUI_TEST_CHILD') == '1':
+            return False
+        # Isolate Tcl lifetime from the HTTP fault tests' worker threads.
+        gc.collect()
+        environment = dict(os.environ, ARCHIVE_SCOUT_GUI_TEST_CHILD='1')
+        test_name = 'tests.unit.test_v123_restoration.GuiRestorationTests.' + self._testMethodName
+        result = subprocess.run([sys.executable, '-m', 'unittest', test_name, '-v'],
+            cwd=Path(__file__).resolve().parents[2], env=environment,
+            text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if 'skipped=1' in result.stderr:
+            self.skipTest('No desktop display available')
+        gc.collect()
+        return True
+
+    def test_resume_allows_engine_to_restore_an_operation_without_keywords(self):
+        if self._desktop_test_in_child():
+            return
+        import tkinter as tk
+        from archive_scout.ui.main_window import ArchiveScoutApp, MODE_LABELS
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch('archive_scout.ui.main_window.app_support_dir', return_value=root), patch.object(ArchiveScoutApp, 'show_welcome'):
+                try:
+                    app = ArchiveScoutApp()
+                except tk.TclError as exc:
+                    if 'display' in str(exc).casefold():
+                        self.skipTest(str(exc))
+                    raise
+                try:
+                    app.withdraw()
+                    app.apply_config(ProjectConfig(root, ['example.org/*'], []).normalized())
+                    with self.assertRaisesRegex(ValueError, 'keyword set'):
+                        app.build_config()
+                    app.mode_var.set(next(label for label, mode in MODE_LABELS.items() if mode == 'resume'))
+                    with patch.object(app, 'run_worker') as worker, patch('archive_scout.ui.main_window.messagebox.showerror') as showerror:
+                        app.start_button.invoke()
+                        showerror.assert_not_called()
+                        self.assertIsNotNone(app.worker_thread)
+                        app.worker_thread.join(timeout=3)
+                        worker.assert_called_once()
+                    config, mode = worker.call_args.args
+                    self.assertEqual(mode, 'resume')
+                    self.assertEqual(config.selected_keyword_sets(), [])
+                finally:
+                    app.destroy()
+
     def test_all_pages_config_hitlist_theme_borders_and_readonly_evidence(self):
-        if os.environ.get('ARCHIVE_SCOUT_GUI_TEST_CHILD') != '1':
-            # Isolate Tcl lifetime from the HTTP fault tests' worker threads.
-            gc.collect()
-            environment=dict(os.environ,ARCHIVE_SCOUT_GUI_TEST_CHILD='1')
-            result=subprocess.run([sys.executable,'-m','unittest',
-                'tests.unit.test_v123_restoration.GuiRestorationTests.'+self._testMethodName,'-v'],
-                cwd=Path(__file__).resolve().parents[2],env=environment,
-                text=True,capture_output=True,timeout=60)
-            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-            if 'skipped=1' in result.stderr:
-                self.skipTest('No desktop display available')
-            gc.collect()
+        if self._desktop_test_in_child():
             return
         import tkinter as tk
         from archive_scout.ui.main_window import ArchiveScoutApp
