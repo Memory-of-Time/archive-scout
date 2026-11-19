@@ -361,26 +361,27 @@ def scan_prior_documents_once(database: sqlite3.Connection, jobs: list[ScanJob],
 def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
                 config: ProjectConfig | None = None) -> None:
     """Do not label a scan complete while a known saved body lacks a score."""
+    scope = """c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS (
+        SELECT 1 FROM targets t WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS (
+            SELECT 1 FROM capture_target_membership m
+            WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
     for job in jobs:
         actual = status
         if status == "complete" and config is not None:
             for target in config.targets:
-                signature = cdx_query_signature(config.for_target(target))
+                scoped = config.for_target(target)
+                scope_params = (cdx_query_signature(scoped), scoped.from_date, scoped.to_date, target)
                 gap = database.execute(
-                    """SELECT 1 FROM captures c
-                       WHERE c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS (SELECT 1 FROM targets t
-                           WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS
-                               (SELECT 1 FROM capture_target_membership m
-                                WHERE m.capture_id=c.id AND m.target_id=t.id))) AND
-                        (c.state='downloaded_unscanned' OR
-                         (c.state='downloaded' AND (NOT EXISTS (
-                             SELECT 1 FROM documents d WHERE d.capture_id=c.id) OR
-                             EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=c.id
-                             AND NOT EXISTS (SELECT 1 FROM document_matches m
-                                 WHERE m.document_id=d.id AND m.scan_run_id=?)))) OR
-                         EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                             AND e.operation='scan' AND e.resolved=0)) LIMIT 1""",
-                    (signature, config.for_target(target).from_date, config.for_target(target).to_date, target, job.scan_run_id),
+                    f"""SELECT 1 FROM captures c
+                       WHERE c.state IN ('downloaded','downloaded_unscanned') AND {scope}
+                       AND (c.state='downloaded_unscanned' OR NOT EXISTS (
+                           SELECT 1 FROM documents d JOIN document_matches m ON m.document_id=d.id
+                           WHERE d.capture_id=c.id AND m.scan_run_id=?))
+                       UNION ALL
+                       SELECT 1 FROM errors e CROSS JOIN captures c ON c.id=e.capture_id
+                       WHERE e.resolved=0 AND e.operation='scan' AND {scope}
+                       LIMIT 1""",
+                    (*scope_params, job.scan_run_id, *scope_params),
                 ).fetchone()
                 if gap:
                     actual = "interrupted"
@@ -858,11 +859,13 @@ def run_project(
 
         # Filesystem and database are not one transaction. Recover complete
         # raw bodies after an interrupted SQLite/FTS commit before network work.
-        if mode in {"all", "resume", "download", "external_media_after_scan", "rescan"}:
+        retry_resume = resumed_request and mode in {"retry_errors", "retry_download_errors"}
+        if retry_resume or mode in {"all", "resume", "download", "download_only", "external_media_after_scan", "rescan"}:
             from .scanning.pending import adopt_orphaned_bodies
             emit(callback, ProgressEvent("resume_local", "Checking interrupted saves for recoverable local files."))
             for target in config.targets:
-                adopt_orphaned_bodies(database, config.for_target(target), stop_event, callback, target=target)
+                adopt_orphaned_bodies(database, config.for_target(target), stop_event, callback,
+                                      target=target, respect_selection=retry_resume)
 
         # Scanning retained bodies is local work and must not wait for CDX.
         # On a Resume with an unreachable indexing endpoint, every previously

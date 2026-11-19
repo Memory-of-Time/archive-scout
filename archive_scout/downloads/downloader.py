@@ -593,6 +593,7 @@ def _save_payload_evidence(database: sqlite3.Connection, result: dict) -> None:
                             str(result["encoding_recovery"]),
                             capture_id=int(result["capture_id"]), retryable=False)
         database.execute("UPDATE errors SET resolved=1 WHERE id=?", (note,))
+    status = result.get("http_status")
     database.execute("""INSERT INTO capture_payload_evidence
         (capture_id,content_hash,bytes_saved,response_content_type,final_url,response_status,updated_at)
         VALUES(?,?,?,?,?,?,?) ON CONFLICT(capture_id) DO UPDATE SET
@@ -602,7 +603,7 @@ def _save_payload_evidence(database: sqlite3.Connection, result: dict) -> None:
         updated_at=excluded.updated_at""", (int(result["capture_id"]),
         str(result["content_hash"]),int(result["bytes_saved"]),
         str(result.get("response_content_type") or ""),str(result.get("final_url") or ""),
-        int(result["http_status"]),utc_now()))
+        int(status) if status is not None else None,utc_now()))
 
 
 def save_success(database: sqlite3.Connection, result: dict) -> None:

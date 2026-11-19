@@ -1918,7 +1918,7 @@ class ArchiveScoutApp(tk.Tk):
         mode = selected_mode
         if mode in {"all", "external_media_after_scan", "index", "download_only"} and not config.targets:
             raise ValueError("Add at least one site or path.")
-        if require_keywords and mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
+        if require_keywords and mode in {"all", "external_media_after_scan", "download", "rescan", "retry_errors"} and not config.selected_keyword_sets():
             raise ValueError("Select at least one non-empty keyword set.")
         if mode == "merge_project" and not config.analysis.merge_source:
             raise ValueError("Choose a source project folder in Archive analysis.")

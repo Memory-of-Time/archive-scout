@@ -390,8 +390,53 @@ def _record_recovery_gap(database, row, category: str, message: str) -> None:
                  category, message, capture_id=capture_id, retryable=True)
 
 
+def _orphan_candidate_batches(database: sqlite3.Connection, config, target: str,
+                              stop_event: threading.Event, *, respect_selection: bool = False
+                              ) -> Iterator[list[sqlite3.Row]]:
+    signature = cdx_query_signature(config)
+    query = """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.digest,c.state,c.download_attempts,
+                      c.http_status AS capture_status,c.final_url AS capture_final_url,
+                      v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
+                      v.response_content_type,v.final_url,v.response_status
+               FROM captures c INDEXED BY captures_download_idx
+               LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
+               WHERE c.query_signature=? AND c.state=? AND c.timestamp BETWEEN ? AND ?
+               AND (c.state!='downloaded_unscanned' OR v.capture_id IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=c.id)
+               AND EXISTS (SELECT 1 FROM targets t WHERE t.pattern=? AND
+                   (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
+                    WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
+    selection_params = []
+    states = ("error", "pending", "downloaded_unscanned")
+    if respect_selection:
+        from ..downloads.schedule import explicit_error_predicate, retry_selection
+        selection, selection_params = retry_selection(database, config)
+        query += f""" AND EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
+            AND e.operation='download' AND e.resolved=0 AND e.ignored=0
+            AND {explicit_error_predicate(config)})""" + selection
+        states = ("error", "pending")
+    order_by = " ORDER BY c.download_attempts,c.id LIMIT ?"
+    batch_size = 500
+    for state in states:
+        scope = (signature, state, config.from_date, config.to_date, target, *selection_params)
+        attempts = 0 if state == "downloaded_unscanned" else 1
+        last_id = 0
+        while True:
+            if stop_event.is_set():
+                raise Stopped
+            rows = database.execute(query + " AND c.download_attempts=? AND c.id>?" + order_by,
+                                    (*scope, attempts, last_id, batch_size)).fetchall()
+            if len(rows) < batch_size:
+                rows.extend(database.execute(query + " AND c.download_attempts>?" + order_by,
+                                             (*scope, attempts, batch_size - len(rows))).fetchall())
+            if not rows:
+                break
+            attempts, last_id = rows[-1]["download_attempts"], rows[-1]["id"]
+            yield rows
+
+
 def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: threading.Event,
-                          callback=None, *, target: str | None = None) -> int:
+                          callback=None, *, target: str | None = None, respect_selection: bool = False) -> int:
     """Recover atomically saved bytes whose DB commit was interrupted.
 
     Only previous attempted captures are checked; a million untouched URLs
@@ -401,34 +446,14 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
     from ..downloads.downloader import capture_path
     from ..classification import classify_payload_kind
     from ..content import classify_replay_content, decode_bytes
-    from ..cdx.parameters import cdx_query_signature
     from ..downloads.checkpoint import prove_file, discard_receipt, preserve_unverified, sync_directory
     from ..downloads.downloader import _save_payload_evidence
     from ..downloads.schedule import clear_retry
     target = target or (config.targets[0] if config.targets else None)
     if not target:
         return 0
-    sig = cdx_query_signature(config)
-    cursor = 0
     adopted = 0
-    while True:
-        rows = database.execute(
-            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.digest,c.state,
-                       v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
-                       v.response_content_type,v.final_url,v.response_status
-                   FROM captures c
-                   LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
-               LEFT JOIN documents d ON d.capture_id=c.id
-               WHERE c.id>? AND c.query_signature=? AND c.timestamp BETWEEN ? AND ? AND EXISTS(SELECT 1 FROM targets t
-                 WHERE t.pattern=? AND (t.id=c.target_id OR EXISTS(
-                   SELECT 1 FROM capture_target_membership m WHERE m.capture_id=c.id AND m.target_id=t.id)))
-                 AND ((c.state IN ('pending','error') AND c.download_attempts>0)
-                   OR (c.state='downloaded_unscanned' AND v.capture_id IS NULL))
-                 AND d.id IS NULL ORDER BY c.id LIMIT 500""",
-            (cursor, sig, config.from_date, config.to_date, target),
-        ).fetchall()
-        if not rows:
-            break
+    for rows in _orphan_candidate_batches(database, config, target, stop_event, respect_selection=respect_selection):
         committed_paths = []
         with database:
             for row in rows:
@@ -458,32 +483,38 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                         continue
                     with path.open("rb") as handle:
                         preview = handle.read(min(length, 65536))
-                    decision = classify_payload_kind(preview, row["mimetype"] or "", row["original_url"])
-                    if decision.resource_class != 'text':
+                    content_type = proof.get('response_content_type') or row['response_content_type'] or row['mimetype'] or ''
+                    decision = classify_payload_kind(preview, content_type, row["original_url"])
+                    if decision.resource_class not in ('text', 'media_descriptor'):
                         if row['state']=='downloaded_unscanned':
                             _record_recovery_gap(database,row,'local_integrity_unproven',
                                 'Unproven retained body is not text; acquisition must revalidate routing.')
                         continue
+                    response_status = proof.get('http_status') or row['response_status']
+                    final_url = proof.get('final_url') or row['final_url']
+                    if row['state'] == 'downloaded_unscanned':
+                        response_status = response_status or row['capture_status']
+                        final_url = final_url or row['capture_final_url']
                     try:
-                        preview_text = decode_bytes(preview, proof.get('response_content_type') or row['mimetype'] or '')
+                        preview_text = decode_bytes(preview, content_type)
                     except UnicodeDecodeError:
                         # A prefix can split a UTF-8 character or UTF-16 pair.
                         # Full-byte proof is already checked; local scanning
                         # validates the complete representation next.
                         preview_text = ''
-                    if classify_replay_content(preview_text, proof.get('final_url') or ''):
+                    if classify_replay_content(preview_text, final_url or ''):
                         if row['state']=='downloaded_unscanned':
                             _record_recovery_gap(database,row,'invalid_archive_replay',
                                 'Recovered file is an archive error shell, not a completed original.')
                         continue
                     _save_payload_evidence(database, {**proof, 'capture_id':cursor,
-                        'response_content_type':proof.get('response_content_type') or row['response_content_type'] or row['mimetype'],
-                        'final_url':proof.get('final_url') or row['final_url'] or '',
-                        'http_status':proof.get('http_status') or row['response_status'] or 200})
+                        'response_content_type':content_type, 'final_url':final_url,
+                        'http_status':response_status})
                     database.execute(
-                        """UPDATE captures SET state='downloaded_unscanned',bytes_saved=?,updated_at=?
+                        """UPDATE captures SET state='downloaded_unscanned',bytes_saved=?,
+                           http_status=?,final_url=?,updated_at=?
                            WHERE id=? AND state IN ('error','pending','downloaded_unscanned')""",
-                        (length, utc_now(), cursor),
+                        (length, response_status, final_url, utc_now(), cursor),
                     )
                     database.execute(
                         """UPDATE capture_routing SET routing='downloaded_awaiting_scan',

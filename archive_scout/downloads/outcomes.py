@@ -42,7 +42,7 @@ def text_outcome_counts(database, config):
     from ..database.scope import scope_membership_predicate
     scope = scope_membership_predicate("archive_scout_download_scopes")
     row = database.execute(f"""SELECT
-        COALESCE(SUM(c.state IN ('pending','downloading','error')),0),
+        COUNT(*),
         COALESCE(SUM(CASE WHEN c.state='error' THEN {text_unavailable()} ELSE 0 END),0)
-        FROM captures c WHERE {scope}""").fetchone()
+        FROM captures c WHERE c.state IN ('pending','downloading','error') AND {scope}""").fetchone()
     return {'unfinished': int(row[0]) - int(row[1]), 'unavailable': int(row[1])}

@@ -26,8 +26,8 @@ from archive_scout.downloads.checkpoint import write_receipt, receipt_path, prov
 from archive_scout.downloads.downloader import capture_path
 from archive_scout.downloads.rate_limit import reset_shared_traffic_state_for_tests
 from archive_scout.events import ProgressEvent, Stopped
-from archive_scout.scanning.pending import adopt_orphaned_bodies, _scan_one, PayloadIntegrityError, scan_pending_saved
-from archive_scout.operations import run_project
+from archive_scout.scanning.pending import adopt_orphaned_bodies, _orphan_candidate_batches, _scan_one, PayloadIntegrityError, scan_pending_saved
+from archive_scout.operations import finish_jobs, prepare_scan_jobs, run_project
 from archive_scout.ui.event_queue import CoalescingEventQueue
 from archive_scout.ui.main_window import ArchiveScoutApp
 
@@ -63,13 +63,114 @@ class ProofRecovery(unittest.TestCase):
     def test_matching_cdx_recovers_legacy_bytes_and_persists_sha256(self):
         self.path.write_bytes(BODY)
         self.assertEqual(adopt_orphaned_bodies(self.db,self.cfg,threading.Event()),1)
-        self.assertEqual(self.db.execute('SELECT content_hash FROM capture_payload_evidence').fetchone()[0],hashlib.sha256(BODY).hexdigest())
+        evidence = self.db.execute('SELECT content_hash,response_status FROM capture_payload_evidence').fetchone()
+        self.assertEqual(tuple(evidence), (hashlib.sha256(BODY).hexdigest(), None))
         self.assertEqual(adopt_orphaned_bodies(self.db,self.cfg,threading.Event()),0)
     def test_receipt_recovers_without_cdx_digest_and_is_cleaned_after_commit(self):
         self.db.execute("UPDATE captures SET digest=''");self.db.commit()
         self.row=self.db.execute('SELECT * FROM captures').fetchone();self.path.write_bytes(BODY);self.receipt()
         self.assertEqual(adopt_orphaned_bodies(self.db,self.cfg,threading.Event()),1)
         self.assertFalse(receipt_path(self.path).exists())
+
+    def test_download_only_resume_recovers_published_and_staged_receipts(self):
+        config = replace(self.cfg, keywords=[])
+        stop = threading.Event()
+        stop.set()
+        self.db.execute("UPDATE captures SET digest=''")
+        self.db.commit()
+        self.row = self.db.execute('SELECT * FROM captures').fetchone()
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                with self.db:
+                    self.db.execute("DELETE FROM capture_payload_evidence")
+                    self.db.execute("UPDATE captures SET state='pending',http_status=NULL,final_url=NULL")
+                self.path.unlink(missing_ok=True)
+                with self.assertRaises(Stopped):
+                    run_project(config, 'download_only', stop)
+                destination = self.path.with_name(self.path.name + '.transfer') if staged else self.path
+                destination.write_bytes(BODY)
+                self.receipt()
+                with patch('archive_scout.downloads.downloader.fetch_retain_streamed') as request:
+                    result = run_project(config, 'resume')
+                request.assert_not_called()
+                self.assertEqual(result.status, 'complete')
+                self.assertEqual(self.path.read_bytes(), BODY)
+                self.assertFalse(receipt_path(self.path).exists())
+                self.assertFalse(self.path.with_name(self.path.name + '.transfer').exists())
+                capture = self.db.execute(
+                    'SELECT state,http_status,final_url,bytes_saved FROM captures'
+                ).fetchone()
+                proof = self.db.execute(
+                    'SELECT response_status,final_url,content_hash,bytes_saved FROM capture_payload_evidence'
+                ).fetchone()
+                self.assertEqual(tuple(capture), ('downloaded_unscanned', 200, proof['final_url'], len(BODY)))
+                self.assertTrue(capture['final_url'].endswith('/http://example.org/a'))
+                self.assertEqual(proof['response_status'], 200)
+                self.assertEqual(proof['content_hash'], hashlib.sha256(BODY).hexdigest())
+                self.assertEqual(proof['bytes_saved'], len(BODY))
+                self.assertEqual(self.db.execute('SELECT COUNT(*) FROM scan_runs').fetchone()[0], 0)
+
+    def test_orphan_candidates_continue_across_equal_attempts_and_keep_membership(self):
+        target_id, signature = self.row['target_id'], self.row['query_signature']
+        other_id = get_or_create_target(self.db, 'other.example/*')
+        with self.db:
+            self.db.executemany(
+                """INSERT INTO captures(original_url,timestamp,target_id,query_signature,
+                   download_attempts,created_at,updated_at)
+                   VALUES(?,'20080101000000',?,?,?,'fixture','fixture')""",
+                ((f'http://example.org/page/{number}', other_id, signature, 1 if number <= 550 else 2)
+                 for number in range(1, 610)),
+            )
+            self.db.execute("INSERT INTO capture_target_membership SELECT id,? FROM captures WHERE id BETWEEN 2 AND 609",
+                            (target_id,))
+            self.db.execute("UPDATE captures SET download_attempts=0 WHERE id=8")
+            self.db.execute("UPDATE captures SET state='skipped' WHERE id=9")
+        rows = [row for batch in _orphan_candidate_batches(self.db, self.cfg, self.cfg.targets[0], threading.Event())
+                for row in batch]
+        self.assertEqual([row['id'] for row in rows], [i for i in range(1, 610) if i not in {8, 9}])
+
+    def test_resumed_download_retry_recovers_only_the_selected_capture(self):
+        with self.db:
+            upsert_capture(self.db, {'timestamp': self.row['timestamp'], 'original': 'http://example.org/unselected',
+                'statuscode': '200', 'mimetype': 'text/html', 'digest': '', 'length': len(BODY)},
+                self.row['target_id'], self.row['query_signature'])
+            self.db.execute("UPDATE captures SET state='error',download_attempts=2")
+            for capture_id in (1, 2):
+                record_error(self.db, 'download', 'connection', 'temporary failure',
+                             capture_id=capture_id, retryable=True)
+        config = replace(self.cfg, keywords=[], retry_capture_ids=[1])
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(Stopped):
+            run_project(config, 'retry_download_errors', stop)
+        self.path.write_bytes(BODY)
+        self.receipt()
+        other = self.db.execute('SELECT * FROM captures WHERE id=2').fetchone()
+        other_path = capture_path(self.root, other['id'], other['timestamp'], other['original_url'])
+        other_path.write_bytes(BODY)
+        write_receipt(other_path, other, {'content_hash': hashlib.sha256(BODY).hexdigest(),
+            'bytes_saved': len(BODY), 'http_status': 200, 'response_content_type': 'text/html'})
+        with patch('archive_scout.downloads.downloader.fetch_retain_streamed') as request:
+            run_project(config, 'resume')
+        request.assert_not_called()
+        states = [row[0] for row in self.db.execute('SELECT state FROM captures ORDER BY id')]
+        self.assertEqual(states, ['downloaded_unscanned', 'error'])
+        errors = [row[0] for row in self.db.execute('SELECT capture_id FROM errors WHERE resolved=0')]
+        self.assertEqual(errors, [2])
+        self.assertTrue(receipt_path(other_path).is_file())
+        self.assertFalse(receipt_path(self.path).exists())
+
+    def test_scan_completion_still_checks_errors_on_routed_captures(self):
+        with self.db:
+            self.db.execute("UPDATE captures SET state='skipped'")
+            record_error(self.db, 'scan', 'fixture', 'local read failed', capture_id=self.row['id'])
+        jobs = prepare_scan_jobs(self.db, self.cfg, 'all')
+        finish_jobs(self.db, jobs, 'complete', self.cfg)
+        self.assertEqual(self.db.execute('SELECT status FROM scan_runs').fetchone()[0], 'interrupted')
+        with self.db:
+            self.db.execute("UPDATE errors SET resolved=1")
+        finish_jobs(self.db, jobs, 'complete', self.cfg)
+        self.assertEqual(self.db.execute('SELECT status FROM scan_runs').fetchone()[0], 'complete')
     def test_receipt_for_other_capture_and_invalid_json_cannot_prove_file(self):
         self.path.write_bytes(BODY);row=dict(self.row);row['digest']=''
         self.receipt();v=json.loads(receipt_path(self.path).read_text());v['original_url']='http://example.org/other'
