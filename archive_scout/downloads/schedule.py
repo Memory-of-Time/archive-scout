@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from ..database.scope import scope_membership_predicate
 from ..utils import utc_now
 
 
@@ -100,12 +101,10 @@ def _retry_queue_exists(database):
     return database.execute("SELECT 1 FROM sqlite_temp_master WHERE name='archive_scout_ready_retries'").fetchone() is not None
 
 
-_ACTIVE_RETRY = automatic_retry_allowed() + ''' AND EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
-    AND e.operation='download' AND e.retryable=1 AND e.resolved=0 AND e.ignored=0)
-    AND EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes sc
-      ON sc.pattern=t.pattern AND sc.signature=c.query_signature AND c.timestamp BETWEEN sc.start AND sc.end
-      WHERE t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
-        WHERE m.capture_id=c.id AND m.target_id=t.id))'''
+_RETRY_ERROR = '''EXISTS (SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx WHERE e.capture_id=c.id
+    AND e.operation='download' AND e.retryable=1 AND e.resolved=0 AND e.ignored=0)'''
+_ACTIVE_RETRY = automatic_retry_allowed() + ' AND ' + _RETRY_ERROR + ' AND ' + scope_membership_predicate(
+    'archive_scout_download_scopes')
 
 
 def prepare_retry_queue(database, *, populate=True):
@@ -179,18 +178,18 @@ def retry_selection(database: sqlite3.Connection, config, alias: str = "c") -> t
                              ((int(value),) for value in config.retry_capture_ids))
         clauses.append(f"EXISTS(SELECT 1 FROM archive_scout_retry_filter f WHERE f.id={alias}.id)")
     if config.retry_error_categories:
-        clauses.append(f"""EXISTS(SELECT 1 FROM errors e WHERE e.capture_id={alias}.id
+        clauses.append(f"""EXISTS(SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx WHERE e.capture_id={alias}.id
             AND e.resolved=0 AND e.ignored=0 AND """ + explicit_error_predicate(config) + """ AND e.category IN ("""
             + ",".join("?" for _ in config.retry_error_categories) + "))")
         params.extend(config.retry_error_categories)
     return "".join(" AND " + item for item in clauses), params
 
 
-def next_due(database: sqlite3.Connection, config=None, *, respect_selection=False, categories=()) -> float | None:
+def scheduled_retry_rows(database: sqlite3.Connection, config=None, *, respect_selection=False,
+                         categories=(), limit=1):
     if config is not None:
         from .downloader import _populate_download_scopes
         _populate_download_scopes(database, config)
-        from ..database.scope import scope_membership_predicate
         scope = " AND " + scope_membership_predicate("archive_scout_download_scopes")
     else:
         scope = ""
@@ -198,9 +197,12 @@ def next_due(database: sqlite3.Connection, config=None, *, respect_selection=Fal
     if categories:
         selection += " AND s.last_category IN (" + ",".join("?" for _ in categories) + ")"
         params.extend(sorted(categories))
-    row = database.execute("""SELECT s.next_eligible_at FROM text_retry_schedule s INDEXED BY text_retry_due_idx
-        CROSS JOIN captures c ON c.id=s.capture_id WHERE c.state='error' AND EXISTS
-        (SELECT 1 FROM errors e WHERE e.capture_id=c.id AND e.retryable=1
-         AND e.resolved=0 AND e.ignored=0) AND """ + automatic_retry_allowed() + scope + selection +
-         " ORDER BY s.next_eligible_at,s.capture_id LIMIT 1", params).fetchone()
-    return float(row[0]) if row and row[0] is not None else None
+    return database.execute("""SELECT s.capture_id,s.next_eligible_at FROM text_retry_schedule s INDEXED BY text_retry_due_idx
+        CROSS JOIN captures c ON c.id=s.capture_id WHERE c.state='error' AND """ + _RETRY_ERROR + ' AND ' +
+         automatic_retry_allowed() + scope + selection + " ORDER BY s.next_eligible_at,s.capture_id LIMIT ?",
+        [*params, limit]).fetchall()
+
+
+def next_due(database: sqlite3.Connection, config=None, *, respect_selection=False, categories=()) -> float | None:
+    rows = scheduled_retry_rows(database, config, respect_selection=respect_selection, categories=categories)
+    return float(rows[0][1]) if rows else None

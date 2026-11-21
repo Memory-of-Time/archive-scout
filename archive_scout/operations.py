@@ -435,30 +435,34 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
     manual = not automatic and respect_selection and explicit_recheck_requested(config)
     error_predicate = explicit_error_predicate(config) if manual else 'e.retryable=1'
     latest_decision = ' AND '+(selected_retry_allowed() if manual else automatic_retry_allowed())
+    source = 'captures c'
+    seek = 'c.id'
+    if automatic:
+        database.execute('CREATE TEMP TABLE IF NOT EXISTS archive_scout_retry_sweep(capture_id INTEGER PRIMARY KEY) WITHOUT ROWID')
+        database.execute('DELETE FROM archive_scout_retry_sweep')
+        database.execute('INSERT INTO archive_scout_retry_sweep SELECT capture_id FROM text_retry_schedule')
+        database.execute("""INSERT OR IGNORE INTO archive_scout_retry_sweep
+            SELECT e.capture_id FROM errors e WHERE e.resolved=0 AND e.ignored=0
+            AND e.operation='download' AND e.retryable=1 AND e.capture_id IS NOT NULL
+            AND NOT EXISTS(SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=e.capture_id)""")
+        source = 'archive_scout_retry_sweep queued CROSS JOIN captures c ON c.id=queued.capture_id'
+        seek = 'queued.capture_id'
     last_id = 0
-    source = ("""(
-        SELECT capture_id FROM text_retry_schedule WHERE next_eligible_at<=?
-        UNION SELECT e.capture_id FROM errors e WHERE e.resolved=0 AND e.ignored=0
-          AND e.operation='download' AND e.retryable=1 AND e.capture_id IS NOT NULL
-          AND NOT EXISTS(SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=e.capture_id))
-        candidates CROSS JOIN captures c ON c.id=candidates.capture_id"""
-        if automatic else 'captures c')
     while True:
         # Explicit retry includes pending captures which a lifetime attempt
         # ceiling prevented from entering the normal queue. Automatic recovery
         # still considers only recorded retryable errors, once per sweep.
         exhausted = " OR (c.state='pending' AND c.download_attempts>=?)" if include_exhausted_pending else ""
         rows = database.execute(
-            "SELECT c.id FROM " + source + """
-               WHERE c.id>? AND """ + scope + """
+            f"SELECT c.id FROM {source} WHERE {seek}>? AND " + scope + """
                AND ((c.state='error' AND EXISTS (
-                   SELECT 1 FROM errors e WHERE e.capture_id=c.id
+                   SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx WHERE e.capture_id=c.id
                    AND e.operation='download' AND e.resolved=0 AND e.ignored=0 AND """ + error_predicate + """)
                    AND (NOT EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id)
                         OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
                                    AND sched.next_eligible_at<=?)))"""
-            + exhausted + ")" + latest_decision + selection + " ORDER BY c.id LIMIT ?",
-            (*([time.time()] if automatic else []), last_id, time.time(),
+            + exhausted + ")" + latest_decision + selection + f" ORDER BY {seek} LIMIT ?",
+            (last_id, time.time(),
              *([config.max_attempts] if include_exhausted_pending else []), *selected_params, batch_size),
         ).fetchall()
         if not rows:
@@ -497,11 +501,20 @@ def recover_transient_text_errors(
     # saved eligibility delays must not exhaust a URL's attempts before it runs.
     budget = NoProgressBudget(config)
     network_failures = ("connection", "connect_timeout", "rate_limit", "http_server_error")
+    read_failures = ("read_timeout", "response_transfer", "replay_deadline")
     slow_recovery = False
     from .downloads.rate_limit import shared_host_gate
-    from .downloads.schedule import next_due
+    from .downloads.schedule import next_due, scheduled_retry_rows
     host_gate = (shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
                  if config.rate_limit_max_wait > 0 else None)
+
+    def next_service_probe():
+        primary = scheduled_retry_rows(database, config, respect_selection=respect_selection, categories=network_failures)
+        stalled = scheduled_retry_rows(database, config, respect_selection=respect_selection,
+                                       categories=read_failures, limit=2)
+        candidates = [*primary, *stalled[:1]] if len(stalled) == 2 else primary
+        return min(candidates, key=lambda row: (row[1], row[0]), default=None)
+
     while True:
         if stop_event.is_set():
             raise Stopped
@@ -512,30 +525,33 @@ def recover_transient_text_errors(
             return 1
         attempted = 0
         made_progress = False
-        categories = network_failures if slow_recovery else ()
-        for ids in _retryable_text_batches(config, database, respect_selection=respect_selection,
-                                           automatic=True, categories=categories):
+        if slow_recovery:
+            probe = next_service_probe()
+            batches = ([int(probe[0])],) if probe is not None and probe[1] <= time.time() else ()
+        else:
+            batches = _retryable_text_batches(config, database, respect_selection=respect_selection, automatic=True)
+        for ids in batches:
             if stop_event.is_set():
                 raise Stopped
             attempted += len(ids)
-            emit(callback, ProgressEvent("download_retry",
-                f"Recovering {len(ids):,} transient text failures (fair retry sweep)"))
+            emit(callback, ProgressEvent("download_retry", "Checking one scheduled replay for service recovery."
+                if slow_recovery else f"Recovering {len(ids):,} transient text failures (fair retry sweep)"))
             download_archive(config, database, scan_run_id, stop_event, callback,
                              states=("error",), capture_ids=ids, scan_jobs=jobs,
                              acquire_only=acquire_only, allow_partial_inventory=True)
             placeholders = ','.join('?' for _ in ids)
-            if database.execute("SELECT 1 FROM captures WHERE id IN (" + placeholders +
-                    ") AND state NOT IN ('pending','downloading','error') LIMIT 1", ids).fetchone():
+            progress = ("state IN ('downloaded','downloaded_unscanned')" if slow_recovery else
+                        "state NOT IN ('pending','downloading','error')")
+            if database.execute(f"SELECT 1 FROM captures WHERE id IN ({placeholders}) AND {progress} LIMIT 1", ids).fetchone():
                 made_progress = True
         if made_progress:
             budget.progress()
             slow_recovery = False
         elif attempted:
             budget.attempted()
-        remaining = next(_retryable_text_batches(config, database, batch_size=1,
-                                                respect_selection=respect_selection, automatic=True), [])
         earliest = next_due(database, config, respect_selection=respect_selection)
-        if not remaining and earliest is None:
+        if earliest is None and not next(_retryable_text_batches(config, database, batch_size=1,
+                                         respect_selection=respect_selection, automatic=True), []):
             return 0
         if not continuous or not config.network.persistent_retries:
             return 1
@@ -547,14 +563,15 @@ def recover_transient_text_errors(
         budget.waiting()
         requested = max(0.05, earliest - time.time()) if earliest is not None else config.network.retry_base_seconds
         if slow_recovery or budget.exhausted or requested > budget.wait_seconds(requested):
-            service_due = next_due(database, config, respect_selection=respect_selection, categories=network_failures)
+            probe = next_service_probe()
+            service_due = float(probe[1]) if probe is not None else None
             if service_due is None or (config.rate_limit_max_wait > 0 and
                     service_due - time.time() > config.rate_limit_max_wait):
                 emit(callback, ProgressEvent("download_incomplete", incomplete_retry_message("Text recovery"),
                                              detail={"retain_notice": True}))
                 return 1
             slow_recovery = True
-            minimum = min(30.0, config.network.retry_max_seconds)
+            minimum = min(config.network.connection_retry_seconds, config.network.retry_max_seconds)
             pause = min(config.network.retry_max_seconds, max(minimum, service_due - time.time()))
             emit(callback, ProgressEvent("download_retry",
                 f"Network failures remain checkpointed. The next automatic recovery check is in {pause:.1f}s."))

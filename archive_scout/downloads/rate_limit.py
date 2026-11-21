@@ -70,6 +70,55 @@ class SharedFixedRateLimiter(FixedRateLimiter):
         self._next_request_box[0] = float(value)
 
 
+class ReplayOutage:
+    failures = frozenset({'connection', 'connect_timeout', 'read_timeout', 'response_transfer'})
+
+    def __init__(self, interval, threshold, *, clock=None):
+        self.clock = clock or time.monotonic
+        self.interval = interval
+        self.threshold = threshold
+        self.last_save = self.clock()
+        self.recent: dict[int, float] = {}
+        self.next_probe: float | None = None
+        self.incidents = 0
+        self.probes = 0
+
+    def failed(self, capture_id, category):
+        if self.next_probe is not None or category not in self.failures:
+            return False
+        now = self.clock()
+        self.recent = {key: seen for key, seen in self.recent.items() if now-seen <= 15.0}
+        self.recent.pop(capture_id, None)
+        self.recent[capture_id] = now
+        if len(self.recent) > self.threshold:
+            self.recent.pop(next(iter(self.recent)))
+        if len(self.recent) < self.threshold or now-self.last_save < 5.0:
+            return False
+        self.next_probe = now + self.interval
+        self.incidents += 1
+        return True
+
+    def saved(self):
+        recovered = self.next_probe is not None
+        self.last_save = self.clock()
+        self.recent.clear()
+        self.next_probe = None
+        return recovered
+
+    def capacity(self, maximum):
+        if self.next_probe is None:
+            return maximum
+        return min(maximum, 1) if self.clock() >= self.next_probe else 0
+
+    def admitted(self):
+        if self.next_probe is not None:
+            self.next_probe = self.clock() + self.interval
+            self.probes += 1
+
+    def snapshot(self):
+        return {'active': self.next_probe is not None, 'incidents': self.incidents, 'admitted_probes': self.probes,
+                'next_probe_in_seconds': max(0.0, self.next_probe-self.clock()) if self.next_probe is not None else None}
+
 
 @dataclass(frozen=True, slots=True)
 class HostPermit:
