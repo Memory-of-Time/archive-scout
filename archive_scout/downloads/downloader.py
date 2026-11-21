@@ -33,7 +33,7 @@ from ..scanning.jobs import ScanJob
 from ..scanning.keywords import compile_prefilter
 from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
-from .rate_limit import ReplayOutage, SharedFixedRateLimiter, shared_host_gate
+from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
 from .schedule import record_failure, clear_retry, prepare_retry_queue, select_due_retry, automatic_retry_allowed, restore_increased_size_limit
 from .checkpoint import write_receipt, discard_receipt, sync_directory
@@ -856,8 +856,6 @@ def download_archive(
     transport = getattr(client, "transport", None)
     streamed = (isinstance(transport, ResilientTransport)
                 and getattr(type(client).get, "__module__", "") == "archive_scout.cdx.client")
-    outage = (ReplayOutage(config.network.connection_retry_seconds, config.network.connection_failure_pause_threshold)
-              if streamed and progressive and config.network.persistent_retries else None)
 
     def measured_fetch(row):
         try:
@@ -892,10 +890,9 @@ def download_archive(
             dispatch_suspended = False
 
             def dispatch_capacity():
-                limit = max_inflight
                 if streamed:
-                    limit = transport.dispatch_slots(client.host_gate.dispatch_slots(limit))
-                return outage.capacity(limit) if outage is not None else limit
+                    return transport.dispatch_slots(client.host_gate.dispatch_slots(max_inflight))
+                return max_inflight
 
             def batch_metrics() -> dict:
                 # Called only at the existing 30-second health interval and
@@ -909,9 +906,8 @@ def download_archive(
                     **diagnostics.save_metrics(),
                     'transport': transport_health,
                     'host_gate': client.host_gate.snapshot(),
-                    'dispatch_slots': dispatch_capacity(),
+                    'dispatch_slots': transport.dispatch_slots(host_slots) if streamed else max_inflight,
                     'host_dispatch_slots': host_slots,
-                    'replay_outage': outage.snapshot() if outage is not None else None,
                     'configured_workers': config.workers,
                     'download_delay_seconds': config.download_delay,
                     'queued_running_tasks': len(futures),
@@ -1045,8 +1041,6 @@ def download_archive(
                     database.execute(f"PRAGMA busy_timeout={busy_timeout}")
                 for row in rows:
                     futures[pool.submit(measured_fetch, row)] = row
-                if rows and outage is not None:
-                    outage.admitted()
 
             while futures or fresh_remaining or parked:
                 diagnostics.watchdog.beat('queue admission')
@@ -1147,9 +1141,6 @@ def download_archive(
                         if scanner_thread is not None:
                             scanner_wakeup.set()
                         diagnostics.saved()
-                        if outage is not None and outage.saved() and callback:
-                            callback(ProgressEvent('acquisition_recovery',
-                                'A replay was validated and saved. Resuming normal replay admission.'))
                         if "analyses" in result:
                             matched += int(any(
                                 int(analysis.get("score") or 0) >= config.minimum_score
@@ -1313,10 +1304,6 @@ def download_archive(
                                     http_status=status,
                                 )
                         diagnostics.failure(row, category, exc)
-                        if outage is not None and outage.failed(int(row['id']), category) and callback:
-                            callback(ProgressEvent('acquisition_recovery',
-                                'Repeated replay transport failures across captures. Checking one capture at a time until a save succeeds.',
-                                detail={'retain_notice': True}))
                         if callback and should_surface_site_issue(category):
                             callback(ProgressEvent("site_issue", issue_message))
                         if retained_after_failure is not None:

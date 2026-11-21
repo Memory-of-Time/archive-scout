@@ -549,6 +549,12 @@ def recover_transient_text_errors(
             slow_recovery = False
         elif attempted:
             budget.attempted()
+            if slow_recovery and database.execute("""SELECT 1 FROM text_retry_schedule
+                WHERE capture_id=? AND last_category IN
+                ('incomplete_representation','payload_digest_mismatch','content_encoding_mismatch')""",
+                (probe[0],)).fetchone():
+                slow_recovery = False
+                continue
         earliest = next_due(database, config, respect_selection=respect_selection)
         if earliest is None and not next(_retryable_text_batches(config, database, batch_size=1,
                                          respect_selection=respect_selection, automatic=True), []):
