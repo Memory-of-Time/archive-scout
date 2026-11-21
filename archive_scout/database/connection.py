@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from ..constants import SCHEMA_VERSION
+from .lease import project_lease
 from .schema import initialize_schema
 
 DATABASE_NAME = "archive_scout.sqlite3"
@@ -29,7 +30,14 @@ def is_modern_database(path: Path) -> bool:
     return database_version(path) in range(2, SCHEMA_VERSION + 1)
 
 
-def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
+def open_database(root: Path, migrate: bool = True, *, lease_held: bool = False) -> sqlite3.Connection:
+    if lease_held:
+        return _open_database(root, migrate, True)
+    with project_lease(root, allow_busy=True) as owns_lease:
+        return _open_database(root, migrate, owns_lease)
+
+
+def _open_database(root: Path, migrate: bool, owns_lease: bool) -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True)
     path = root / DATABASE_NAME
     version = database_version(path) if path.exists() else None
@@ -40,7 +48,9 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         )
     if not migrate and version is not None and version != SCHEMA_VERSION:
         raise RuntimeError('This project requires a backed-up schema migration; migrate=False cannot modify it')
-    if migrate and path.exists() and not is_modern_database(path):
+    if not owns_lease and version != SCHEMA_VERSION:
+        raise RuntimeError("The active operation is preparing the project database. Try again after setup.")
+    if migrate and path.exists() and version not in range(2, SCHEMA_VERSION + 1):
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
         version = database_version(path)
@@ -51,7 +61,8 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
     database = sqlite3.connect(path, timeout=60)
     try:
         database.row_factory = sqlite3.Row
-        database.execute("PRAGMA journal_mode=WAL")
+        if owns_lease:
+            database.execute("PRAGMA journal_mode=WAL")
         database.execute("PRAGMA synchronous=NORMAL")
         database.execute("PRAGMA foreign_keys=ON")
         database.execute("PRAGMA recursive_triggers=ON")
@@ -60,6 +71,8 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         database.execute("PRAGMA mmap_size=268435456")
         database.execute("PRAGMA wal_autocheckpoint=10000")
         database.execute("PRAGMA busy_timeout=60000")
+        if not owns_lease:
+            return database
         initialize_schema(database)
         from ..projects.paths import rebase_project_files
         rebase_project_files(root, database)

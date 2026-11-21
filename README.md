@@ -56,6 +56,8 @@ See [v1.3.0 validation and limits](docs/V130_SUSTAINABILITY.md). Local fixture m
 
 ## Projects and compatibility
 
+When reopening a media inventory from the previous v1.3.1 patch, run **Index media URLs only** once before a media download-only pass. Scout follows ordinary CDX continuation keys to verify earlier completion records and keeps saved media files and pending cursors. Automatic media indexing also verifies new numbered-page results before marking a target complete.
+
 This normal-indexing update uses **SQLite schema 13**. Scout backs up supported older databases before upgrading. Existing captures, downloads, project settings and saved cursors stay available. On the next indexing run, Scout checks older completed empty queries and numbered-page scopes whose ordinary CDX coverage was uncertain. The database records the method that established completion and retains conflicting CDX observations. Use this build or a later compatible build to reopen an upgraded project.
 
 Before replacing an installation, stop any active run and back up its project folder. Reopen the same `project.json`; there is no required project reindex. Old `Scout` CLI commands remain supported, and existing GUI preferences stored under the legacy `Scout` settings directory are recognized. See [Project migration](docs/MIGRATION.md), [Project recovery](docs/PROJECT_RECOVERY.md) and the [operations and report snapshot guide](docs/OPERATIONS.md).

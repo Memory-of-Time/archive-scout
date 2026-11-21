@@ -35,6 +35,11 @@ from .replay_turn import (
 )
 
 try:
+    import brotli
+except ImportError:  # Older source installs can still open and resume projects.
+    brotli = None
+
+try:
     import truststore
 except ImportError:  # pragma: no cover - exercised in minimal source installs
     truststore = None
@@ -350,6 +355,9 @@ class PayloadDigestMismatch(IncompleteRepresentationError):
     """A proposed header repair did not match the selected archived payload."""
 
 
+_SUPPORTED_CONTENT_CODINGS = frozenset({'', 'identity', 'gzip', 'x-gzip', 'deflate', 'br'})
+
+
 def _check_full_range(status: int, headers: dict[str, str]) -> None:
     """A standalone 206 prefix must never be published as an entire document."""
     if status != 206:
@@ -381,8 +389,7 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
             yield chunk
 
     try:
-        if len(codings) > 4 or any(coding not in {'', 'identity', 'gzip', 'x-gzip', 'deflate'}
-                                   for coding in codings):
+        if len(codings) > 4 or any(coding not in _SUPPORTED_CONTENT_CODINGS for coding in codings):
             raise IncompleteRepresentationError('unsupported HTTP content encoding chain: ' +
                                                 ', '.join(codings)[:200])
         if len(codings) == 1:
@@ -413,7 +420,7 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
 def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
                                    stop_event: threading.Event, *,
                                    expected_digest: str = "") -> Iterable[bytes]:
-    """Bounded raw-wire decoder with gzip/deflate EOF and CRC verification.
+    """Bounded raw-wire decoder with framing and compression verification.
 
     Libraries' convenience decoded iterators may accept an incomplete gzip
     stream with a valid HTTP Content-Length. Decode raw chunks ourselves so
@@ -421,7 +428,7 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
     concatenated gzip members. Ordinary identity bodies take the fast path.
     """
     encoding = headers.get("content-encoding", "identity").split(",", 1)[0].strip().casefold()
-    if encoding not in {"", "identity", "gzip", "x-gzip", "deflate"}:
+    if encoding not in _SUPPORTED_CONTENT_CODINGS:
         raise IncompleteRepresentationError(f"unsupported HTTP content encoding: {encoding}")
     repair_digest = ""
     repair_hash = None
@@ -461,6 +468,31 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
             if repair_hash is None or not isinstance(normalize_transport_error(exc), IncompleteRepresentationError):
                 raise
             framing_error = exc
+    elif encoding == "br":
+        if brotli is None:
+            raise IncompleteRepresentationError("Brotli decoder unavailable; update Archive Scout's runtime dependencies")
+        decoder = brotli.Decompressor()
+        try:
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                if stop_event.is_set():
+                    raise Stopped
+                received_wire += len(chunk)
+                if decoder.is_finished():
+                    raise IncompleteRepresentationError("unexpected bytes after Brotli stream")
+                expanded = decoder.process(chunk, output_buffer_limit=4 * 1024)
+                while expanded:
+                    yield expanded
+                    if stop_event.is_set():
+                        raise Stopped
+                    if decoder.is_finished():
+                        break
+                    expanded = decoder.process(b"", output_buffer_limit=4 * 1024)
+        except brotli.error as exc:
+            raise IncompleteRepresentationError(f"invalid Brotli stream: {exc}") from exc
+        if not decoder.is_finished():
+            raise IncompleteRepresentationError("incomplete Brotli stream; end marker missing")
     else:
         gzip_mode = encoding in {"gzip", "x-gzip"}
         decoder = zlib.decompressobj(16 + zlib.MAX_WBITS if gzip_mode else zlib.MAX_WBITS)

@@ -83,6 +83,11 @@ class PermanentRequestError(RuntimeError):
         self.status = int(status)
         self.category = category
 
+    def invalid_index_target(self) -> bool:
+        return self.status == 400 and (self.category == "invalid_index_target" or
+            (self.category == "http_client_error" and any(term in str(self).casefold()
+             for term in ("invalid target", "invalid host", "invalid domain"))))
+
 
 def _permanent_http_rejection(status, url, headers, preview=b""):
     """Keep streamed and in-memory HTTP outcomes identical and evidence based."""

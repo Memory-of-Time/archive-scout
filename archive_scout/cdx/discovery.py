@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS matches (
 
 
 def _domain(line: bytes) -> str:
-    value = line.decode("utf-8-sig").strip().rstrip(".").removeprefix("*.")
+    value = line.decode("utf-8-sig").strip().removesuffix("/*").rstrip(".").removeprefix("*.")
     host = value.encode("idna").decode("ascii").lower()
     if len(host) <= 253 and "." in host and all(HOST_LABEL.fullmatch(part) for part in host.split(".")):
         return host
@@ -251,6 +251,10 @@ def run_fast_discovery(domain_file, output_dir, url_filter, from_date="2001", to
         with project_lease(root), closing(sqlite3.connect(root / "discovery.sqlite3")) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                with db:
+                    db.execute("UPDATE input SET offset=0,eof=0,rejected=0 WHERE rejected>0")
+                    db.execute("PRAGMA user_version=1")
             if callback:
                 callback(ProgressEvent("discovery", f"Searching Wayback URL metadata. Live results: {paths['urls']}"))
 

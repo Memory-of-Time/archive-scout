@@ -4,6 +4,8 @@
 
 In the desktop app, choose **Fast URL discovery from a domain list** in **Operation** and click **Start operation**. Pick a UTF-8 text file with one domain per line. Paste your original-URL regex, then accept the default capture dates of 2001–2003 or enter different dates.
 
+Both `example.org` and `*.example.org/*` select the domain and its subdomains. Resuming an older list that contained rejected lines checks the input once and preserves the results and request counts for domains already processed.
+
 The CLI runs the same operation. This PowerShell example looks for either filename at the end of a path or parameter value, allowing query strings afterward.
 
 ```powershell

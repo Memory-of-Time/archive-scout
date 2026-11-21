@@ -620,7 +620,7 @@ def run_project(
     (config.output_dir / "media" / "images").mkdir(parents=True, exist_ok=True)
     (config.output_dir / "media" / "videos").mkdir(parents=True, exist_ok=True)
     (config.output_dir / "reports").mkdir(exist_ok=True)
-    database = open_database(config.output_dir, migrate=True)
+    database = open_database(config.output_dir, migrate=True, lease_held=True)
     jobs: list[ScanJob] = []
     # Record the requested optional media *phase*, not just currently visible
     # media settings. It survives a crash during indexing, scanning or media.

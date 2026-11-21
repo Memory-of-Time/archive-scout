@@ -14,6 +14,7 @@ from collections import Counter, deque
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from uuid import uuid4
 
 from ..constants import VERSION
 from ..events import ProgressEvent
@@ -99,6 +100,8 @@ class AcquisitionDiagnostics:
         self.root, self.callback, self.enabled = Path(root), callback, enabled
         self.kind = "media" if kind == "media" else "text"
         self.build = build_fingerprint()
+        self.run = {'build_id': self.build, 'acquisition_run_id': uuid4().hex,
+                    'acquisition_started_at': utc_now()}
         self.lock = threading.Lock()
         self.responses = Counter()
         self.timings = Counter()
@@ -115,6 +118,7 @@ class AcquisitionDiagnostics:
         self.phase_saved_base = 0
         self.batch_saved = 0
         self.batch_metrics = None
+        self.last_batch_metrics = None
         self.last_summary = time.monotonic()
         self.acquisition_started = self.last_summary
         self.last_successful_save = None
@@ -122,12 +126,13 @@ class AcquisitionDiagnostics:
         self.recent_saves = deque(maxlen=4096)
         self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
         from .watchdog import OwnerWatchdog
-        self.watchdog = OwnerWatchdog(self.summary_path, enabled=enabled)
+        self.watchdog = OwnerWatchdog(self.summary_path, enabled=enabled, build_id=self.build,
+                                      run_id=self.run['acquisition_run_id'])
 
     def close(self):
         self.watchdog.close()
         if self.batch_saved or self.phase_saved_base or self.failures:
-            self.summary(self.batch_saved, force=True)
+            self.summary(self.batch_saved, final=True)
 
     def saved(self):
         with self.lock:
@@ -154,6 +159,20 @@ class AcquisitionDiagnostics:
         self.batch_saved = 0
         self.callback = callback
         self.batch_metrics = None
+        self.last_batch_metrics = None
+
+    def _batch_details(self):
+        if self.enabled and self.batch_metrics is not None:
+            try:
+                return self.batch_metrics()
+            except Exception:
+                return None
+        return self.last_batch_metrics
+
+    def finish_batch(self, saved, *, force=False, final=False):
+        self.last_batch_metrics = self._batch_details()
+        self.batch_metrics = None
+        self.summary(saved, force=force, final=final)
 
     def _emit(self, event):
         if self.callback:
@@ -209,7 +228,7 @@ class AcquisitionDiagnostics:
             evidence.update(getattr(error, 'transfer_diagnostic', {}))
         if 'final_url' in evidence:
             evidence['final_url'] = _safe_url(evidence['final_url'])
-        value = {'build_id': self.build, 'observed_at': utc_now(), 'category': category,
+        value = {**self.run, 'observed_at': utc_now(), 'category': category,
                  'capture_id': int(row['id']), 'capture_timestamp': str(row['timestamp']),
                  'original_url': _safe_url(row['original_url']),
                  'expected_cdx_digest': str(dict(row).get('digest') or '')[:100],
@@ -248,7 +267,7 @@ class AcquisitionDiagnostics:
             now, cpu = time.monotonic(), time.process_time()
             elapsed, used = now-self.resource_sample[0], cpu-self.resource_sample[1]
             self.resource_sample = (now, cpu)
-            return {'build_id': self.build, 'response_counts': dict(self.responses),
+            return {**self.run, 'response_counts': dict(self.responses),
                     'representation_recovery_count': self.representation_recovery_count,
                     'recent_representation_recoveries': list(self.representation_recoveries),
                     'transport_failure_phases': dict(self.transport_failures),
@@ -272,10 +291,10 @@ class AcquisitionDiagnostics:
     def _timing(value):
         return "unknown (no samples)" if value is None else f"{value:.3f}s"
 
-    def _append_history(self, detail):
+    def _append_history(self, detail, *, final=False):
         now = time.monotonic()
         previous = getattr(self, '_last_history', None)
-        if previous is not None and now - previous < self.HISTORY_INTERVAL_SECONDS:
+        if not final and previous is not None and now - previous < self.HISTORY_INTERVAL_SECONDS:
             return
         record = (json.dumps({**detail, 'observed_at': utc_now()}, sort_keys=True)+'\n').encode('utf-8')
         if len(record) > self.HISTORY_MAX_BYTES:
@@ -292,20 +311,22 @@ class AcquisitionDiagnostics:
             handle.write(record)
         self._last_history = now
 
-    def summary(self, saved, *, force=False):
+    def summary(self, saved, *, force=False, final=False):
         self.batch_saved = saved
         total_saved = self.phase_saved_base + saved
-        if not self.enabled or (not force and time.monotonic()-self.last_summary < 30):
+        if not self.enabled or (not (force or final) and time.monotonic()-self.last_summary < 30):
             return
         self.last_summary = time.monotonic()
         detail = self.snapshot()
+        detail['observed_at'] = utc_now()
+        if self.watchdog.last_gap is not None:
+            detail['last_owner_heartbeat_gap'] = self.watchdog.last_gap
         if self.kind == 'text':
             detail['operation_save_metrics'] = self.save_metrics()
-        if self.batch_metrics is not None:
-            try:
-                detail['acquisition'] = self.batch_metrics()
-            except Exception:
-                pass  # Diagnostics must not affect saved evidence or retries.
+        batch_details = self._batch_details()
+        if batch_details is not None:
+            detail['acquisition'] = batch_details
+        detail['acquisition_run_finished'] = final
         detail['new_saves'] = total_saved
         detail['batch_new_saves'] = saved
         try:
@@ -314,7 +335,7 @@ class AcquisitionDiagnostics:
             temporary = path.with_suffix('.tmp')
             temporary.write_text(json.dumps(detail, sort_keys=True), encoding='utf-8')
             os.replace(temporary, path)
-            self._append_history(detail)
+            self._append_history(detail, final=final)
         except OSError:
             pass
         if self.callback:
@@ -337,7 +358,8 @@ class AcquisitionDiagnostics:
                            f"unattempted deferrals {metrics['dispatch_deferrals_before_request']:,}. ")
             gate = metrics.get('host_gate', {})
             if gate:
-                stages += (f"Host admission {metrics.get('dispatch_slots', '?')} slots; "
+                stages += (f"Replay dispatch {metrics.get('dispatch_slots', '?')} slots; "
+                           f"host gate {metrics.get('host_dispatch_slots', '?')} slots; "
                            f"pause {gate.get('remaining_pause', 0):.1f}s; "
                            f"probe required {gate.get('probe_required')}; "
                            f"reason {gate.get('reason') or 'none'}. ")

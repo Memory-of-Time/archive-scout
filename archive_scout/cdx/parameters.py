@@ -8,6 +8,10 @@ from ..config import ProjectConfig
 from ..utils import parse_cdx_parameter_lines
 
 
+def has_cdx_collapse(config: ProjectConfig) -> bool:
+    return bool(config.cdx_collapses) or any(key == "collapse" for key, _ in parse_cdx_parameter_lines(config.cdx_extra_params))
+
+
 def _semantic_cdx_payload(config: ProjectConfig) -> dict:
     """v1.1.1-style identity: result membership, not HTTP page layout.
 
@@ -22,7 +26,7 @@ def _semantic_cdx_payload(config: ProjectConfig) -> dict:
     }
     if config.text_collapse_scope == "range":
         payload["coverage_scope"] = "range"
-        if config.cdx_collapses:
+        if has_cdx_collapse(config):
             payload["from"] = config.from_date
             payload["to"] = config.to_date
     else:
@@ -69,7 +73,7 @@ def cdx_query_signatures(config: ProjectConfig) -> tuple[str, ...]:
     sizes = (config.page_size, 5000, 25000, 1000, 10000, 50000, 100000, 150000)
     values = [cdx_query_signature(config)]
     values.extend(_legacy_cdx_query_signature(config, size) for size in sizes)
-    if config.text_collapse_scope == "year" or not config.cdx_collapses:
+    if config.text_collapse_scope == "year" or not has_cdx_collapse(config):
         values.append(_legacy_cdx_query_signature(config, None))
     return tuple(dict.fromkeys(values))
 

@@ -727,6 +727,7 @@ def download_archive(
     diagnostics, owns_diagnostics = acquisition_client(("text_observations", id(database)), lambda: AcquisitionDiagnostics(config.output_dir, callback,
                                          enabled=config.network.diagnostics))
     diagnostics.begin_batch(callback)
+    deferred_media_signature = None
     if callback and config.network.diagnostics and not diagnostics.build_announced:
         callback(ProgressEvent('acquisition_health', f'Text acquisition build: {diagnostics.build}'))
         diagnostics.build_announced = True
@@ -895,11 +896,13 @@ def download_archive(
                 now = time.monotonic()
                 transport_health = (client.transport.snapshot()
                     if isinstance(getattr(client, "transport", None), ResilientTransport) else {})
+                host_slots = client.host_gate.dispatch_slots(max_inflight) if streamed else max_inflight
                 return {
                     **diagnostics.save_metrics(),
                     'transport': transport_health,
                     'host_gate': client.host_gate.snapshot(),
-                    'dispatch_slots': transport.dispatch_slots(client.host_gate.dispatch_slots(max_inflight)) if streamed else max_inflight,
+                    'dispatch_slots': transport.dispatch_slots(host_slots) if streamed else max_inflight,
+                    'host_dispatch_slots': host_slots,
                     'configured_workers': config.workers,
                     'download_delay_seconds': config.download_delay,
                     'queued_running_tasks': len(futures),
@@ -1168,6 +1171,8 @@ def download_archive(
                                 from ..media.indexer import media_query_signature
                                 from ..media.extensions import extension_from_url
                                 from ..database.repositories import get_or_create_media_target, upsert_media_captures
+                                if deferred_media_signature is None:
+                                    deferred_media_signature = media_query_signature(config)
                                 target = get_or_create_media_target(database, "__deferred_text_replay__")
                                 suffix = extension_from_url(str(row["original_url"]))
                                 # Preserve the URL's real suffix (or absence
@@ -1178,7 +1183,7 @@ def download_archive(
                                                "mimetype":exc.content_type,"statuscode":row["statuscode"],
                                                "digest":row["digest"],"length":row["length"]},
                                                exc.resource_class,suffix)], target,
-                                    media_query_signature(config),source_type="text_replay_deferred",
+                                    deferred_media_signature,source_type="text_replay_deferred",
                                 )
                     except RateLimitDeferred as exc:
                         category = 'rate_limit' if exc.status == 429 else 'http_server_error'
@@ -1382,10 +1387,9 @@ def download_archive(
         if scanner_thread is not None and reconciliation_finished:
             mark_reconciled(database, config)
         try:
-            diagnostics.summary(saved_this_pass, force=owns_diagnostics or batch_failure is not None)
+            diagnostics.finish_batch(saved_this_pass, force=batch_failure is not None, final=owns_diagnostics)
         finally:
             diagnostics.watchdog.close()
-            diagnostics.batch_metrics = None  # do not retain this batch's owners
     if callback and held_failures:
         size_detail = (f" {oversized_failures:,} exceeded the configured text size limit "
                        f"({config.max_file_mb:g} MiB); increasing that limit makes them eligible again."

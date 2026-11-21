@@ -12,7 +12,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from functools import partial
+from typing import Callable, Iterable
 
 from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_site_issue, upsert_captures
@@ -35,6 +36,7 @@ from .parameters import (
     cdx_query_signatures,
     cdx_layout_signature,
     cdx_year_window,
+    has_cdx_collapse,
     parse_num_pages,
     preferred_index_strategy,
 )
@@ -70,6 +72,12 @@ class PendingWindow:
     gateway_504_failures: int = 0
     verifying_pages: bool = False
     transport_retry: bool = False
+
+    def bind_page_count(self, count: int, layout: str) -> None:
+        self.page_count = count
+        self.page_layout = layout
+        self.page = min(self.page, count)
+        self.retry_pages = [page for page in self.retry_pages if page < count]
 
 
 @dataclass(slots=True)
@@ -1046,33 +1054,27 @@ def cdx_response_budget(page_size: int) -> int:
     return min(256 * 1024 * 1024, max(64 * 1024 * 1024, size * 1536))
 
 
-def _reconcile_paged_completion(current: PendingWindow, completed_pages: set[int]) -> bool:
-    """End-of-window safeguard; one O(page-count) pass only on completion.
-
-    Page counters and the cursor are a scheduling hint, not durable evidence of
-    complete coverage. Every page must have a committed row-ledger entry.
-    """
+def _reconcile_paged_completion(current: PendingWindow, completed_pages: Iterable[int]) -> bool:
+    """Stream an ordered ledger and restart at its first missing page."""
+    expected = 0
     if current.page_count < 0:
         return False
-    missing = [page for page in range(current.page_count) if page not in completed_pages]
-    if missing:
-        current.retry_pages = sorted(set(current.retry_pages).union(missing))
-        return False
-    return True
-
-
-def _ledger_complete(database, current, ledger_key):
-    expected = 0
-    for row in database.execute("""SELECT page FROM index_pages WHERE query_signature=? AND
-            target_id=? AND window_start=? AND window_end=? AND layout_signature=?
-            AND status='complete' AND page>=0 AND page<? ORDER BY page""", (*ledger_key, current.page_count)):
-        if row[0] != expected:
+    for page in sorted(completed_pages) if isinstance(completed_pages, (set, frozenset)) else completed_pages:
+        if page != expected or expected == current.page_count:
             break
         expected += 1
     if expected == current.page_count:
         return True
     current.page = expected
+    current.retry_pages = sorted(set(current.retry_pages) | {expected})
     return False
+
+
+def _ledger_complete(database, current, ledger_key):
+    rows = database.execute("""SELECT page FROM index_pages WHERE query_signature=? AND
+            target_id=? AND window_start=? AND window_end=? AND layout_signature=?
+            AND status='complete' AND page>=0 AND page<? ORDER BY page""", (*ledger_key, current.page_count))
+    return _reconcile_paged_completion(current, (row[0] for row in rows))
 
 
 def _select_page_batch(current: PendingWindow, workers: int) -> tuple[list[int], int]:
@@ -1096,6 +1098,12 @@ def _select_page_batch(current: PendingWindow, workers: int) -> tuple[list[int],
     return pages, next_page
 
 
+def _fetch_window_count(client, config, target, current, *, stop_event):
+    return _request_paged_count(client, cdx_paged_endpoints(config),
+        build_num_pages_params(config, target, current.start, current.end, current.page_blocks),
+        config, stop_event)
+
+
 def _request_paged_batch(
     client: HttpClient,
     config: ProjectConfig,
@@ -1117,16 +1125,8 @@ def _request_paged_batch(
         current.retry_pages.clear()
         current.page_failures.clear()
     if current.page_count < 0:
-        current.page_count = _request_paged_count(
-            client,
-            endpoints,
-            build_num_pages_params(config, target, current.start, current.end, current.page_blocks),
-            config,
-            stop_event,
-        )
-        current.page_layout = effective_layout
-        current.page = min(current.page, current.page_count)
-        current.retry_pages = [page for page in current.retry_pages if page < current.page_count]
+        current.bind_page_count(_fetch_window_count(client, config, target, current, stop_event=stop_event),
+                                effective_layout)
     if current.page >= current.page_count and not current.retry_pages:
         return PagedBatch([], [], True)
 
@@ -1275,7 +1275,7 @@ def index_archive(
 ) -> bool:
     config = config.normalized()
     client = _client_for_config(config, stop_event, callback)
-    if not config.cdx_collapses:
+    if not has_cdx_collapse(config):
         emit(callback, ProgressEvent("index", "Warning: no CDX collapse is selected. Every archived snapshot may be returned."))
 
     # state_kind is either the legacy per-year checkpoint model or Audit3's
@@ -1338,6 +1338,7 @@ def index_archive(
         emit(callback, ProgressEvent("index_retry", f"Waiting for the next eligible domain at {when}.",
                                      detail={"next_retry_utc": when}))
     task_queue = TargetQueue(database, config, new_tasks(), workers, stop_event, waiting_for_retry)
+    fetch_count = partial(_fetch_window_count, stop_event=stop_event)
     last_status = float("-inf")
 
     def queue_status():
@@ -1375,6 +1376,7 @@ def index_archive(
             if task is None:
                 break
             target, target_config, target_id, state_kind, year, task_start, task_end, default_windows, signature = task
+            collapsed = has_cdx_collapse(target_config)
             scoped_time = 0.0
             if target_config.skip_slow_index_targets:
                 budget_row = database.execute("SELECT seconds,expired FROM normal_index_spent WHERE target=?", (target,)).fetchone()
@@ -1478,7 +1480,7 @@ def index_archive(
                 plan.planned += 1
                 with database:
                     persist_task_state(encode_plan(plan), False, seen, error_id)
-            if state_kind == "range" and not seen and not plan.completed:
+            if state_kind == "range" and state_plan and len(plan.pending) > 1 and not seen and not plan.completed:
                 durable = database.execute(
                     "SELECT 1 FROM captures WHERE target_id=? AND query_signature=? LIMIT 1",
                     (target_id, signature),
@@ -1492,7 +1494,7 @@ def index_archive(
                     emit(callback, ProgressEvent("index", "Reassembled untouched legacy windows into the full selected date range; no committed work changed."))
             old_pending, old_planned = plan.pending, plan.planned
             removed = coalesce_unstarted_micro_windows(
-                plan, seen=seen, collapse_enabled=bool(target_config.cdx_collapses))
+                plan, seen=seen, collapse_enabled=collapsed)
             if removed:
                 try:
                     with database:
@@ -1504,7 +1506,7 @@ def index_archive(
                     plan.pending, plan.planned = old_pending, old_planned
                     raise
                 emit(callback, ProgressEvent("index", f"Repaired {removed:,} inherited tiny CDX windows; saved checkpoint before new requests."))
-            elif target_config.cdx_collapses and seen and len(plan.pending) >= 8:
+            elif collapsed and seen and len(plan.pending) >= 8:
                 emit(callback, ProgressEvent("index", "Existing fragmented collapsed CDX checkpoint retained: "
                     "automatic reassembly could change which timestamp represents a URL."))
             counted_complete, counted_extra, attempts, active_seconds, saved_cursors = task_queue.recall(error_prefix)
@@ -1609,24 +1611,35 @@ def index_archive(
                         "work_unit": completed_windows, "work_units": total_windows,
                     },
                 ))
-                if task_queue.pending and current.strategy == "paged":
+                needs_count = current.strategy == "paged" and current.page_count < 0
+                if task_queue.pending and current.strategy == "paged" and current.page_count > 0:
                     if task_queue.barrier is None:
                         task_queue.barrier = task
                     else:
                         task_queue.append(task)
                     break
-                if current.strategy == "resume" and workers > 1 and response is None:
+                if (needs_count or current.strategy == "resume") and workers > 1 and response is None:
                     if task_queue.barrier is not None or any(entry[0][0] == target for entry in task_queue.pending.values()):
                         if task_queue.barrier is None:
                             task_queue.barrier = task
                         else:
                             task_queue.append(task)
                     else:
-                        task_queue.submit(task, client, _request_resume, current)
+                        task_queue.submit(task, client, fetch_count if needs_count else _request_resume, current)
                     break
                 request_started = response[1] if response else time.monotonic()
                 retry_budget.attempted()
                 try:
+                    if needs_count and response is not None:
+                        future, _ = response
+                        response = None
+                        count = future.result()
+                        layout = cdx_layout_signature(target_config, current.start, current.end, "paged", current.page_blocks)
+                        current.bind_page_count(count, layout)
+                        with database:
+                            persist_task_state(encode_plan(plan), False, seen, error_id)
+                        retry_budget.progress()
+                        continue
                     if current.strategy == "paged":
                         received = 0
                         changed = 0
@@ -2031,7 +2044,7 @@ def index_archive(
                     if _maybe_subdivide_persistent_gateway_504(
                         database, plan, current, exc, persist_task_state, seen, error_id,
                         callback, completed_windows, total_windows,
-                        collapse_enabled=bool(target_config.cdx_collapses),
+                        collapse_enabled=collapsed,
                     ):
                         total_windows += 1
                         transient_failure_streak = 0
@@ -2066,7 +2079,7 @@ def index_archive(
                             break
                         continue
                     if current.strategy == "resume" and current.pagination_supported:
-                        parts = split_window(current) if (not target_config.cdx_collapses and _can_split_cdx_window(current, exc)) else []
+                        parts = split_window(current) if (not collapsed and _can_split_cdx_window(current, exc)) else []
                         if parts:
                             plan.pending[0:1] = parts
                             added = len(parts) - 1
@@ -2076,7 +2089,7 @@ def index_archive(
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
                             emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split unstarted {target} {label} into {len(parts)} smaller windows (unfinished ranges retained).", completed_windows, total_windows, {"retain_notice": True}))
                             continue
-                        if not target_config.cdx_collapses and _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
+                        if not collapsed and _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
                             current.strategy = "paged"
                             current.page = 0
                             current.page_count = -1
@@ -2096,9 +2109,7 @@ def index_archive(
                         task_queue.append(task, time.monotonic() + transient_backoff(target_config, current.failures))
                         break
                 except RuntimeError as exc:
-                    target_bad_request = (isinstance(exc, PermanentRequestError) and exc.status == 400
-                        and (exc.category == "invalid_index_target" or (exc.category == "http_client_error"
-                        and any(term in str(exc).casefold() for term in ("invalid target", "invalid host", "invalid domain")))))
+                    target_bad_request = isinstance(exc, PermanentRequestError) and exc.invalid_index_target()
                     if isinstance(exc, PermanentRequestError) and (exc.status == 403 or target_bad_request):
                         category = "index_request_rejected" if target_bad_request else exc.category
                         message = (f"CDX rejected the request for {target} (HTTP 400)" if target_bad_request

@@ -6,7 +6,7 @@ checkpoint rows are not equivalent to completed empty inventories.
 from __future__ import annotations
 
 import sqlite3
-from .cdx.parameters import cdx_query_signature
+from .cdx.parameters import index_scopes
 from .cdx.indexer import uncovered_index_ranges
 from .media.indexer import media_index_state_signature, ALL_EXTENSIONS_STATE
 from .config import ProjectConfig
@@ -18,9 +18,7 @@ class IndexCoveragePending(RuntimeError):
 
 def text_coverage_gaps(database: sqlite3.Connection, config: ProjectConfig) -> list[str]:
     gaps: list[str] = []
-    for target in config.targets:
-        scoped = config.for_target(target)
-        signature = cdx_query_signature(scoped)
+    for target, scoped, signature in index_scopes(config):
         found = database.execute("SELECT id FROM targets WHERE pattern=?", (target,)).fetchone()
         if found is None:
             gaps.append(f"{target}: no index checkpoint")
@@ -45,11 +43,13 @@ def text_coverage_gaps(database: sqlite3.Connection, config: ProjectConfig) -> l
 
 
 def media_coverage_gaps(database: sqlite3.Connection, config: ProjectConfig) -> list[str]:
+    config = config.normalized()
     media = config.media.normalized()
     signature = media_index_state_signature(config)
     gaps: list[str] = []
+    configured_targets = set(config.targets)
     for target in media.targets or config.targets:
-        scoped = config.for_target(target) if target in config.targets else config
+        scoped = config.index_settings(target) if target in configured_targets else config
         years = ([0] if scoped.text_collapse_scope == "range" and scoped.from_year != scoped.to_year
                  else list(range(scoped.from_year, scoped.to_year + 1)))
         row = database.execute("SELECT id FROM media_targets WHERE pattern=?", (target,)).fetchone()
@@ -110,7 +110,7 @@ def record_admission(db: sqlite3.Connection, operation_run_id: int,
     import json
     from .media.indexer import media_query_signature
     semantic = {
-        "targets": [(target, cdx_query_signature(config.for_target(target))) for target in config.targets],
+        "targets": [(target, signature) for target, _, signature in index_scopes(config)],
         "media": media_query_signature(config) if phase in ("media", "embedded") else None,
         "retention": getattr(config, "keep_downloaded_text", None),
         "phase": phase,

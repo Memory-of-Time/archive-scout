@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch, Mock
 
+import brotli
 import httpx
 import urllib3
 from archive_scout.cdx.client import HttpClient, RateLimitDeferred, is_timeout_error
@@ -50,10 +51,31 @@ class Decoder(unittest.TestCase):
         for encoding,wire in [('gzip, gzip',gzip.compress(gzip.compress(BODY))),
                               ('gzip, deflate',zlib.compress(gzip.compress(BODY))),
                               ('deflate, gzip',gzip.compress(zlib.compress(BODY))),
+                              ('br, gzip',gzip.compress(brotli.compress(BODY))),
+                              ('gzip, br',brotli.compress(gzip.compress(BODY))),
                               ('identity, gzip',gzip.compress(BODY))]:
             with self.subTest(encoding=encoding):self.assertEqual(self.decode(wire,encoding),BODY)
     def test_unknown_inner_encoding_cannot_become_terminal_binary(self):
-        with self.assertRaises(IncompleteRepresentationError):self.decode(gzip.compress(BODY),'br, gzip')
+        with self.assertRaises(IncompleteRepresentationError):self.decode(gzip.compress(BODY),'unknown, gzip')
+    def test_brotli_drains_bounded_output_and_verifies_the_last_chunk(self):
+        body = BODY * 8192
+        wire = brotli.compress(body)
+        pieces = list(_decoded_verified_chunks([wire], {'content-encoding': 'br'}, threading.Event()))
+        self.assertEqual(b''.join(pieces), body)
+        self.assertLessEqual(max(map(len, pieces)), 64 * 1024)
+        self.assertEqual(self.decode(wire, 'br'), body)
+        for invalid in (wire[:-1], wire + b'\x00', wire + wire):
+            with self.subTest(length=len(invalid)), self.assertRaises(IncompleteRepresentationError):
+                self.decode(invalid, 'br')
+        with self.assertRaises(IncompleteRepresentationError):
+            self.decode(wire, 'br', length=len(wire) + 1)
+    def test_older_install_preserves_brotli_as_a_retryable_failure(self):
+        wire = brotli.compress(BODY)
+        with patch('archive_scout.network.transports.brotli', None):
+            with self.assertRaises(IncompleteRepresentationError) as caught:
+                self.decode(wire, 'br')
+            self.assertEqual(classify_exception(caught.exception), ('incomplete_representation', None, True))
+            self.assertEqual(self.decode(gzip.compress(BODY), 'gzip'), BODY)
     def test_truncated_inner_member_is_rejected(self):
         with self.assertRaises(IncompleteRepresentationError):self.decode(gzip.compress(gzip.compress(BODY)[:-3]),'gzip, gzip')
     def test_chain_limit_and_wire_length_are_checked(self):
@@ -84,6 +106,8 @@ class Fixture(BaseHTTPRequestHandler):
             self.send_response(503);self.send_header('Retry-After','60');self.send_header('Content-Length','99999999');self.end_headers();self.close_connection=True;return
         wire=BODY;encoding='gzip'
         if self.path=='/stacked':wire=gzip.compress(gzip.compress(BODY));encoding='gzip, gzip'
+        if self.path=='/brotli':wire=brotli.compress(BODY);encoding='br'
+        if self.path=='/broken-brotli':wire=brotli.compress(BODY)[:-1];encoding='br'
         if self.path=='/wrong':wire=BODY.replace(b'needle',b'xxxxxx')
         self.send_response(200);self.send_header('Content-Type','text/html');self.send_header('Content-Encoding',encoding)
         self.send_header('Content-Length',str(len(wire)));self.send_header('Set-Cookie','secret=never-log');self.end_headers();self.wfile.write(wire)
@@ -115,6 +139,23 @@ class RealHTTP(unittest.TestCase):
                     self.assertNotIn('set-cookie',detail['response_headers'])
                     self.assertEqual(base64.b64decode(detail['decoded_prefix_base64']),BODY.replace(b'needle',b'xxxxxx'))
                 finally:backend.close()
+    def test_brotli_replays_on_all_backends_preserve_complete_bytes_only(self):
+        backends = [HttpxBackend(2, 2, 2, trust_env=False), Urllib3Backend(2, 2, 2, trust_env=False)]
+        if shutil.which('curl'):
+            backends.append(CurlBackend(2, 2, trust_env=False))
+        with tempfile.TemporaryDirectory() as tmp:
+            for backend in backends:
+                with self.subTest(backend=backend.name):
+                    dest = Path(tmp) / backend.name
+                    try:
+                        result = backend.download(self.url('/brotli'), {}, dest, 10_000, threading.Event())
+                        self.assertEqual(result.content_hash, hashlib.sha256(BODY).hexdigest())
+                        self.assertEqual(dest.read_bytes(), BODY)
+                        with self.assertRaises(IncompleteRepresentationError):
+                            backend.download(self.url('/broken-brotli'), {}, dest, 10_000, threading.Event())
+                        self.assertFalse(dest.exists())
+                    finally:
+                        backend.close()
     def test_retry_after_observed_without_reading_error_body_or_changing_policy(self):
         samples=[];client=HttpClient(FixedRateLimiter(0),1,2,'test',threading.Event(),
             network_backend='httpx',trust_environment=False,host_gate=SharedHostGate(),
@@ -141,15 +182,15 @@ class RealHTTP(unittest.TestCase):
                 network=NetworkConfig(backend='httpx',trust_environment=False)).normalized()
             target=get_or_create_target(db,cfg.targets[0]);sig=cdx_query_signature(cfg)
             with db:
-                for name in ['stacked','wrong']:upsert_capture(db,{'timestamp':'20080101000000','original':'http://example.org/'+name,'mimetype':'text/html','statuscode':'200','digest':DIGEST,'length':len(BODY)},target,sig)
-                save_coverage_state(db,target,sig,cfg.from_date,cfg.to_date,None,True,2,None)
+                for name in ['stacked','wrong','brotli']:upsert_capture(db,{'timestamp':'20080101000000','original':'http://example.org/'+name,'mimetype':'text/html','statuscode':'200','digest':DIGEST,'length':len(BODY)},target,sig)
+                save_coverage_state(db,target,sig,cfg.from_date,cfg.to_date,None,True,3,None)
                 kid=get_or_create_keyword_set(db,'test',['needle']);run=start_scan_run(db,kid,'test',1,'all',{})
             reset_shared_traffic_state_for_tests()
             with patch('archive_scout.downloads.downloader.replay_url',side_effect=lambda timestamp,url:self.url('/'+url.rsplit('/',1)[-1])):
                 download_archive(cfg,db,run,threading.Event(),lambda event:None,scan_jobs=[ScanJob.create(run,'test',['needle'])])
             states={r['original_url'].rsplit('/',1)[-1]:r['state'] for r in db.execute('SELECT original_url,state FROM captures')}
-            self.assertEqual(states,{'stacked':'downloaded','wrong':'error'})
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM document_matches WHERE score>0').fetchone()[0],1)
+            self.assertEqual(states,{'stacked':'downloaded','wrong':'error','brotli':'downloaded'})
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM document_matches WHERE score>0').fetchone()[0],2)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM text_retry_schedule').fetchone()[0],1)
             samples=list((root/'diagnostics/text-acquisition').glob('sample-*.json'));self.assertEqual(len(samples),1)
             value=json.loads(samples[0].read_text());self.assertNotEqual(value['evidence']['actual_candidate_digest'],DIGEST)

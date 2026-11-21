@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 @contextmanager
-def project_lease(root, *, lock_name: str = "archive_scout.lock"):
+def project_lease(root, *, lock_name: str = "archive_scout.lock", allow_busy: bool = False):
     """Serialize whole operations and database replacement across processes.
 
     Advisory OS locks are released on crashes; the tiny lock file is reusable.
@@ -24,18 +24,19 @@ def project_lease(root, *, lock_name: str = "archive_scout.lock"):
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
-            try:
+        try:
+            if os.name == "nt":
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise RuntimeError("This project has an active operation or maintenance task") from exc
-        else:
-            import fcntl
-            try:
+            else:
+                import fcntl
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise RuntimeError("This project has an active operation or maintenance task") from exc
+        except OSError as exc:
+            if allow_busy:
+                yield False
+                return
+            raise RuntimeError("This project has an active operation or maintenance task") from exc
         locked = True
-        yield
+        yield True
     finally:
         try:
             if locked:

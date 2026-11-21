@@ -182,14 +182,17 @@ class PlanningTests(unittest.TestCase):
             stop=threading.Event();client=_client_for_config(cfg,stop,None)
             def fetch(_client,endpoints,params,**kwargs):
                 p=dict(params);calls.append(p)
+                self.assertLessEqual(len(calls), 4)
                 if 'showNumPages' in p:return [['pages'],[1]]
-                if 'page' in p:return CDXRows([row()])
-                raise TransientRequestError('read timeout',read_timed_out=True)
+                if len(calls) == 1:
+                    raise TransientRequestError('read timeout',read_timed_out=True)
+                return CDXRows([row()])
             try:
                 with patch.object(HttpClient,'get_cdx_any',fetch):
                     self.assertFalse(index_direct_media(cfg,db,client,stop,None,
                         media_query_signature(cfg),media_index_state_signature(cfg)))
-                self.assertEqual(len(calls),3)
+                self.assertEqual(['count' if 'showNumPages' in p else 'page' if 'page' in p else 'resume'
+                                  for p in calls], ['resume', 'count', 'page', 'resume'])
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM captures').fetchone()[0],0)
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM media_captures').fetchone()[0],1)
                 self.assertEqual(db.execute('SELECT complete FROM media_index_state').fetchone()[0],1)

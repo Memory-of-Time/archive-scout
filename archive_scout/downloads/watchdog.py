@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 class OwnerWatchdog:
-    def __init__(self, directory, *, enabled=True, clock=None,
+    def __init__(self, directory, *, enabled=True, clock=None, build_id=None, run_id=None,
                  stall_seconds=120.0, repeat_seconds=300.0):
         self.directory = Path(directory)
         self.enabled = enabled
@@ -22,11 +22,19 @@ class OwnerWatchdog:
         self.owner = threading.get_ident()
         self.pulse = (self.clock(), 'starting')
         self.last_report = float('-inf')
+        self.build_id = build_id
+        self.run_id = run_id
+        self.last_gap = None
 
     def beat(self, stage):
         if self.enabled:
             with self.lock:
-                self.pulse = (self.clock(), stage)
+                now = self.clock()
+                last, previous_stage = self.pulse
+                if self.thread is not None and not self.stopped.is_set() and now - last >= self.stall_seconds:
+                    self.last_gap = {'ended_at_epoch': time.time(), 'seconds': now-last,
+                                     'previous_stage': previous_stage, 'next_stage': stage}
+                self.pulse = (now, stage)
 
     def start(self):
         if self.enabled and self.thread is None:
@@ -78,6 +86,7 @@ class OwnerWatchdog:
         finally:
             del frames
         record = {'observed_at_epoch': time.time(), 'owner_stage': stage,
+                  'build_id': self.build_id, 'acquisition_run_id': self.run_id,
                   'owner_silent_seconds': now-last, 'threads': threads,
                   'notice': 'Thread locations only; no frame locals or archived content. '
                             'A suspended computer can also cause a heartbeat gap.'}
