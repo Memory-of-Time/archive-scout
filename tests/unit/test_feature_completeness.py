@@ -276,7 +276,7 @@ class FeatureCompletenessTests(unittest.TestCase):
             client.host_gate.remaining.return_value = 0
             with patch("archive_scout.cdx.discovery._domain", side_effect=lambda line: "plain.example" if line.strip() == b"plain.example" else ""):
                 paths, _ = run_fast_discovery(source, self.root / "quick", "jpg")
-            with sqlite3.connect(paths["urls"].parent / "discovery.sqlite3") as old:
+            with closing(sqlite3.connect(paths["urls"].parent / "discovery.sqlite3")) as old, old:
                 old.execute("PRAGMA user_version=0")
             paths, counts = run_fast_discovery(source, self.root / "quick", "jpg")
             run_fast_discovery(source, self.root / "quick", "jpg")
