@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from ..database.scope import scope_membership_predicate
+from ..error_runs import active_error_run
 from ..utils import utc_now
 
 
@@ -76,16 +77,20 @@ def record_failure(database: sqlite3.Connection, capture_id: int, category: str,
     if count >= 3 and category in {'incomplete_representation', 'payload_digest_mismatch', 'content_encoding_mismatch'}:
         backoff = max(backoff, min(60.0, max(1.0, max_seconds)))
     delay = backoff * (0.90 + (capture_id % 17) / 85.0)
+    next_eligible_at = max(time.time() + delay, not_before)
     database.execute("""INSERT INTO text_retry_schedule
         (capture_id,next_eligible_at,failure_count,last_category,last_status,updated_at)
         VALUES(?,?,?,?,?,?) ON CONFLICT(capture_id) DO UPDATE SET
         next_eligible_at=excluded.next_eligible_at,
         failure_count=excluded.failure_count,last_category=excluded.last_category,
         last_status=excluded.last_status,updated_at=excluded.updated_at""",
-        (capture_id, max(time.time()+delay, not_before), count, category, status, utc_now()))
+        (capture_id, next_eligible_at, count, category, status, utc_now()))
     if stage_ready and _retry_queue_exists(database):
         database.execute('''INSERT OR REPLACE INTO archive_scout_ready_retries
             SELECT capture_id,next_eligible_at FROM text_retry_schedule WHERE capture_id=?''', (capture_id,))
+    run = active_error_run.get()
+    if run is not None:
+        run.retry_scheduled(capture_id, category, status, next_eligible_at, count, kind='text')
 
 
 def clear_retry(database: sqlite3.Connection, capture_id: int) -> None:

@@ -50,9 +50,15 @@ Choose **Fast URL discovery from a domain list** in Operation, select a UTF-8 fi
 
 ## v1.3.0 large-project reliability
 
-Dashboard refresh reads compact transaction-maintained summaries instead of repeatedly counting the complete inventory. Pending local scans use a keyset index rather than sorting project history on every batch. Unexpected scanner-supervisor failures stop further acquisition with completed files retained. Optional acquisition diagnostics now keep a bounded five-minute history alongside the latest health snapshot. Network pacing and saved-body validation contracts are unchanged.
+Dashboard refresh reads compact transaction-maintained summaries instead of repeatedly counting the complete inventory. Pending local scans use a keyset index rather than sorting project history on every batch. Unexpected scanner-supervisor failures stop further acquisition with completed files retained.
 
 See [v1.3.0 validation and limits](docs/V130_SUSTAINABILITY.md). Local fixture measurements do not establish overnight live Wayback performance.
+
+## Troubleshooting a project run
+
+Scout writes runtime diagnostics to the project's `errors` folder when network diagnostics are enabled. `latest-run.json` names the newest run folder. That folder contains the effective settings, progress and resource timelines, detailed failures and retry times, representative early and recent failures, and text and media acquisition health. A stalled operation can also contain a thread-location snapshot. To share the evidence, ZIP the `errors` folder from the project that had the issue.
+
+Scout retains four run folders and rotates their journals. Each run's overview records rotation, dropped records and final status when available. The folder contains archived URL paths and capture IDs for diagnosis. It redacts session IDs and secrets from request URLs and omits archived response bodies. The existing Diagnostics export remains available for an aggregate project report.
 
 ## Projects and compatibility
 

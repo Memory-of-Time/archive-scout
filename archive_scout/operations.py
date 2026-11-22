@@ -33,6 +33,7 @@ from .projects.integrity import check_project_integrity
 from .projects.backups import create_project_backup
 from .projects.repair import repair_project
 from .projects.diagnostics import export_diagnostics
+from .error_runs import ErrorRun
 from .projects.importers import import_text_folder
 from .constants import VERSION
 from .coverage import IndexCoveragePending, require_embedded_coverage, text_coverage_gaps, media_coverage_gaps, record_admission
@@ -610,6 +611,7 @@ def run_project(
     stop_event: threading.Event | None = None,
     callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
+    requested_mode = mode
     config = config.normalized()
     resumed_request = False
     if mode == "resume":
@@ -638,6 +640,12 @@ def run_project(
     if mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
         raise ValueError("select at least one keyword set")
     stop_event = stop_event or threading.Event()
+    with ErrorRun(config, requested_mode, mode) as error_run:
+        return _run_project(config, mode, stop_event, callback, resumed_request, error_run)
+
+
+def _run_project(config, mode, stop_event, callback, resumed_request, error_run):
+    error_run.heartbeat('opening project database')
     config.output_dir.mkdir(parents=True, exist_ok=True)
     (config.output_dir / "captures").mkdir(exist_ok=True)
     (config.output_dir / "media" / "images").mkdir(parents=True, exist_ok=True)
@@ -668,6 +676,7 @@ def run_project(
                 discover_embedded=True if pending_media_phase == "external" else config.media.discover_embedded,
                 allow_external_embeds=True if pending_media_phase == "external" else config.media.allow_external_embeds)
     operation_run_id = start_operation_run(database, mode, VERSION)
+    error_run.operation_id = operation_run_id
     from .downloads.checkpoint import note_recovery_run
     note_recovery_run(database, operation_run_id)
     if mode in RESUMABLE_MODES:
@@ -680,7 +689,9 @@ def run_project(
 
     def operation_callback(event: ProgressEvent) -> None:
         nonlocal last_progress_write, last_progress_stage
-        if threading.get_ident() == owner_thread_id:
+        owner = threading.get_ident() == owner_thread_id
+        error_run.progress(event, owner=owner)
+        if owner:
             now = time.monotonic()
             completed_boundary = (
                 event.current is not None
@@ -1173,4 +1184,14 @@ def run_project(
         try:
             end_session(acquisition_session_token)
         finally:
+            if error_run.directory is not None:
+                try:
+                    outcome = database.execute('SELECT status,message FROM operation_runs WHERE id=?',
+                                               (operation_run_id,)).fetchone()
+                    if outcome:
+                        error_run.status = outcome[0]
+                        error_run.record('timeline', 'operation_outcome', {
+                            'status': outcome[0], 'message': error_run.safe_text(outcome[1])})
+                except sqlite3.Error:
+                    pass
             database.close()

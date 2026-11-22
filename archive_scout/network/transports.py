@@ -29,6 +29,7 @@ from httpcore import ReadTimeout as HttpcoreReadTimeout
 import urllib3
 
 from ..events import Stopped
+from ..error_runs import active_error_run, request_identity, safe_url
 from ..runtime import ensure_frozen_bundle_available
 from .replay_turn import (
     ReplayDispatchDeferred, ReplayTurnExpired, ReplayTurnInterrupted, replay_timeout, replay_turn,
@@ -323,6 +324,7 @@ _DIAGNOSTIC_HEADERS = frozenset({
     'content-type', 'content-length', 'content-encoding', 'transfer-encoding',
     'retry-after', 'memento-datetime', 'x-archive-orig-content-encoding',
     'x-archive-orig-content-length', 'x-archive-src',
+    'content-range', 'server', 'via', 'date', 'age', 'cf-ray', 'x-app-server',
 })
 
 
@@ -725,9 +727,35 @@ class _BackendControls:
     on_headers: Callable[[], None] | None
     response_callback: Callable[[int], None] | None = None
     response_status: int | None = None
+    capture_diagnostics: bool = False
+    diagnostic_url: str = ""
+    diagnostic_status: int | None = None
+    dial_target: tuple[str, int] | None = None
+    connected_peer: tuple[str, int] | None = None
 
 
 _backend_controls: ContextVar[_BackendControls | None] = ContextVar("backend_controls", default=None)
+
+
+def _backend_attempted(url: str) -> None:
+    controls = _backend_controls.get()
+    if controls is not None and controls.capture_diagnostics:
+        controls.diagnostic_url = url
+        controls.diagnostic_status = None
+        controls.dial_target = None
+        controls.connected_peer = None
+
+
+def _backend_peer(get_address) -> None:
+    controls = _backend_controls.get()
+    if controls is None or controls.diagnostic_url == '':
+        return
+    try:
+        address = get_address()
+        if isinstance(address, tuple) and len(address) >= 2 and type(address[1]) is int:
+            controls.connected_peer = (str(address[0]), address[1])
+    except Exception:
+        pass
 
 
 def _managed_redirects() -> bool:
@@ -740,6 +768,8 @@ def _backend_received_headers(status: int) -> None:
     if controls is None or not 200 <= status <= 599:
         return
     controls.response_status = status
+    if controls.capture_diagnostics:
+        controls.diagnostic_status = status
     if controls.on_headers is not None:
         controls.on_headers()
         controls.on_headers = None
@@ -804,6 +834,9 @@ class _TimedNetworkBackend:
         self.backend = backend
 
     def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        controls = _backend_controls.get()
+        if controls is not None and controls.capture_diagnostics:
+            controls.dial_target = (host.decode('ascii', 'replace') if isinstance(host, bytes) else str(host), port)
         stream = self.backend.connect_tcp(host, port, timeout=replay_timeout(timeout),
                                           local_address=local_address, socket_options=socket_options)
         return _TimedNetworkStream(stream)
@@ -872,7 +905,11 @@ class HttpxBackend:
             if remaining is not None:
                 options['timeout'] = httpx.Timeout(min(self.read_timeout, remaining),
                     connect=min(self.connect_timeout, remaining))
+            _backend_attempted(current_url)
             with self.client.stream("GET", current_url, headers=headers, **options) as response:
+                stream = getattr(response, 'extensions', {}).get('network_stream')
+                if stream is not None:
+                    _backend_peer(lambda: stream.get_extra_info('server_addr'))
                 _backend_received_headers(int(response.status_code))
                 location = response.headers.get("Location")
                 if response.status_code in {301,302,303,307,308} and not location and redirect_validator:
@@ -938,7 +975,11 @@ class HttpxBackend:
             options["timeout"] = httpx.Timeout(
                 connect=replay_timeout(self.connect_timeout), read=replay_timeout(self.read_timeout),
                 write=replay_timeout(self.connect_timeout), pool=replay_timeout(max(5.0, self.connect_timeout)))
+        _backend_attempted(url)
         with self.client.stream("GET", url, headers=request_headers, **options) as response:
+            stream = getattr(response, 'extensions', {}).get('network_stream')
+            if stream is not None:
+                _backend_peer(lambda: stream.get_extra_info('server_addr'))
             _backend_received_headers(int(response.status_code))
             if (redirect_validator or _managed_redirects()) and int(response.status_code) in {301,302,303,307,308}:
                 location = response.headers.get("location")
@@ -1130,6 +1171,7 @@ class Urllib3Backend:
         try:
             for _ in range(11):
                 remaining = _deadline_remaining(deadline)
+                _backend_attempted(current_url)
                 response = self._pool_for(current_url).request(
                     "GET",
                     current_url,
@@ -1141,8 +1183,12 @@ class Urllib3Backend:
                     timeout=(self.timeout if remaining is None else urllib3.Timeout(
                         connect=min(self.connect_timeout, remaining), read=min(self.read_timeout, remaining))),
                 )
+                _backend_peer(lambda: response.connection.sock.getpeername())
                 if int(response.status) not in {301, 302, 303, 307, 308}:
                     break
+                controls = _backend_controls.get()
+                if controls is not None:
+                    controls.diagnostic_status = int(response.status)
                 location = response.headers.get("Location")
                 if not location:
                     if redirect_validator:
@@ -1218,6 +1264,7 @@ class Urllib3Backend:
         response = None
         try:
             for _ in range(11):
+                _backend_attempted(current_url)
                 response = self._pool_for(current_url).request(
                     "GET", current_url, headers=headers, preload_content=False,
                     redirect=False, retries=False,
@@ -1225,8 +1272,12 @@ class Urllib3Backend:
                         connect=replay_timeout(self.connect_timeout), read=replay_timeout(self.read_timeout))),
                     pool_timeout=replay_timeout(self.pool_timeout),
                 )
+                _backend_peer(lambda: response.connection.sock.getpeername())
                 if int(response.status) not in {301, 302, 303, 307, 308}:
                     break
+                controls = _backend_controls.get()
+                if controls is not None:
+                    controls.diagnostic_status = int(response.status)
                 location = response.headers.get("Location")
                 if not location:
                     if redirect_validator:
@@ -1425,6 +1476,7 @@ class CurlBackend:
                 command.extend(["--header", f"{key}: {value}"])
             command.extend(["--", url])
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            _backend_attempted(url)
             proc = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -1517,6 +1569,7 @@ class CurlBackend:
                 command.extend(["--header", f"{key}: {value}"])
             command.extend(["--", url])
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            _backend_attempted(url)
             proc = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 creationflags=creationflags, env=self._curl_environment(),
@@ -1643,6 +1696,7 @@ class ResilientTransport:
         if requested not in {"auto", "httpx", "urllib3", "curl"}:
             raise ValueError("network backend must be auto, httpx, urllib3, or curl")
         self.callback = callback
+        self.error_run = active_error_run.get()
         self.cdx_response_seconds = max(1.0, float(read_timeout))
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
@@ -1825,7 +1879,39 @@ class ResilientTransport:
                 self._backend_result(turn, None)
                 raise
         on_headers = lambda: self._backend_reachable(turn)
-        return _backend_controls.set(_BackendControls(pacer, permit_checker, on_headers, response_callback))
+        controls = _BackendControls(pacer, permit_checker, on_headers, response_callback,
+                                    capture_diagnostics=getattr(self, 'error_run', None) is not None)
+        return _backend_controls.set(controls)
+
+    def _note_failure(self, turn, url, exc, started, *, phase=None, expected_digest=''):
+        run = getattr(self, 'error_run', None)
+        if run is None:
+            return
+        controls = _backend_controls.get()
+        try:
+            run.backend_failure(url, controls.diagnostic_url or url, turn.name,
+                                phase or transport_failure_phase(exc), exc, time.monotonic() - started,
+                                controls.diagnostic_status, probe=turn.probe, expected_digest=expected_digest,
+                                dial_target=controls.dial_target, connected_peer=controls.connected_peer)
+        except Exception:
+            pass
+
+    def _note_status(self, url, response):
+        run = getattr(self, 'error_run', None)
+        if run is None or response.status < 400:
+            return
+        try:
+            identity = request_identity(url)
+            controls = _backend_controls.get()
+            run.record('failures', 'http_response', {**identity, 'backend': response.backend,
+                'status': response.status, 'backend_seconds': round(response.elapsed, 3),
+                'dial_target': controls.dial_target, 'connected_peer': controls.connected_peer,
+                'final_url': safe_url(response.final_url), 'headers': {
+                    key: run.safe_text(value) for key, value in response_diagnostic(
+                        response.status, response.headers, response.final_url)['response_headers'].items()}},
+                group=(response.status, identity.get('original_host', '')))
+        except Exception:
+            pass
 
     def request(
         self,
@@ -1841,6 +1927,8 @@ class ResilientTransport:
         for turn, context in self._backend_turns(stop_event, permit_checker, response_callback=response_callback):
             name = turn.name
             backend = self.backends[name]
+            start_count = len(failures)
+            started = time.monotonic() if getattr(self, 'error_run', None) else 0.0
             try:
                 options = {"redirect_validator": redirect_validator} if redirect_validator is not None else {}
                 if (isinstance(backend, (HttpxBackend, Urllib3Backend, CurlBackend))
@@ -1848,10 +1936,12 @@ class ResilientTransport:
                         {'/cdx/search/cdx', '/web/timemap/json', '/web/timemap/cdx'}):
                     options['deadline'] = time.monotonic() + self.cdx_response_seconds
                 response = backend.request(url, headers, max_bytes, stop_event, **options)
+                self._note_status(url, response)
                 if _backend_controls.get().response_status is None:
                     self._backend_reachable(turn)
                 return response
-            except RedirectPolicyError:
+            except RedirectPolicyError as exc:
+                self._note_failure(turn, url, exc, started, phase='redirect_policy')
                 self._backend_result(turn, True)  # successful response, policy refused redirect
                 raise
             except (PermitRevoked, Stopped):
@@ -1874,6 +1964,8 @@ class ResilientTransport:
             except Exception as exc:
                 failures.append((name, _response_error(exc)))
             finally:
+                if len(failures) > start_count:
+                    self._note_failure(turn, url, failures[-1][1], started)
                 had_headers = _backend_controls.get().response_status is not None
                 _backend_controls.reset(context)
             last_error = failures[-1][1]
@@ -1921,6 +2013,8 @@ class ResilientTransport:
         for turn, context in self._backend_turns(stop_event, permit_checker, pinned=pinned, response_callback=response_callback):
             name = turn.name
             backend = self.backends[name]
+            start_count = len(failures)
+            started = time.monotonic() if getattr(self, 'error_run', None) else 0.0
             try:
                 kwargs = ({"redirect_validator": redirect_validator}
                           if redirect_validator is not None else {})
@@ -1934,12 +2028,14 @@ class ResilientTransport:
                     )
                 else:
                     response = backend.download(url, headers, destination, max_bytes, stop_event, **kwargs)
+                self._note_status(url, response)
                 if _backend_controls.get().response_status is None:
                     self._backend_reachable(turn)
                 if 200 <= response.status < 300:
                     replay_timeout()
                 return response
-            except RedirectPolicyError:
+            except RedirectPolicyError as exc:
+                self._note_failure(turn, url, exc, started, phase='redirect_policy', expected_digest=expected_digest)
                 self._backend_result(turn, True)  # successful response, policy refused redirect
                 raise
             except (PermitRevoked, ReplayTurnExpired, Stopped):
@@ -1960,6 +2056,8 @@ class ResilientTransport:
             except Exception as exc:
                 failures.append((name, _response_error(exc)))
             finally:
+                if len(failures) > start_count:
+                    self._note_failure(turn, url, failures[-1][1], started, expected_digest=expected_digest)
                 had_headers = _backend_controls.get().response_status is not None
                 _backend_controls.reset(context)
             partial_ready = bool(retain_partial and _partial_metadata_path(destination).is_file()

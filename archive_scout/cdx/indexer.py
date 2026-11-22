@@ -18,6 +18,7 @@ from typing import Callable, Iterable
 from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_site_issue, upsert_captures
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
+from ..error_runs import active_error_run
 from ..events import ProgressEvent, Stopped
 from ..network.transports import (exception_chain, IncompleteRepresentationError, normalize_transport_error,
                                   is_transport_pool_timeout, is_transport_connection_failure)
@@ -712,6 +713,17 @@ def _record_network_event(database: sqlite3.Connection, stage: str, message: str
                 (SELECT COALESCE(MAX(id),0)-10000 FROM network_events)""")
     except sqlite3.OperationalError:
         pass
+    run = active_error_run.get()
+    if run is not None:
+        try:
+            safe_details = {key: run.safe_text(value) if isinstance(value, str) else value
+                            for key, value in (details or {}).items()
+                            if key in {'window_start', 'window_end', 'window', 'target', 'strategy',
+                                       'failures', 'page', 'page_count', 'retry_pages', 'streak'}}
+            run.record('failures', 'index_event', {'stage': stage, 'message': run.safe_text(message),
+                       'details': safe_details}, group=(stage,))
+        except Exception:
+            pass
 
 
 def _temporary_index_failure(exc: BaseException) -> bool:

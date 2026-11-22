@@ -19,6 +19,7 @@ from uuid import uuid4
 from ..constants import VERSION
 from ..events import ProgressEvent
 from ..network.transports import exception_chain, transport_failure_phase
+from ..error_runs import active_error_run, endpoint_details, safe_url
 from ..utils import utc_now
 
 
@@ -31,7 +32,8 @@ def build_fingerprint():
                  'downloads/validation.py', 'downloads/outcomes.py', 'network/transports.py', 'network/replay_turn.py',
                  'cdx/client.py', 'database/dashboard.py', 'database/schema.py', 'ui/dashboard.py',
                  'cdx/indexer.py', 'cdx/status.py',
-                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'scanning/capacity.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py'):
+                 'media/indexer.py', 'media/downloader.py', 'media/recovery.py', 'media/embedded_pages.py', 'scanning/pending.py', 'scanning/capacity.py', 'domains.py', 'scanning/scoring.py', 'operations.py', 'retry_budget.py',
+                 'error_runs.py'):
         path = root / name
         if path.is_file():
             try:
@@ -113,6 +115,8 @@ class AcquisitionDiagnostics:
         self.representation_recoveries = deque(maxlen=8)
         self.failures = Counter()
         self.transport_failures = Counter()
+        self.host_outcomes = {}
+        self.saved_replay_modes = Counter()
         self.resource_sample = (time.monotonic(), time.process_time())
         self.samples = set()
         self.phase_saved_base = 0
@@ -124,20 +128,46 @@ class AcquisitionDiagnostics:
         self.last_successful_save = None
         self.build_announced = False
         self.recent_saves = deque(maxlen=4096)
-        self.summary_path = self.root / 'diagnostics' / (self.kind + '-acquisition')
+        self.error_run = active_error_run.get() if enabled else None
+        directory = self.error_run.directory if self.error_run is not None else self.root / 'diagnostics'
+        if self.error_run is not None:
+            self.run['diagnostic_run_id'] = self.error_run.run_info['diagnostic_run_id']
+            self.run['operation_run_id'] = self.error_run.operation_id
+        self.summary_path = directory / (self.kind + '-acquisition')
         from .watchdog import OwnerWatchdog
         self.watchdog = OwnerWatchdog(self.summary_path, enabled=enabled, build_id=self.build,
-                                      run_id=self.run['acquisition_run_id'])
+                                      run_id=self.run['acquisition_run_id'],
+                                      diagnostic_run_id=self.run.get('diagnostic_run_id'))
 
     def close(self):
         self.watchdog.close()
         if self.batch_saved or self.phase_saved_base or self.failures:
             self.summary(self.batch_saved, final=True)
 
-    def saved(self):
+    def capture_outcome(self, row, outcome, exception=None):
+        if self.error_run is None:
+            return
+        host = endpoint_details(row['original_url']).get('host') or '[unknown host]'
+        if host not in self.host_outcomes and len(self.host_outcomes) >= 128:
+            host = '[other hosts]'
+        if host not in self.host_outcomes:
+            self.host_outcomes[host] = Counter()
+        self.host_outcomes[host][outcome] += 1
+        if exception is not None:
+            try:
+                self.error_run.capture_failure(row, outcome, exception, kind=self.kind)
+            except Exception:
+                pass
+
+    def saved(self, row=None):
         with self.lock:
             self.last_successful_save = time.monotonic()
             self.recent_saves.append(self.last_successful_save)
+            if row is not None and self.error_run is not None:
+                self.capture_outcome(row, 'saved')
+                if self.kind == 'text':
+                    alternate = 'alternate_replay' in row.keys() and row['alternate_replay']
+                    self.saved_replay_modes['alternate_selected' if alternate else 'standard'] += 1
 
     def save_metrics(self):
         with self.lock:
@@ -193,7 +223,7 @@ class AcquisitionDiagnostics:
             if detail.get('encoding_recovery'):
                 self.representation_recovery_count += 1
                 self.representation_recoveries.append({
-                    'url': _safe_url(detail.get('url', '')),
+                    'url': (safe_url if self.error_run else _safe_url)(detail.get('url', '')),
                     'backend': detail.get('backend', ''),
                     'proof': str(detail['encoding_recovery'])[:500],
                     'observed_at': utc_now()})
@@ -202,7 +232,7 @@ class AcquisitionDiagnostics:
                     self.timings[key] += max(0.0, float(detail[key]))
                     self.timing_counts[key] += 1
             if detail['status'] in (429, 503):
-                self.controls.append({**detail, 'url': _safe_url(detail.get('url', '')),
+                self.controls.append({**detail, 'url': (safe_url if self.error_run else _safe_url)(detail.get('url', '')),
                                       'observed_at': utc_now()})
 
     def failure(self, row, category, exc):
@@ -218,6 +248,9 @@ class AcquisitionDiagnostics:
             self._emit(ProgressEvent('acquisition_health',
                 f'{self.kind.title()} acquisition failure [{category}] for capture {row["id"]}; '
                 f'build {self.build}. Bounded diagnostic sampling is enabled.'))
+        if self.error_run is not None:
+            self.capture_outcome(row, category, exc)
+            return
         slot = int(hashlib.sha256((category + ':' + str(row['id'])).encode()).hexdigest()[:8], 16) % self.MAX_SAMPLES
         if slot in self.samples:
             return
@@ -267,7 +300,8 @@ class AcquisitionDiagnostics:
             now, cpu = time.monotonic(), time.process_time()
             elapsed, used = now-self.resource_sample[0], cpu-self.resource_sample[1]
             self.resource_sample = (now, cpu)
-            return {**self.run, 'response_counts': dict(self.responses),
+            extra = {'original_host_outcomes': self.host_outcomes, 'saved_replay_modes': self.saved_replay_modes} if self.error_run else {}
+            return {**self.run, **extra, 'response_counts': dict(self.responses),
                     'representation_recovery_count': self.representation_recovery_count,
                     'recent_representation_recoveries': list(self.representation_recoveries),
                     'transport_failure_phases': dict(self.transport_failures),
@@ -294,7 +328,8 @@ class AcquisitionDiagnostics:
     def _append_history(self, detail, *, final=False):
         now = time.monotonic()
         previous = getattr(self, '_last_history', None)
-        if not final and previous is not None and now - previous < self.HISTORY_INTERVAL_SECONDS:
+        interval = 30 if self.error_run is not None else self.HISTORY_INTERVAL_SECONDS
+        if not final and previous is not None and now - previous < interval:
             return
         record = (json.dumps({**detail, 'observed_at': utc_now()}, sort_keys=True)+'\n').encode('utf-8')
         if len(record) > self.HISTORY_MAX_BYTES:

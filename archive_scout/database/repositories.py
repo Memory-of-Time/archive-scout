@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from ..constants import REVIEW_STATUSES
+from ..error_runs import active_error_run
 from ..scanning.keywords import keyword_rules_to_lines, parse_keyword_rules, serialize_keyword_rules
 from ..utils import utc_now
 
@@ -421,21 +422,32 @@ def record_error(
         params,
     ).fetchone()
     if row:
+        error_id = int(row['id'])
+        attempts = int(row['attempt_count']) + 1
         database.execute(
             "UPDATE errors SET message=?,http_status=?,attempt_count=?,retryable=?,last_seen=? WHERE id=?",
-            (message, http_status, int(row["attempt_count"]) + 1, int(retryable), now, row["id"]),
+            (message, http_status, attempts, int(retryable), now, error_id),
         )
-        return int(row["id"])
-    cursor = database.execute(
-        """
-        INSERT INTO errors(
-            capture_id,document_id,media_capture_id,operation,category,message,http_status,
-            attempt_count,retryable,resolved,ignored,first_seen,last_seen,index_scope
-        ) VALUES(?,?,?,?,?,?,?,1,?,0,0,?,?,?)
-        """,
-        (capture_id, document_id, media_capture_id, operation, category, message, http_status, int(retryable), now, now, index_scope),
-    )
-    return int(cursor.lastrowid)
+    else:
+        cursor = database.execute(
+            """
+            INSERT INTO errors(
+                capture_id,document_id,media_capture_id,operation,category,message,http_status,
+                attempt_count,retryable,resolved,ignored,first_seen,last_seen,index_scope
+            ) VALUES(?,?,?,?,?,?,?,1,?,0,0,?,?,?)
+            """,
+            (capture_id, document_id, media_capture_id, operation, category, message, http_status, int(retryable), now, now, index_scope),
+        )
+        error_id = int(cursor.lastrowid)
+        attempts = 1
+    run = active_error_run.get()
+    if run is not None:
+        try:
+            run.error_row(error_id, operation, category, message, capture_id, document_id, media_capture_id,
+                          http_status, retryable, index_scope, attempts)
+        except Exception:
+            pass
+    return error_id
 
 
 def resolve_errors(

@@ -10,7 +10,7 @@ from pathlib import Path
 
 class OwnerWatchdog:
     def __init__(self, directory, *, enabled=True, clock=None, build_id=None, run_id=None,
-                 stall_seconds=120.0, repeat_seconds=300.0):
+                 diagnostic_run_id=None, stall_seconds=120.0, repeat_seconds=300.0):
         self.directory = Path(directory)
         self.enabled = enabled
         self.clock = clock or time.monotonic
@@ -24,6 +24,7 @@ class OwnerWatchdog:
         self.last_report = float('-inf')
         self.build_id = build_id
         self.run_id = run_id
+        self.diagnostic_run_id = diagnostic_run_id
         self.last_gap = None
 
     def beat(self, stage):
@@ -77,7 +78,9 @@ class OwnerWatchdog:
                 frame = frames.get(ident)
                 stack = []
                 while frame is not None and len(stack) < 20:
-                    stack.append({'file': frame.f_code.co_filename[-200:],
+                    name = frame.f_code.co_filename.replace('\\', '/')
+                    file = 'archive_scout/' + name.split('/archive_scout/', 1)[1] if '/archive_scout/' in name else name.rsplit('/', 1)[-1]
+                    stack.append({'file': file[-200:],
                                   'line': frame.f_lineno,
                                   'function': frame.f_code.co_name[:100]})
                     frame = frame.f_back
@@ -87,6 +90,7 @@ class OwnerWatchdog:
             del frames
         record = {'observed_at_epoch': time.time(), 'owner_stage': stage,
                   'build_id': self.build_id, 'acquisition_run_id': self.run_id,
+                  'diagnostic_run_id': self.diagnostic_run_id,
                   'owner_silent_seconds': now-last, 'threads': threads,
                   'notice': 'Thread locations only; no frame locals or archived content. '
                             'A suspended computer can also cause a heartbeat gap.'}

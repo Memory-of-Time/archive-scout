@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from contextvars import copy_context
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -557,11 +558,11 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
             raise
         if alternate:
             if response["final_url"] != url:
-                raise AlternateReplayUnverified('Alternate replay changed the requested capture URL or timestamp')
+                raise AlternateReplayUnverified('Alternate replay changed the requested capture URL or timestamp', response)
             proof = prove_file(stage, row)
             if (not proof or proof['source'] != 'cdx' or proof['content_hash'] != response["content_hash"]
                     or proof['bytes_saved'] != int(response["bytes"])):
-                raise AlternateReplayUnverified('Alternate replay bytes did not match the indexed digest')
+                raise AlternateReplayUnverified('Alternate replay bytes did not match the indexed digest', response)
         content_type = (response["headers"].get("content-type") or
                         response["headers"].get("Content-Type") or row["mimetype"] or "")
         preview = response["preview"]
@@ -578,7 +579,7 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
         replay_problem = classify_replay_content(preview_text, response["final_url"])
         if replay_problem:
             if alternate:
-                raise AlternateReplayUnverified(f'Alternate replay returned an archive error response: {replay_problem}')
+                raise AlternateReplayUnverified(f'Alternate replay returned an archive error response: {replay_problem}', response)
             raise RuntimeError(replay_problem)
         if int(response["bytes"]) != stage.stat().st_size:
             raise OSError("streamed replay byte count differs from retained file")
@@ -841,7 +842,7 @@ def download_archive(
                 scanner_failures.append(exc)
             finally:
                 connection.close()
-        scanner_thread = threading.Thread(target=local_scanner,
+        scanner_thread = threading.Thread(target=copy_context().run, args=(local_scanner,),
                          name="archive-scout-local-scan-supervisor", daemon=False)
         scanner_thread.start()
         scanner_wakeup.set()
@@ -1168,7 +1169,7 @@ def download_archive(
                         outcome_state = 'downloaded_unscanned'
                         if scanner_thread is not None:
                             scanner_wakeup.set()
-                        diagnostics.saved()
+                        diagnostics.saved(row)
                         if "analyses" in result:
                             matched += int(any(
                                 int(analysis.get("score") or 0) >= config.minimum_score
@@ -1185,6 +1186,7 @@ def download_archive(
                         continue
                     except NonTextResponse as exc:
                         outcome_state = 'skipped'
+                        diagnostics.capture_outcome(row, 'routed_non_text')
                         with database_write_lock, database:
                             database.execute("UPDATE captures SET state='skipped',updated_at=? WHERE id=?", (utc_now(),row["id"]))
                             database.execute(
@@ -1257,6 +1259,7 @@ def download_archive(
                             diagnostics.failure(row, exc.category, exc)
                         else:
                             outcome_state = 'skipped'
+                            diagnostics.capture_outcome(row, exc.category, exc)
                             with database_write_lock, database:
                                 database.execute("UPDATE captures SET state='skipped',final_url=?,updated_at=? WHERE id=?",
                                     (exc.destination, utc_now(), row["id"]))

@@ -563,6 +563,7 @@ def download_media(
                             )
                             clear_media_retry(database, int(result["id"]))
                         saved += 1
+                        diagnostics.saved(row)
                         recent_saves.append(time.monotonic())
                     except RateLimitDeferred as exc:
                         # Remote pause exhaustion belongs to the media retry

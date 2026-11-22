@@ -10,6 +10,7 @@ from typing import Callable
 
 from ..retry_budget import NoProgressBudget, incomplete_retry_message
 from ..config import ProjectConfig
+from ..error_runs import active_error_run
 from ..events import ProgressEvent, Stopped
 from ..utils import utc_now
 from .indexer import media_query_signature
@@ -44,10 +45,14 @@ def record_media_failure(db: sqlite3.Connection, capture_id: int, category: str,
     if repetitions >= 3 and category in {'incomplete_representation','incomplete_media_representation','payload_digest_mismatch','content_encoding_mismatch'}:
         delay = max(delay,min(60.0,network.retry_max_seconds))
     delay = max(0.1, delay) * (0.9 + (capture_id % 17) / 85.0)
+    next_eligible_at = time.time() + delay
     db.execute("""INSERT INTO media_retry_schedule(media_capture_id,next_eligible_at,failure_count,last_category,last_status,updated_at)
       VALUES(?,?,?,?,?,?) ON CONFLICT(media_capture_id) DO UPDATE SET next_eligible_at=excluded.next_eligible_at,
       failure_count=excluded.failure_count,last_category=excluded.last_category,last_status=excluded.last_status,updated_at=excluded.updated_at""",
-      (capture_id,time.time()+delay,failures,category,status,utc_now()))
+      (capture_id,next_eligible_at,failures,category,status,utc_now()))
+    run = active_error_run.get()
+    if run is not None:
+        run.retry_scheduled(capture_id, category, status, next_eligible_at, failures, kind='media')
 
 
 def clear_media_retry(db: sqlite3.Connection, capture_id: int) -> None:
