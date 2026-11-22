@@ -1,4 +1,4 @@
-# Archive Scout v1.3.1
+# Archive Scout v1.3.2
 
 **Archive Scout** is an independent, cross-platform desktop and command-line tool for researching and preserving public Wayback Machine captures. It indexes archived URLs, acquires and validates saved bodies, scans selected keyword sets, supports media discovery, and produces reports.
 

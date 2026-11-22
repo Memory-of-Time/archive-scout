@@ -138,20 +138,23 @@ class AlternateReplayTests(ReplayFixture):
         self.assertFalse(receipt_path(path).exists())
         self.assertFalse(path.with_name(path.name + '.transfer').exists())
 
-    def test_scheduled_alternate_requires_the_indexed_body_and_never_follows_redirects(self):
+    def test_recovery_variants_require_the_indexed_body_and_never_follow_redirects(self):
         rows = [self.seed('valid', digest='sha1:' + CDX_DIGEST), self.seed('mismatch'),
-                self.seed('redirect'), self.seed('unknown-digest', digest='')]
+                self.seed('redirect'), self.seed('unknown-digest', digest=''), self.seed('legacy-alternate')]
         with self.db:
             for row in rows:
                 cid = row['id']
                 self.db.execute("UPDATE captures SET state='error' WHERE id=?", (cid,))
-                record_error(self.db, 'download', 'incomplete_representation', 'fixture', capture_id=cid, retryable=True)
-                record_failure(self.db, cid, 'incomplete_representation', 200, True, 1, 1)
+                category = ('alternate_replay_unverified' if row['original_url'].endswith('/legacy-alternate')
+                            else 'incomplete_representation')
+                record_error(self.db, 'download', category, 'fixture', capture_id=cid, retryable=True)
+                record_failure(self.db, cid, category, 200, True, 1, 1)
         requested = []
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                requested.append(self.path)
+                identity = self.headers.get('Accept-Encoding') == 'identity'
+                requested.append((self.path, identity))
                 if self.path.endswith('/redirect'):
                     self.send_response(302)
                     self.send_header('Location', '/web/20030101000000if_/changed')
@@ -159,7 +162,7 @@ class AlternateReplayTests(ReplayFixture):
                     self.end_headers()
                     return
                 payload = BODY.replace(b'archival', b'replayed') if (
-                    self.path.endswith('/mismatch') and 'if_/' in self.path) else BODY
+                    self.path.endswith('/mismatch') and (identity or 'if_/' in self.path)) else BODY
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html')
                 self.send_header('Content-Length', str(len(payload)))
@@ -183,17 +186,22 @@ class AlternateReplayTests(ReplayFixture):
             downloader.download_archive(self.config, self.db, 0, threading.Event(), None,
                 states=('error',), capture_ids=[row['id'] for row in rows], acquire_only=True,
                 allow_partial_inventory=True)
-            self.assertEqual(set(requested), {f'/web/{STAMP}if_/valid', f'/web/{STAMP}if_/mismatch',
-                f'/web/{STAMP}if_/redirect', f'/web/{STAMP}id_/unknown-digest'})
+            self.assertEqual(set(requested), {(f'/web/{STAMP}id_/valid', True),
+                (f'/web/{STAMP}id_/mismatch', True), (f'/web/{STAMP}id_/redirect', True),
+                (f'/web/{STAMP}id_/unknown-digest', False), (f'/web/{STAMP}id_/legacy-alternate', True)})
             self.assertEqual([r[0] for r in self.db.execute('SELECT capture_id FROM capture_payload_evidence ORDER BY 1')],
-                             [rows[0]['id'], rows[3]['id']])
+                             [rows[0]['id'], rows[3]['id'], rows[4]['id']])
             self.assertEqual([r[0] for r in self.db.execute('SELECT last_category FROM text_retry_schedule ORDER BY capture_id')],
-                             ['alternate_replay_unverified', 'alternate_replay_unverified'])
+                             ['identity_replay_unverified', 'identity_replay_unverified'])
             self.assertEqual(self.path(rows[0]).read_bytes(), BODY)
             self.assertFalse(self.path(rows[1]).exists())
             downloader.download_archive(self.config, self.db, 0, threading.Event(), None,
                 states=('error',), capture_ids=[rows[1]['id']], acquire_only=True, allow_partial_inventory=True)
-        self.assertEqual(requested[-1], f'/web/{STAMP}id_/mismatch')
+            self.assertEqual(requested[-1], (f'/web/{STAMP}if_/mismatch', False))
+            self.assertFalse(self.path(rows[1]).exists())
+            downloader.download_archive(self.config, self.db, 0, threading.Event(), None,
+                states=('error',), capture_ids=[rows[1]['id']], acquire_only=True, allow_partial_inventory=True)
+        self.assertEqual(requested[-1], (f'/web/{STAMP}id_/mismatch', False))
         self.assertEqual(self.path(rows[1]).read_bytes(), BODY)
 
 

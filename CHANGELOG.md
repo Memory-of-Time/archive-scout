@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.2
+
+- Restore text replay concurrency after two responses following a connection outage across the available backends. During recovery Scout admits one request at a time using the configured pacing and records the recovery state in the project diagnostics.
+- Try the same archived capture with identity encoding after a qualifying representation error. Use the existing alternate replay when it is still eligible. Both recovery paths require matching capture identity and indexed payload digest.
+- Verify the nonstandard `Content-Encoding: none` response against the complete transfer and the indexed payload digest. Record expected and observed digests for rejected recovery copies.
+
 ## v1.3.1
 
 - Added standalone Fast URL discovery for large domain lists, with a live list of matching URLs and capture metadata.

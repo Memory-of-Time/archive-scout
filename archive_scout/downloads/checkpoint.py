@@ -121,7 +121,7 @@ def read_receipt(path: Path, row) -> dict | None:
 
 
 def prove_file(path: Path, row, *, expected_hash=None, expected_size=None,
-               receipt_for: Path | None = None) -> dict | None:
+               receipt_for: Path | None = None, observed_digests: dict | None = None) -> dict | None:
     """Stream hash once. No readable-prefix or filename-only acceptance path."""
     sha256, sha1, length = hashlib.sha256(), hashlib.sha1(), 0
     with path.open('rb') as handle:
@@ -139,7 +139,10 @@ def prove_file(path: Path, row, *, expected_hash=None, expected_size=None,
         return None
     cdx = str(dict(row).get('digest') or '').upper().removeprefix('SHA1:').rstrip('=')
     if re.fullmatch(r'[A-Z2-7]{32}', cdx):
-        if base64.b32encode(sha1.digest()).decode() == cdx:
+        actual = base64.b32encode(sha1.digest()).decode()
+        if observed_digests is not None:
+            observed_digests.update(expected_cdx_digest=cdx, actual_candidate_digest=actual)
+        if actual == cdx:
             return {'content_hash': digest, 'bytes_saved': length, 'source': 'cdx'}
     return None
 

@@ -159,15 +159,14 @@ class AcquisitionDiagnostics:
             except Exception:
                 pass
 
-    def saved(self, row=None):
+    def saved(self, row=None, replay_retry_variant=None):
         with self.lock:
             self.last_successful_save = time.monotonic()
             self.recent_saves.append(self.last_successful_save)
             if row is not None and self.error_run is not None:
                 self.capture_outcome(row, 'saved')
                 if self.kind == 'text':
-                    alternate = 'alternate_replay' in row.keys() and row['alternate_replay']
-                    self.saved_replay_modes['alternate_selected' if alternate else 'standard'] += 1
+                    self.saved_replay_modes[replay_retry_variant or 'standard'] += 1
 
     def save_metrics(self):
         with self.lock:

@@ -1,10 +1,11 @@
-# Archive Scout v1.3.1 source patch
+# Archive Scout v1.3.2 source patch
 
-Apply this patch to `archive-scout-main(20261117-225344).zip`.
+Apply this overlay to Archive Scout v1.3.1 with the Project Errors add-on and its CI fix.
 
-1. Stop Archive Scout and extract a clean copy of the supplied repository.
-2. Extract the patch ZIP into the repository root containing `pyproject.toml`, replacing the matching files.
-3. Run `python -m pip install .` for a source installation, or rebuild your platform executable with the existing release workflow.
-4. Open your existing project normally. The main project remains on SQLite schema 12. Existing inventory does not require a reindex.
+1. Stop Archive Scout and extract the patch into the repository root containing `pyproject.toml`. Replace the matching files.
+2. Run `python -m pip install .` for a source installation, or rebuild your platform executable with the release workflow.
+3. Open your existing schema 13 project and select Resume. Scout uses the saved inventory, cursors, bodies, and retry schedules.
 
-The ZIP contains changed and new source files only. It does not include a replacement executable or any project data. Read [Fast URL discovery and large project resume](docs/V131_DISCOVERY_AND_RESUME.md) for usage, limits, and validation.
+The supplied Phoenix trace recorded 6,746 text connection failures and 19 validated saves. The last 81 minutes produced zero saves. The available HTTP stacks all reported failures reaching the same Wayback endpoint. The saved-body checks and retry changes are covered by the loopback fixtures. Sustained throughput on live Wayback is unverified.
+
+The project's `errors` folder contains the transport recovery state and the selected representation retry beside the capture outcome.

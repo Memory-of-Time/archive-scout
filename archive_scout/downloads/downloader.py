@@ -35,7 +35,7 @@ from ..scanning.keywords import compile_prefilter
 from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
-from .validation import AlternateReplayUnverified, classify_exception
+from .validation import AlternateReplayUnverified, IdentityReplayUnverified, classify_exception
 from .schedule import record_failure, clear_retry, prepare_retry_queue, select_due_retry, automatic_retry_allowed, restore_increased_size_limit
 from .checkpoint import prove_file, write_receipt, discard_receipt, sync_directory
 from .diagnostics import AcquisitionDiagnostics
@@ -538,31 +538,40 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
     # No unvalidated prefix may be reused as if it were a complete capture.
     stage.unlink(missing_ok=True)
     indexed_digest = str(row["digest"] or "") if "digest" in row.keys() else ""
-    alternate = ("alternate_replay" in row.keys() and row["alternate_replay"]
-                 and bool(_valid_cdx_digest(indexed_digest)) and isinstance(client, HttpClient))
-    url = replay_url(row["timestamp"], original, "if_") if alternate else replay_url(row["timestamp"], original)
+    retry_variant = ""
+    if _valid_cdx_digest(indexed_digest) and isinstance(client, HttpClient):
+        if "replay_retry_variant" in row.keys():
+            retry_variant = row["replay_retry_variant"]
+        elif "alternate_replay" in row.keys() and row["alternate_replay"]:
+            retry_variant = "alternate"
+    recovery_error = IdentityReplayUnverified if retry_variant == "identity" else AlternateReplayUnverified
+    url = (replay_url(row["timestamp"], original, "if_") if retry_variant == "alternate"
+           else replay_url(row["timestamp"], original))
     try:
         try:
             response = client.download_to_path(
                 url, stage, config.max_file_bytes,
                 redirect_validator=make_replay_redirect_validator(config, original,
-                    skip_redirects=alternate or not config.download_external_redirects),
+                    skip_redirects=bool(retry_variant) or not config.download_external_redirects),
                 **({"expected_digest": indexed_digest, "retain_partial": False}
                    if isinstance(client, HttpClient) else {}),
+                **({"identity_encoding": True} if retry_variant == "identity" else {}),
             )
         except Exception as exc:
-            if alternate and (isinstance(exc, (PermanentRequestError, RedirectPolicyError))
+            if retry_variant and (isinstance(exc, (PermanentRequestError, RedirectPolicyError))
                     or classify_exception(exc)[0] in {'incomplete_representation',
                        'payload_digest_mismatch', 'content_encoding_mismatch'}):
-                raise AlternateReplayUnverified('Alternate replay failed capture validation') from exc
+                raise recovery_error(f'{retry_variant.title()} replay failed capture validation') from exc
             raise
-        if alternate:
+        if retry_variant:
             if response["final_url"] != url:
-                raise AlternateReplayUnverified('Alternate replay changed the requested capture URL or timestamp', response)
-            proof = prove_file(stage, row)
+                raise recovery_error(f'{retry_variant.title()} replay changed the capture URL or timestamp', response)
+            observed_digests = {}
+            proof = prove_file(stage, row, observed_digests=observed_digests)
             if (not proof or proof['source'] != 'cdx' or proof['content_hash'] != response["content_hash"]
                     or proof['bytes_saved'] != int(response["bytes"])):
-                raise AlternateReplayUnverified('Alternate replay bytes did not match the indexed digest', response)
+                raise recovery_error(f'{retry_variant.title()} replay bytes did not match the indexed digest',
+                                     response, observed_digests)
         content_type = (response["headers"].get("content-type") or
                         response["headers"].get("Content-Type") or row["mimetype"] or "")
         preview = response["preview"]
@@ -578,8 +587,8 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
             preview_text = ""
         replay_problem = classify_replay_content(preview_text, response["final_url"])
         if replay_problem:
-            if alternate:
-                raise AlternateReplayUnverified(f'Alternate replay returned an archive error response: {replay_problem}', response)
+            if retry_variant:
+                raise recovery_error(f'{retry_variant.title()} replay returned an archive error response: {replay_problem}', response)
             raise RuntimeError(replay_problem)
         if int(response["bytes"]) != stage.stat().st_size:
             raise OSError("streamed replay byte count differs from retained file")
@@ -597,7 +606,8 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
             "bytes_saved": int(response["bytes"]), "content_hash": response["content_hash"],
             "http_status": response["status"], "final_url": response["final_url"],
             "response_content_type": content_type, "deferred_scan": True,
-            "encoding_recovery": response.get("encoding_recovery", "")}
+            "encoding_recovery": response.get("encoding_recovery", ""),
+            "replay_retry_variant": retry_variant}
     finally:
         # A partial text replay is NOT a resumable media transfer.  Discard
         # both its bytes and HTTPX range/ETag sidecar.  A stale sidecar without
@@ -876,6 +886,8 @@ def download_archive(
     transport = getattr(client, "transport", None)
     streamed = (isinstance(transport, ResilientTransport)
                 and getattr(type(client).get, "__module__", "") == "archive_scout.cdx.client")
+    if streamed:
+        transport.replay_route_recovery = config.network.persistent_retries
 
     def measured_fetch(row):
         try:
@@ -1030,14 +1042,21 @@ def download_archive(
                                     ids = [int(row['id']) for row in rows]
                                     fields = ','.join('?' for _ in ids)
                                     current = {int(row['id']): row for row in database.execute("""
-                                        SELECT c.*, CASE WHEN c.state='error' THEN EXISTS (
-                                            SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=c.id
+                                        SELECT c.*, CASE WHEN c.state='error' THEN COALESCE((
+                                            SELECT CASE
+                                                WHEN s.last_category!='identity_replay_unverified'
+                                                AND NOT EXISTS (SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx
+                                                    WHERE e.capture_id=c.id AND e.operation='download'
+                                                    AND e.category='identity_replay_unverified') THEN 'identity'
+                                                WHEN s.last_category!='alternate_replay_unverified'
+                                                AND NOT EXISTS (SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx
+                                                    WHERE e.capture_id=c.id AND e.operation='download'
+                                                    AND e.category='alternate_replay_unverified') THEN 'alternate'
+                                                ELSE '' END FROM text_retry_schedule s WHERE s.capture_id=c.id
                                             AND s.last_category IN ('incomplete_representation',
-                                                'payload_digest_mismatch','content_encoding_mismatch')
-                                            AND NOT EXISTS (SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx
-                                                WHERE e.capture_id=c.id AND e.operation='download'
-                                                AND e.category='alternate_replay_unverified')
-                                        ) ELSE 0 END AS alternate_replay
+                                                'payload_digest_mismatch','content_encoding_mismatch',
+                                                'identity_replay_unverified','alternate_replay_unverified')
+                                        ), '') ELSE '' END AS replay_retry_variant
                                         FROM captures c WHERE c.id IN ("""+fields+""")
                                         AND c.state IN ('pending','error')""", ids)}
                                     database.executemany("DELETE FROM archive_scout_download_queue WHERE id=?",
@@ -1169,7 +1188,7 @@ def download_archive(
                         outcome_state = 'downloaded_unscanned'
                         if scanner_thread is not None:
                             scanner_wakeup.set()
-                        diagnostics.saved(row)
+                        diagnostics.saved(row, result.get('replay_retry_variant'))
                         if "analyses" in result:
                             matched += int(any(
                                 int(analysis.get("score") or 0) >= config.minimum_score

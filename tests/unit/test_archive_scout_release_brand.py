@@ -6,7 +6,7 @@ from archive_scout.constants import APP_NAME, VERSION, SCHEMA_VERSION
 class ScoutReleaseBrandTests(unittest.TestCase):
     def test_new_brand_preserves_schema(self):
         self.assertEqual(APP_NAME, "Archive Scout")
-        self.assertEqual(VERSION, "1.3.1")
+        self.assertEqual(VERSION, "1.3.2")
         self.assertEqual(SCHEMA_VERSION, 13)
 
     def test_default_user_agent_and_saved_version_follow_release(self):

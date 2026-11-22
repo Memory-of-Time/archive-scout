@@ -270,8 +270,8 @@ class ErrorRun:
         for name in ('digest', 'mimetype', 'download_attempts', 'state'):
             if name in row.keys() and row[name] is not None:
                 data[name] = row[name] if type(row[name]) is int else self.safe_text(row[name])[:100]
-        if 'alternate_replay' in row.keys():
-            data['alternate_requested'] = bool(row['alternate_replay'])
+        if 'replay_retry_variant' in row.keys():
+            data['replay_retry_variant'] = row['replay_retry_variant']
         if getattr(exc, 'source', None) and getattr(exc, 'destination', None):
             data.update(redirect_source=safe_url(exc.source), redirect_destination=safe_url(exc.destination))
         self.record('failures', kind + '_capture_outcome', data, group=(category, url['original_host']))

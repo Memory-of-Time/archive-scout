@@ -492,13 +492,13 @@ class HttpClient:
         max_bytes: int,
         accept: str = "*/*",
         *, expected_digest: str = "", redirect_validator=None,
-        retain_partial: bool = True,
+        retain_partial: bool = True, identity_encoding: bool = False,
     ) -> dict:
         """Stream a response to disk; only media may retain validated partials."""
         headers = {
             "User-Agent": self.user_agent,
             "Accept": accept,
-            "Accept-Encoding": "gzip, deflate",
+            "Accept-Encoding": "identity" if identity_encoding else "gzip, deflate",
             "Connection": "keep-alive",
             "Accept-Language": "en-US,en;q=0.8",
         }

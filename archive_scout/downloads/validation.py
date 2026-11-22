@@ -9,7 +9,7 @@ from ..network.replay_turn import ReplayTurnExpired, ReplayTurnInterrupted
 class AlternateReplayUnverified(RuntimeError):
     """An alternate replay did not yield provable bytes for the selected capture."""
 
-    def __init__(self, message, response=None):
+    def __init__(self, message, response=None, observed_digests=None):
         super().__init__(message)
         if response is not None:
             from ..network.transports import response_diagnostic
@@ -17,10 +17,17 @@ class AlternateReplayUnverified(RuntimeError):
             self.representation_diagnostic = {
                 **response_diagnostic(response.get('status', 0), response.get('headers', {}), response.get('final_url', '')),
                 'received_sha256': response.get('content_hash', ''), 'decoded_bytes_received': response.get('bytes', 0),
+                **(observed_digests or {}),
             }
 
 
+class IdentityReplayUnverified(AlternateReplayUnverified):
+    """The exact replay without negotiated compression could not be proven."""
+
+
 def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
+    if isinstance(exc, IdentityReplayUnverified):
+        return "identity_replay_unverified", None, True
     if isinstance(exc, AlternateReplayUnverified):
         return "alternate_replay_unverified", None, True
     if isinstance(exc, ReplayTurnExpired):

@@ -391,7 +391,7 @@ def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
             yield chunk
 
     try:
-        if len(codings) > 4 or any(coding not in _SUPPORTED_CONTENT_CODINGS for coding in codings):
+        if codings != ['none'] and (len(codings) > 4 or any(coding not in _SUPPORTED_CONTENT_CODINGS for coding in codings)):
             raise IncompleteRepresentationError('unsupported HTTP content encoding chain: ' +
                                                 ', '.join(codings)[:200])
         if len(codings) == 1:
@@ -430,11 +430,18 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
     concatenated gzip members. Ordinary identity bodies take the fast path.
     """
     encoding = headers.get("content-encoding", "identity").split(",", 1)[0].strip().casefold()
-    if encoding not in _SUPPORTED_CONTENT_CODINGS:
+    nonstandard_identity = encoding == "none"
+    if not nonstandard_identity and encoding not in _SUPPORTED_CONTENT_CODINGS:
         raise IncompleteRepresentationError(f"unsupported HTTP content encoding: {encoding}")
     repair_digest = ""
     repair_hash = None
-    if encoding in {"gzip", "x-gzip"}:
+    if nonstandard_identity:
+        repair_digest = _valid_cdx_digest(expected_digest)
+        if not repair_digest:
+            raise ContentEncodingMismatch("none content encoding has no comparable capture digest for recovery")
+        repair_hash = hashlib.sha1()
+        encoding = "identity"
+    elif encoding in {"gzip", "x-gzip"}:
         iterator = iter(chunks)
         prefix = bytearray()
         while len(prefix) < 2:
@@ -467,7 +474,8 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
                     repair_hash.update(chunk)
                 yield chunk
         except Exception as exc:
-            if repair_hash is None or not isinstance(normalize_transport_error(exc), IncompleteRepresentationError):
+            if (repair_hash is None or nonstandard_identity
+                    or not isinstance(normalize_transport_error(exc), IncompleteRepresentationError)):
                 raise
             framing_error = exc
     elif encoding == "br":
@@ -524,7 +532,7 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
             raise IncompleteRepresentationError(f"incomplete {encoding} stream; end marker or checksum missing")
     if stop_event.is_set():
         raise Stopped
-    if repair_hash is None and expected_wire is not None and expected_wire != received_wire:
+    if (repair_hash is None or nonstandard_identity) and expected_wire is not None and expected_wire != received_wire:
         raise IncompleteRepresentationError(
             f"HTTP Content-Length mismatch: received {received_wire}, expected {expected_wire}")
     if repair_hash is not None:
@@ -533,7 +541,8 @@ def _decode_single_verified_chunks(chunks: Iterable[bytes], headers: dict[str, s
             error = PayloadDigestMismatch("encoding-header recovery failed the selected capture's CDX digest")
             error.actual_digest = actual
             raise error
-        headers["x-archive-scout-encoding-recovery"] = "gzip header mismatch; CDX SHA-1 verified: " + actual
+        repair_reason = "none content encoding" if nonstandard_identity else "gzip header mismatch"
+        headers["x-archive-scout-encoding-recovery"] = f"{repair_reason}; CDX SHA-1 verified: {actual}"
         if framing_error is not None or (expected_wire is not None and expected_wire != received_wire):
             headers["x-archive-scout-encoding-recovery"] += (
                 f"; replay framing contradicted verified payload ({received_wire} bytes, advertised {advertised or 'chunked'})")
@@ -1667,6 +1676,7 @@ class _BackendTurn:
     name: str
     generation: int
     probe: bool = False
+    replay_recovery_incident: int | None = None
 
 
 class ResilientTransport:
@@ -1681,6 +1691,7 @@ class ResilientTransport:
 
     BACKEND_RECOVERY_SECONDS = 30.0
     CONNECTION_FAILURE_THRESHOLD = 3
+    REPLAY_RECOVERY_CONFIRMATIONS = 2
 
     def __init__(
         self,
@@ -1706,6 +1717,9 @@ class ResilientTransport:
         self.connection_failure_streaks: dict[str, int] = {}
         self.backend_waiters = 0
         self.cooldown_until: dict[str, float] = {}
+        self.replay_route_recovery = False
+        self.replay_recovery_incidents = 0
+        self.replay_confirmations_remaining = 0
         self.fallback_pacer = None
         self.last_success: str | None = None
         # Explicit backends must not instantiate unused stacks. In particular,
@@ -1755,11 +1769,15 @@ class ResilientTransport:
                 "preferred_backend": self.last_success,
                 "recovery_interval_seconds": self.BACKEND_RECOVERY_SECONDS,
                 "connection_failure_streaks": dict(getattr(self, "connection_failure_streaks", {})),
+                "replay_recovery_incidents": getattr(self, "replay_recovery_incidents", 0),
+                "replay_confirmations_remaining": getattr(self, "replay_confirmations_remaining", 0),
             }
 
     def dispatch_slots(self, slots: int) -> int:
         with self.condition:
             now = time.monotonic()
+            if getattr(self, 'replay_confirmations_remaining', 0):
+                slots = min(slots, 1)
             if any(name not in self.cooldown_until for name in self.order):
                 return slots
             return min(slots, sum(self.cooldown_until[name] <= now and name not in self.recovery_probes
@@ -1781,14 +1799,18 @@ class ResilientTransport:
                 raise Stopped
             with self.condition:
                 now = time.monotonic()
+                incident = (self.replay_recovery_incidents
+                            if getattr(self, 'replay_confirmations_remaining', 0) else None)
                 for route in candidates:
                     if route not in self.cooldown_until:
-                        return _BackendTurn(route, self.backend_generations.get(route, 0))
+                        return _BackendTurn(route, self.backend_generations.get(route, 0),
+                                            replay_recovery_incident=incident)
                 for route in candidates:
                     if self.cooldown_until[route] <= now and route not in self.recovery_probes:
                         self.recovery_probes.add(route)
                         self.probe_started[route] = now
-                        return _BackendTurn(route, self.backend_generations.get(route, 0), probe=True)
+                        return _BackendTurn(route, self.backend_generations.get(route, 0), probe=True,
+                                            replay_recovery_incident=incident)
                 if not wait:
                     return None
                 self.backend_waiters += 1
@@ -1799,13 +1821,16 @@ class ResilientTransport:
             if permit_checker is not None and not permit_checker():
                 raise PermitRevoked("host permit expired while waiting for a backend")
 
-    def _backend_result(self, turn: _BackendTurn, succeeded: bool | None) -> bool:
+    def _backend_result(self, turn: _BackendTurn, succeeded: bool | None, *, replied=False) -> bool:
         name = turn.name
         with self.condition:
             if not hasattr(self, 'connection_failure_streaks'):
                 self.connection_failure_streaks = {}
             current = self.backend_generations.get(name, 0)
             if succeeded is True:
+                if (replied and getattr(self, 'replay_confirmations_remaining', 0)
+                        and turn.replay_recovery_incident == self.replay_recovery_incidents):
+                    self.replay_confirmations_remaining -= 1
                 changed = self.last_success != name
                 recovering = name in self.cooldown_until or name in self.recovery_probes
                 self.last_success = name
@@ -1828,12 +1853,18 @@ class ResilientTransport:
                 if turn.probe or streak >= self.CONNECTION_FAILURE_THRESHOLD:
                     self.cooldown_until[name] = time.monotonic() + self.BACKEND_RECOVERY_SECONDS
                     self.backend_generations[name] = current + 1
+                if getattr(self, 'replay_route_recovery', False):
+                    if self.replay_confirmations_remaining:
+                        self.replay_confirmations_remaining = self.REPLAY_RECOVERY_CONFIRMATIONS
+                    elif all(backend in self.cooldown_until for backend in self.order):
+                        self.replay_recovery_incidents += 1
+                        self.replay_confirmations_remaining = self.REPLAY_RECOVERY_CONFIRMATIONS
             if turn.probe or succeeded is False:
                 self.condition.notify_all()
             return False
 
     def _backend_reachable(self, turn: _BackendTurn) -> None:
-        if self._backend_result(turn, True) and self.callback:
+        if self._backend_result(turn, True, replied=True) and self.callback:
             self.callback(f"Network backend: {turn.name}")
 
     def _backend_turns(self, stop_event, permit_checker, *, pinned=None, response_callback=None):
@@ -1855,6 +1886,8 @@ class ResilientTransport:
             if context is not None:
                 attempted.add(turn.name)
                 yield turn, context
+                if replay is not None and getattr(self, 'replay_confirmations_remaining', 0):
+                    return
 
     def _start_backend(self, turn, attempt_number, stop_event, permit_checker, response_callback=None):
         pacer = getattr(self, "physical_pacer", None) or getattr(self, "fallback_pacer", None)
@@ -1942,7 +1975,8 @@ class ResilientTransport:
                 return response
             except RedirectPolicyError as exc:
                 self._note_failure(turn, url, exc, started, phase='redirect_policy')
-                self._backend_result(turn, True)  # successful response, policy refused redirect
+                if _backend_controls.get().on_headers is not None:
+                    self._backend_result(turn, True, replied=True)
                 raise
             except (PermitRevoked, Stopped):
                 self._backend_result(turn, None)
@@ -2036,7 +2070,8 @@ class ResilientTransport:
                 return response
             except RedirectPolicyError as exc:
                 self._note_failure(turn, url, exc, started, phase='redirect_policy', expected_digest=expected_digest)
-                self._backend_result(turn, True)  # successful response, policy refused redirect
+                if _backend_controls.get().on_headers is not None:
+                    self._backend_result(turn, True, replied=True)
                 raise
             except (PermitRevoked, ReplayTurnExpired, Stopped):
                 self._backend_result(turn, None)
