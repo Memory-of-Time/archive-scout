@@ -6,8 +6,13 @@ import urllib.error
 from ..network.replay_turn import ReplayTurnExpired, ReplayTurnInterrupted
 
 
+class AlternateReplayUnverified(RuntimeError):
+    """An alternate replay did not yield provable bytes for the selected capture."""
+
 
 def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
+    if isinstance(exc, AlternateReplayUnverified):
+        return "alternate_replay_unverified", None, True
     if isinstance(exc, ReplayTurnExpired):
         return "replay_deadline", None, True
     if isinstance(exc, ReplayTurnInterrupted):

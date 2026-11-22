@@ -83,7 +83,7 @@ def title_from_html(raw: str) -> str:
     return clean_space(html.unescape(TAG_PATTERN.sub(" ", match.group(1))))[:500]
 
 
-def decode_bytes(data: bytes, content_type: str = "") -> str:
+def decode_bytes(data: bytes, content_type: str = "", *, detect_missing_charset: bool = True) -> str:
     """Decode text once, respecting BOM and declared legacy/wide encodings."""
     for bom, encoding in (
         (b"\xef\xbb\xbf", "utf-8-sig"),
@@ -105,18 +105,35 @@ def decode_bytes(data: bytes, content_type: str = "") -> str:
     xml = XML_ENCODING_PATTERN.search(head)
     if xml:
         candidates.append(xml.group(1))
-    candidates.extend(["utf-8", "windows-1252", "latin-1"])
+    candidates.append("utf-8")
     html_content = ("html" in content_type.casefold() or b"<html" in data[:1024].lower()
                     or b"<!doctype html" in data[:1024].lower())
     if html_content:
         candidates = ["windows-1252" if value.casefold() in
                       {"iso-8859-1", "latin-1", "latin1"} else value for value in candidates]
+    sample_start = 0
     for encoding in dict.fromkeys(candidates):
         try:
             return data.decode(encoding)
-        except (LookupError, UnicodeError):
-            continue
-    return data.decode("utf-8", "replace")
+        except (LookupError, UnicodeError) as exc:
+            if encoding == "utf-8" and isinstance(exc, UnicodeDecodeError):
+                sample_start = max(0, exc.start - 1024)
+    if detect_missing_charset:
+        from chardet import detect
+
+        guess = detect(data[sample_start:sample_start + 16384])
+        encoding = guess.get('encoding')
+        if encoding and guess['confidence'] >= 0.85:
+            if encoding.casefold() == 'gb2312':
+                encoding = 'gb18030'
+            try:
+                return data.decode(encoding)
+            except (LookupError, UnicodeError):
+                pass
+    try:
+        return data.decode("windows-1252")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
 
 
 def _binary_signature(data: bytes) -> bool:

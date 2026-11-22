@@ -668,6 +668,8 @@ def run_project(
                 discover_embedded=True if pending_media_phase == "external" else config.media.discover_embedded,
                 allow_external_embeds=True if pending_media_phase == "external" else config.media.allow_external_embeds)
     operation_run_id = start_operation_run(database, mode, VERSION)
+    from .downloads.checkpoint import note_recovery_run
+    note_recovery_run(database, operation_run_id)
     if mode in RESUMABLE_MODES:
         _remember_resume_request(database, config, mode, operation_run_id, resumed=resumed_request)
     database.commit()
@@ -888,7 +890,8 @@ def run_project(
             emit(callback, ProgressEvent("resume_local", "Checking interrupted saves for recoverable local files."))
             for target in config.targets:
                 adopt_orphaned_bodies(database, config.for_target(target), stop_event, callback,
-                                      target=target, respect_selection=retry_resume)
+                                      target=target, respect_selection=retry_resume,
+                                      incremental=mode != 'rescan')
 
         # Scanning retained bodies is local work and must not wait for CDX.
         # On a Resume with an unreachable indexing endpoint, every previously

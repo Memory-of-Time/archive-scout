@@ -391,18 +391,24 @@ def _record_recovery_gap(database, row, category: str, message: str) -> None:
 
 
 def _orphan_candidate_batches(database: sqlite3.Connection, config, target: str,
-                              stop_event: threading.Event, *, respect_selection: bool = False
+                              stop_event: threading.Event, *, respect_selection: bool = False,
+                              publication_ids: tuple[int, ...] | None = None
                               ) -> Iterator[list[sqlite3.Row]]:
+    if publication_ids == ():
+        return
     signature = cdx_query_signature(config)
-    query = """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.digest,c.state,c.download_attempts,
+    tracked = publication_ids is not None
+    source = 'captures c NOT INDEXED' if tracked else 'captures c INDEXED BY captures_download_idx'
+    eligibility = ("c.state IN ('error','pending','downloaded_unscanned','downloaded')"
+        if tracked else """c.state=? AND (c.state!='downloaded_unscanned' OR v.capture_id IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=c.id)""")
+    query = f"""SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.digest,c.state,c.download_attempts,
                       c.http_status AS capture_status,c.final_url AS capture_final_url,
                       v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
                       v.response_content_type,v.final_url,v.response_status
-               FROM captures c INDEXED BY captures_download_idx
+               FROM {source}
                LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
-               WHERE c.query_signature=? AND c.state=? AND c.timestamp BETWEEN ? AND ?
-               AND (c.state!='downloaded_unscanned' OR v.capture_id IS NULL)
-               AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=c.id)
+               WHERE c.query_signature=? AND {eligibility} AND c.timestamp BETWEEN ? AND ?
                AND EXISTS (SELECT 1 FROM targets t WHERE t.pattern=? AND
                    (t.id=c.target_id OR EXISTS (SELECT 1 FROM capture_target_membership m
                     WHERE m.capture_id=c.id AND m.target_id=t.id)))"""
@@ -415,6 +421,16 @@ def _orphan_candidate_batches(database: sqlite3.Connection, config, target: str,
             AND e.operation='download' AND e.resolved=0 AND e.ignored=0
             AND {explicit_error_predicate(config)})""" + selection
         states = ("error", "pending")
+    if tracked:
+        if stop_event.is_set():
+            raise Stopped
+        slots = ','.join('?' for _ in publication_ids)
+        rows = database.execute(query + f" AND c.id IN ({slots}) ORDER BY c.id",
+                                (signature, config.from_date, config.to_date, target,
+                                 *selection_params, *publication_ids)).fetchall()
+        if rows:
+            yield rows
+        return
     order_by = " ORDER BY c.download_attempts,c.id LIMIT ?"
     batch_size = 500
     for state in states:
@@ -435,8 +451,32 @@ def _orphan_candidate_batches(database: sqlite3.Connection, config, target: str,
             yield rows
 
 
+def _publication_batches(root: Path, stop_event: threading.Event):
+    from ..downloads.checkpoint import read_receipt_file, recovery_directory
+    try:
+        entries = os.scandir(recovery_directory(root))
+    except FileNotFoundError:
+        return
+    with entries:
+        batch = []
+        for entry in entries:
+            if stop_event.is_set():
+                raise Stopped
+            if not entry.name.endswith('.validated.json') or not entry.is_file(follow_symlinks=False):
+                continue
+            receipt = read_receipt_file(Path(entry.path))
+            if receipt is not None:
+                batch.append(receipt['capture_id'])
+            if len(batch) == 500:
+                yield tuple(batch)
+                batch.clear()
+        if batch:
+            yield tuple(batch)
+
+
 def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: threading.Event,
-                          callback=None, *, target: str | None = None, respect_selection: bool = False) -> int:
+                          callback=None, *, target: str | None = None, respect_selection: bool = False,
+                          incremental: bool = False) -> int:
     """Recover atomically saved bytes whose DB commit was interrupted.
 
     Only previous attempted captures are checked; a million untouched URLs
@@ -446,14 +486,30 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
     from ..downloads.downloader import capture_path
     from ..classification import classify_payload_kind
     from ..content import classify_replay_content, decode_bytes
-    from ..downloads.checkpoint import prove_file, discard_receipt, preserve_unverified, sync_directory
+    from ..downloads.checkpoint import (LEGACY_RECOVERY_KEY, prove_file, read_receipt,
+        discard_receipt, preserve_unverified, sync_directory)
     from ..downloads.downloader import _save_payload_evidence
     from ..downloads.schedule import clear_retry
     target = target or (config.targets[0] if config.targets else None)
     if not target:
         return 0
+    legacy_key = LEGACY_RECOVERY_KEY + hash_text('\0'.join((target, cdx_query_signature(config),
+                                                            config.from_date, config.to_date)))
+    legacy = not incremental or not database.execute(
+        "SELECT 1 FROM project_meta WHERE key=? AND CAST(value AS INTEGER)>=?",
+        (legacy_key, config.max_file_bytes)).fetchone()
+    legacy_complete = True
+
+    def candidates():
+        for ids in _publication_batches(config.output_dir, stop_event):
+            yield from _orphan_candidate_batches(database, config, target, stop_event,
+                                                  respect_selection=respect_selection, publication_ids=ids)
+        if legacy:
+            yield from _orphan_candidate_batches(database, config, target, stop_event,
+                                                  respect_selection=respect_selection)
+
     adopted = 0
-    for rows in _orphan_candidate_batches(database, config, target, stop_event, respect_selection=respect_selection):
+    for rows in candidates():
         committed_paths = []
         with database:
             for row in rows:
@@ -462,6 +518,12 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                 cursor = int(row["id"])
                 path = capture_path(config.output_dir, cursor, row["timestamp"], row["original_url"])
                 try:
+                    if row['state'] in {'downloaded', 'downloaded_unscanned'} and row['expected_hash']:
+                        receipt = read_receipt(path, row)
+                        if (receipt and receipt['content_hash'] == row['expected_hash']
+                                and receipt['bytes_saved'] == row['expected_size']):
+                            committed_paths.append(path)
+                        continue
                     stage = path.with_name(path.name + '.transfer')
                     if stage.is_file() and 0 < stage.stat().st_size <= config.max_file_bytes:
                         staged_proof = prove_file(stage, row, expected_hash=row['expected_hash'],
@@ -496,7 +558,7 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                         response_status = response_status or row['capture_status']
                         final_url = final_url or row['capture_final_url']
                     try:
-                        preview_text = decode_bytes(preview, content_type)
+                        preview_text = decode_bytes(preview, content_type, detect_missing_charset=False)
                     except UnicodeDecodeError:
                         # A prefix can split a UTF-8 character or UTF-16 pair.
                         # Full-byte proof is already checked; local scanning
@@ -535,10 +597,12 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                     from ..downloads.downloader import _storage_full, StorageFullError
                     if _storage_full(exc):
                         raise StorageFullError('storage full during retained-body recovery') from exc
+                    legacy_complete = False
                     if row['state']=='downloaded_unscanned':
                         _record_recovery_gap(database,row,'local_integrity_unproven',repr(exc))
                     continue
                 except (ValueError, UnicodeError):
+                    legacy_complete = False
                     if row['state']=='downloaded_unscanned':
                         _record_recovery_gap(database,row,'local_integrity_unproven',
                             'Retained body validation failed; reacquisition required.')
@@ -546,6 +610,11 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
         # Receipts are removed only AFTER the evidence/state transaction commits.
         for path in committed_paths:
             discard_receipt(path)
+    if incremental and legacy and not respect_selection and legacy_complete and not stop_event.is_set():
+        with database:
+            database.execute("""INSERT INTO project_meta VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (legacy_key, str(config.max_file_bytes)))
     if adopted and callback:
         callback(ProgressEvent('scan', f'Recovered {adopted:,} complete previously saved bodies without network access.'))
     return adopted

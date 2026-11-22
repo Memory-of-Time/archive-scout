@@ -6,3 +6,4 @@ ahocorasick-rs>=1.0.3,<2
 selectolax>=0.4.8,<1
 idna>=3,<4
 Brotli>=1.2,<2
+chardet>=5.2,<6

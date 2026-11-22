@@ -154,10 +154,14 @@ def rescan_keyword_sets(
         clauses.append("c.state IN ('downloaded','downloaded_unscanned')")
         # A score=0 is still a persisted coverage marker; no need to reload
         # already-scored bodies into Python merely to rediscover no hits.
-        placeholders = ",".join("?" for _ in jobs)
-        clauses.append(f"(SELECT COUNT(DISTINCT m.scan_run_id) FROM document_matches m WHERE m.document_id=d.id AND m.scan_run_id IN ({placeholders}))<?")
-        params.extend(job.scan_run_id for job in jobs)
-        params.append(len(jobs))
+        if len(jobs) == 1:
+            clauses.append("NOT EXISTS (SELECT 1 FROM document_matches m WHERE m.scan_run_id=? AND m.document_id=d.id)")
+            params.append(jobs[0].scan_run_id)
+        else:
+            placeholders = ",".join("?" for _ in jobs)
+            clauses.append(f"(SELECT COUNT(DISTINCT m.scan_run_id) FROM document_matches m WHERE m.document_id=d.id AND m.scan_run_id IN ({placeholders}))<?")
+            params.extend(job.scan_run_id for job in jobs)
+            params.append(len(jobs))
     # Scope membership is an indexed, connection-local relation rather than an
     # ever-growing OR expression. Memory/SQL depth are independent of project size.
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_rescan_scope")

@@ -542,7 +542,7 @@ def _partial_metadata_path(destination: Path) -> Path:
 
 
 def _valid_cdx_digest(value: str) -> str:
-    value = str(value or "").upper().rstrip("=")
+    value = str(value or "").upper().removeprefix("SHA1:").rstrip("=")
     return value if re.fullmatch(r"[A-Z2-7]{32}", value) else ""
 
 

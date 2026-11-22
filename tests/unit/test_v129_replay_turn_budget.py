@@ -298,7 +298,7 @@ class ReplayTurnBudgetTests(unittest.TestCase):
             db.close()
 
     def test_a_gate_closure_between_admission_and_worker_refunds_unstarted_attempts(self):
-        cfg = self.seed(["/one", "/two"])
+        cfg = self.seed(["/one", "/two"], workers=2)
         gate = shared_host_gate(cfg.rate_limit_base_pause, cfg.rate_limit_max_pause)
         dispatch_slots = gate.dispatch_slots
         stop = threading.Event()

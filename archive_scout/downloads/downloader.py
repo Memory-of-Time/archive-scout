@@ -16,7 +16,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Callable, Iterator
 
-from ..cdx.client import HttpClient, RateLimitDeferred
+from ..cdx.client import HttpClient, PermanentRequestError, RateLimitDeferred
 from ..cdx.parameters import cdx_query_signature, index_scopes
 from ..database.classification import classify_indexed_captures
 from ..database.scope import scope_membership_predicate
@@ -34,13 +34,13 @@ from ..scanning.keywords import compile_prefilter
 from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
-from .validation import classify_exception
+from .validation import AlternateReplayUnverified, classify_exception
 from .schedule import record_failure, clear_retry, prepare_retry_queue, select_due_retry, automatic_retry_allowed, restore_increased_size_limit
-from .checkpoint import write_receipt, discard_receipt, sync_directory
+from .checkpoint import prove_file, write_receipt, discard_receipt, sync_directory
 from .diagnostics import AcquisitionDiagnostics
 from .redirects import make_replay_redirect_validator
 from ..network.replay_turn import ReplayDispatchDeferred, ReplayTurn, replay_turn
-from ..network.transports import RedirectPolicyError, ResilientTransport
+from ..network.transports import RedirectPolicyError, ResilientTransport, _valid_cdx_digest
 
 
 class StorageFullError(OSError):
@@ -465,7 +465,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
     decision = classify_payload_kind(data, content_type, original)
     if decision.resource_class not in {"text", "media_descriptor"}:
         raise NonTextResponse(decision.resource_class, decision.reason, content_type)
-    raw = decode_bytes(data if scan_now else data[:20000], content_type)
+    raw = decode_bytes(data if scan_now else data[:20000], content_type, detect_missing_charset=scan_now)
     replay_problem = classify_replay_content(raw, response["final_url"])
     if replay_problem:
         raise RuntimeError(replay_problem)
@@ -536,15 +536,32 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
     stage.parent.mkdir(parents=True, exist_ok=True)
     # No unvalidated prefix may be reused as if it were a complete capture.
     stage.unlink(missing_ok=True)
+    indexed_digest = str(row["digest"] or "") if "digest" in row.keys() else ""
+    alternate = ("alternate_replay" in row.keys() and row["alternate_replay"]
+                 and bool(_valid_cdx_digest(indexed_digest)) and isinstance(client, HttpClient))
+    url = replay_url(row["timestamp"], original, "if_") if alternate else replay_url(row["timestamp"], original)
     try:
-        response = client.download_to_path(
-            replay_url(row["timestamp"], original), stage, config.max_file_bytes,
-            redirect_validator=make_replay_redirect_validator(config, original,
-                skip_redirects=not config.download_external_redirects),
-            **({"expected_digest": str(row["digest"] or "")} if isinstance(client, HttpClient)
-               and "digest" in row.keys() else {}),
-            **({"retain_partial": False} if isinstance(client, HttpClient) else {}),
-        )
+        try:
+            response = client.download_to_path(
+                url, stage, config.max_file_bytes,
+                redirect_validator=make_replay_redirect_validator(config, original,
+                    skip_redirects=alternate or not config.download_external_redirects),
+                **({"expected_digest": indexed_digest, "retain_partial": False}
+                   if isinstance(client, HttpClient) else {}),
+            )
+        except Exception as exc:
+            if alternate and (isinstance(exc, (PermanentRequestError, RedirectPolicyError))
+                    or classify_exception(exc)[0] in {'incomplete_representation',
+                       'payload_digest_mismatch', 'content_encoding_mismatch'}):
+                raise AlternateReplayUnverified('Alternate replay failed capture validation') from exc
+            raise
+        if alternate:
+            if response["final_url"] != url:
+                raise AlternateReplayUnverified('Alternate replay changed the requested capture URL or timestamp')
+            proof = prove_file(stage, row)
+            if (not proof or proof['source'] != 'cdx' or proof['content_hash'] != response["content_hash"]
+                    or proof['bytes_saved'] != int(response["bytes"])):
+                raise AlternateReplayUnverified('Alternate replay bytes did not match the indexed digest')
         content_type = (response["headers"].get("content-type") or
                         response["headers"].get("Content-Type") or row["mimetype"] or "")
         preview = response["preview"]
@@ -553,13 +570,15 @@ def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpC
             raise NonTextResponse(decision.resource_class, decision.reason, content_type)
         # A recognizable archive error shell is not a saved original document.
         try:
-            preview_text = decode_bytes(preview, content_type)
+            preview_text = decode_bytes(preview, content_type, detect_missing_charset=False)
         except UnicodeDecodeError:
             # Prefix-only preview can split a UTF-16 surrogate/UTF-8 character.
             # The scanner validates the complete retained document locally.
             preview_text = ""
         replay_problem = classify_replay_content(preview_text, response["final_url"])
         if replay_problem:
+            if alternate:
+                raise AlternateReplayUnverified(f'Alternate replay returned an archive error response: {replay_problem}')
             raise RuntimeError(replay_problem)
         if int(response["bytes"]) != stage.stat().st_size:
             raise OSError("streamed replay byte count differs from retained file")
@@ -872,7 +891,7 @@ def download_archive(
                 finished_at[int(row['id'])] = time.monotonic()
 
     started = time.monotonic()
-    max_inflight = max(config.workers, config.workers * 2)
+    max_inflight = config.workers
     last_completion = time.monotonic()
     last_stall_message = time.monotonic()
     from .session import AcquisitionExecutor
@@ -1009,8 +1028,17 @@ def download_archive(
                                 if rows:
                                     ids = [int(row['id']) for row in rows]
                                     fields = ','.join('?' for _ in ids)
-                                    current = {int(row['id']): row for row in database.execute(
-                                        "SELECT * FROM captures WHERE id IN ("+fields+") AND state IN ('pending','error')", ids)}
+                                    current = {int(row['id']): row for row in database.execute("""
+                                        SELECT c.*, CASE WHEN c.state='error' THEN EXISTS (
+                                            SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=c.id
+                                            AND s.last_category IN ('incomplete_representation',
+                                                'payload_digest_mismatch','content_encoding_mismatch')
+                                            AND NOT EXISTS (SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx
+                                                WHERE e.capture_id=c.id AND e.operation='download'
+                                                AND e.category='alternate_replay_unverified')
+                                        ) ELSE 0 END AS alternate_replay
+                                        FROM captures c WHERE c.id IN ("""+fields+""")
+                                        AND c.state IN ('pending','error')""", ids)}
                                     database.executemany("DELETE FROM archive_scout_download_queue WHERE id=?",
                                                         ((cid,) for cid in ids))
                                     if config.network.persistent_retries and not capture_ids:
