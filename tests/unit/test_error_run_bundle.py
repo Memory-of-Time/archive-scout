@@ -106,7 +106,7 @@ class ErrorRunTests(unittest.TestCase):
                     paths.append(run.directory)
         self.assertFalse(paths[0].exists())
         self.assertEqual(self.journal(directory=paths[1])[0]['number'], 1)
-        self.assertEqual(self.latest(), paths[2])
+        self.assertTrue(self.latest().samefile(paths[2]))
         self.assertEqual((unrelated / 'notes.txt').read_text(), 'fixture')
         self.assertIsNone(active_error_run.get())
 
